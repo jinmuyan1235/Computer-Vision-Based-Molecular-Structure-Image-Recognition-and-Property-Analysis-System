@@ -28,6 +28,10 @@ class ImagePreprocessor:
             return image.copy()
         if image.ndim != 3:
             raise ValueError("图片数组维度无效。")
+        if image.shape[2] == 1:
+            return image[:, :, 0].copy()
+        if image.shape[2] not in {3, 4}:
+            raise ValueError("图片数组的通道数必须是 1、3 或 4。")
         conversion = cv2.COLOR_BGRA2GRAY if image.shape[2] == 4 else cv2.COLOR_BGR2GRAY
         return cv2.cvtColor(image, conversion)
 

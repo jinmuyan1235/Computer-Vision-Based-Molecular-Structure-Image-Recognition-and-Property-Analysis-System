@@ -19,6 +19,7 @@
 5. 结构重绘并计算基础描述符；
 6. 执行 Lipinski 与扩展可旋转键规则；
 7. 在 Streamlit 展示并导出 JSON、CSV、可选 PDF。
+8. 若用户提供可信的带标签数据和本地模型，可选执行 Morgan 指纹 + Random Forest ADMET baseline。
 
 ## 4. 关键设计
 
@@ -34,6 +35,10 @@
 
 demo 和 RDKit 流程完全支持 CPU。MolScribe 可通过 `OCSR_DEVICE` 与 `MOLSCRIBE_MODEL_PATH` 配置，GPU 不是必需条件。
 
+### 可选 ADMET 与输出隔离
+
+ADMET baseline 默认关闭，没有模型时只保留 RDKit 规则分析。每次单分子分析生成唯一 `analysis_id`，预处理图、结构重绘和报告文件不会因同名输入互相覆盖。
+
 ## 5. 验收演示
 
 1. 执行 `python scripts/make_demo_samples.py` 生成样例；
@@ -42,6 +47,7 @@ demo 和 RDKit 流程完全支持 CPU。MolScribe 可通过 `OCSR_DEVICE` 与 `M
 4. 展示预处理阶段、识别结果、canonical SMILES、结构重绘和性质；
 5. 在 SMILES 页输入 `CCO`；
 6. 在批量页处理 `data/samples` 并下载 CSV。
+7. 执行 `pytest -q` 验证核心、适配器、导出和端到端流程。
 
 ## 6. 风险与局限
 

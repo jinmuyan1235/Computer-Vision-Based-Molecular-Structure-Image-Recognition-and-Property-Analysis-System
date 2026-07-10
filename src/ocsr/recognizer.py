@@ -34,6 +34,10 @@ class MoleculeRecognizer:
         except Exception as exc:
             return OCSRResult(None, None, self.backend, "failed", f"OCSR 识别发生未预期错误：{exc}")
 
+    def status(self) -> dict[str, Any]:
+        """Return readiness information for the selected adapter."""
+        return self.adapter.status()
+
     @property
     def is_demo(self) -> bool:
         """Return whether the recognizer is using the demonstration backend."""

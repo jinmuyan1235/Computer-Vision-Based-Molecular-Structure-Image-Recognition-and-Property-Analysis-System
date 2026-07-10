@@ -14,3 +14,5 @@ data/batch_input/*
 *.onnx
 *.pth
 *.pt
+models/*
+!models/.gitkeep

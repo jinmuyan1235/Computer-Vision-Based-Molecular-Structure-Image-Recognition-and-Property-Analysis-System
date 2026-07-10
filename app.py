@@ -19,6 +19,18 @@ from src.export.pdf_exporter import save_pdf
 st.set_page_config(page_title="分子结构图像识别与性质分析", page_icon="🧪", layout="wide")
 
 
+@st.cache_resource(show_spinner=False)
+def get_report_generator(backend: str) -> MoleculeReportGenerator:
+    """Cache expensive optional OCSR model initialization between reruns."""
+    return MoleculeReportGenerator(backend, OUTPUT_DIR)
+
+
+@st.cache_resource(show_spinner=False)
+def get_batch_analyzer(backend: str) -> BatchAnalyzer:
+    """Reuse a batch analyzer and its selected backend between reruns."""
+    return BatchAnalyzer(backend, OUTPUT_DIR)
+
+
 def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_prefix: str) -> None:
     """Render a molecule analysis report in Streamlit."""
     if report.get("status") != "success":
@@ -64,6 +76,18 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
         violations = "、".join(lipinski.get("violations") or [])
         st.warning(f"⚠️ {lipinski.get('summary', '')} 超限项：{violations}")
 
+    admet = report.get("admet") or {}
+    if admet.get("status") == "success":
+        st.subheader("可选 ADMET baseline")
+        admet_columns = st.columns(3)
+        admet_columns[0].metric("预测终点", str(admet.get("target", "-")))
+        admet_columns[1].metric("预测值", str(admet.get("prediction", "-")))
+        probability = admet.get("probability")
+        admet_columns[2].metric("模型置信度", f"{probability:.1%}" if probability is not None else "未提供")
+        st.caption(admet.get("disclaimer", ""))
+    elif admet.get("status") in {"unavailable", "failed"}:
+        st.warning(admet.get("message", "ADMET baseline 不可用。"))
+
     if show_preprocessing and report.get("input", {}).get("type") == "image":
         st.subheader("OpenCV 图像预处理过程")
         stage_paths = (report.get("images") or {}).get("preprocessing") or {}
@@ -100,6 +124,11 @@ with st.sidebar:
     export_pdf = st.checkbox("启用 PDF 报告", value=False)
     if backend == "demo":
         st.warning("当前未检测到真实 OCSR 模型，正在使用演示模式，请安装 MolScribe/DECIMER 后切换为真实识别模式。")
+    backend_status = get_report_generator(backend).recognizer.status()
+    if backend_status["available"]:
+        st.success(backend_status["message"])
+    else:
+        st.error(backend_status["message"])
     st.caption("CPU 可运行；真实模型可按各自配置自动使用相应设备。")
 
 image_tab, smiles_tab, batch_tab, about_tab = st.tabs(["图片识别", "SMILES 分析", "批量处理", "项目说明"])
@@ -116,7 +145,7 @@ with image_tab:
                     temporary.write(uploaded.getvalue())
                     temporary_path = Path(temporary.name)
                 try:
-                    st.session_state["image_report"] = MoleculeReportGenerator(backend, OUTPUT_DIR).generate(image_path=temporary_path)
+                    st.session_state["image_report"] = get_report_generator(backend).generate(image_path=temporary_path)
                     st.session_state["image_report"]["input"]["filename"] = uploaded.name
                 finally:
                     temporary_path.unlink(missing_ok=True)
@@ -127,7 +156,7 @@ with smiles_tab:
     smiles_input = st.text_input("输入 SMILES", value="CCO", placeholder="例如：CCO")
     if st.button("分析 SMILES", type="primary", key="analyze_smiles"):
         with st.spinner("正在进行 RDKit 校验与性质计算……"):
-            st.session_state["smiles_report"] = MoleculeReportGenerator(backend, OUTPUT_DIR).generate(smiles=smiles_input)
+            st.session_state["smiles_report"] = get_report_generator(backend).generate(smiles=smiles_input)
     if "smiles_report" in st.session_state:
         show_report(st.session_state["smiles_report"], False, export_pdf, "smiles")
 
@@ -144,9 +173,9 @@ with batch_tab:
                     with tempfile.TemporaryDirectory() as temp_dir:
                         for item in uploaded_files:
                             (Path(temp_dir) / Path(item.name).name).write_bytes(item.getvalue())
-                        st.session_state["batch_result"] = BatchAnalyzer(backend, OUTPUT_DIR).analyze_folder(temp_dir)
+                        st.session_state["batch_result"] = get_batch_analyzer(backend).analyze_folder(temp_dir)
                 elif folder_path.strip():
-                    st.session_state["batch_result"] = BatchAnalyzer(backend, OUTPUT_DIR).analyze_folder(folder_path.strip())
+                    st.session_state["batch_result"] = get_batch_analyzer(backend).analyze_folder(folder_path.strip())
                 else:
                     st.warning("请上传至少一张图片或填写输入文件夹路径。")
             except Exception as exc:

@@ -24,6 +24,8 @@
 - 规则判断：Lipinski 五规则指标及扩展可旋转键规则；
 - 批量处理：逐图容错、结果表格、成功率/有效率和失败原因汇总；
 - 导出：单图 JSON、批量 CSV/JSON、统计图和可选 PDF；
+- 可选 ADMET baseline：用户提供带标签 CSV 后，可训练 Morgan Fingerprint + Random Forest 单终点模型；
+- 工程稳定性：后端可用性诊断、模型实例缓存、分析 ID 隔离输出和端到端测试；
 - Web 演示：Streamlit 四个页签，一条命令启动；
 - 自动化测试：SMILES、描述符、规则、预处理和 demo 识别。
 
@@ -37,8 +39,10 @@ flowchart LR
     D --> E["RDKit 校验与标准化"]
     E --> F["结构重绘"]
     E --> G["描述符与规则分析"]
+    E --> K["可选 ADMET baseline"]
     F --> H["Streamlit 展示"]
     G --> H
+    K --> H
     H --> I["JSON / CSV / PDF"]
     J["手动 SMILES"] --> E
 ```
@@ -158,13 +162,39 @@ streamlit run app.py
 
 DECIMER 同样是可选依赖。当前适配器支持暴露 `predict_SMILES` 的发行形式。若已安装版本的模块路径不同，只需调整 `src/ocsr/decimer_adapter.py` 中标注的适配位置。未安装或初始化失败时系统返回可读错误，不会崩溃。
 
+适配器会优先请求后端返回置信度，并兼容不支持置信度参数的旧版本。Web 侧边栏会显示所选后端是否已成功加载。
+
+## 可选 ADMET baseline
+
+项目不会附带或伪造 ADMET 数据。准备一个至少包含 `smiles` 和目标标签列的可信 CSV 后，可训练单个分类或回归终点：
+
+```bash
+python scripts/train_admet.py \
+  --input data/admet.csv \
+  --smiles-column smiles \
+  --target-column ames \
+  --task classification \
+  --output models/admet_baseline.joblib
+```
+
+训练完成后启用模型：
+
+```bash
+# Windows PowerShell
+$env:ENABLE_ADMET_MODEL="true"
+$env:ADMET_MODEL_PATH="models/admet_baseline.joblib"
+streamlit run app.py
+```
+
+模型文件使用 joblib 序列化，只应加载自己训练或可信来源的本地文件。未启用、文件缺失或预测失败时，系统会继续完成 RDKit 描述符与 Lipinski 规则分析。ADMET 输出仅是教学 baseline，不替代实验或专业结论。
+
 ## 测试
 
 ```bash
 pytest -q
 ```
 
-测试覆盖合法/非法 SMILES、canonical SMILES、描述符字段、规则超限、合成图预处理以及 demo 阿司匹林文件名识别。
+测试覆盖合法/非法 SMILES、canonical SMILES、描述符字段、规则超限、图像预处理、OCSR 兼容层、单图/手动 SMILES 端到端流程、批处理导出、PDF 报告以及可选 ADMET baseline。
 
 ## 项目目录
 
@@ -179,14 +209,16 @@ molecule-vision-ocsr/
 │   ├── samples/
 │   ├── batch_input/
 │   └── outputs/
+├── models/                # 可选本地模型；模型文件不提交到 Git
 ├── src/
 │   ├── preprocess/        # 图片读取、OpenCV 处理、过程可视化
 │   ├── ocsr/              # 统一接口与 demo/MolScribe/DECIMER 适配器
 │   ├── chem/              # RDKit 校验、描述符、规则、绘图
 │   ├── analysis/          # 单分子报告与批处理编排
 │   ├── export/            # JSON、CSV、可选 PDF
+│   ├── ml/                # 可选 Morgan + Random Forest ADMET baseline
 │   └── utils/             # 文件与日志工具
-├── scripts/               # 批处理、SMILES 分析、样例生成
+├── scripts/               # 批处理、SMILES 分析、样例生成、ADMET 训练
 ├── tests/                 # pytest 测试
 └── docs/                  # 说明书、API 与报告模板
 ```
