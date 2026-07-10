@@ -1,0 +1,193 @@
+"""Streamlit demonstration UI for Molecule Vision OCSR."""
+
+from __future__ import annotations
+
+import json
+import tempfile
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+from config import OUTPUT_DIR
+from src.analysis.batch_analyzer import BatchAnalyzer
+from src.analysis.molecule_report import MoleculeReportGenerator
+from src.export.json_exporter import to_json_text
+from src.export.pdf_exporter import save_pdf
+
+
+st.set_page_config(page_title="分子结构图像识别与性质分析", page_icon="🧪", layout="wide")
+
+
+def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_prefix: str) -> None:
+    """Render a molecule analysis report in Streamlit."""
+    if report.get("status") != "success":
+        st.error(report.get("message", "分析失败。"))
+        ocsr = report.get("ocsr") or {}
+        if ocsr:
+            st.caption(f"后端：{ocsr.get('backend')} · 状态：{ocsr.get('status')}")
+        return
+
+    ocsr = report.get("ocsr") or {}
+    validation = report.get("validation") or {}
+    st.success(report.get("message", "分析完成。"))
+    left, right = st.columns([1.1, 1])
+    with left:
+        st.subheader("结构识别")
+        st.code(ocsr.get("smiles") or "", language=None)
+        st.write(f"**Canonical SMILES：** `{validation.get('canonical_smiles')}`")
+        confidence = ocsr.get("confidence")
+        st.write(f"**识别后端：** {ocsr.get('backend')}　 **置信度：** {confidence if confidence is not None else '模型未提供'}")
+        st.write(f"**RDKit 校验：** {'有效' if validation.get('valid') else '无效'}")
+    with right:
+        st.subheader("标准化结构重绘")
+        drawing = (report.get("images") or {}).get("redrawn_molecule")
+        if drawing:
+            st.image(drawing, width="stretch")
+
+    descriptors = report.get("descriptors") or {}
+    st.subheader("分子基本性质")
+    display_names = {
+        "formula": "分子式", "molecular_weight": "MW", "logp": "LogP",
+        "tpsa": "TPSA", "hbd": "HBD", "hba": "HBA",
+        "rotatable_bonds": "可旋转键", "heavy_atom_count": "重原子数",
+    }
+    property_frame = pd.DataFrame(
+        [{"性质": display_names.get(key, key), "数值": str(value)} for key, value in descriptors.items()]
+    )
+    st.dataframe(property_frame, hide_index=True, width="stretch")
+
+    lipinski = report.get("lipinski") or {}
+    if lipinski.get("passed"):
+        st.info("✅ " + lipinski.get("summary", "符合规则。"))
+    else:
+        violations = "、".join(lipinski.get("violations") or [])
+        st.warning(f"⚠️ {lipinski.get('summary', '')} 超限项：{violations}")
+
+    if show_preprocessing and report.get("input", {}).get("type") == "image":
+        st.subheader("OpenCV 图像预处理过程")
+        stage_paths = (report.get("images") or {}).get("preprocessing") or {}
+        preferred = ["original", "gray", "denoised", "binary", "cropped", "deskewed", "normalized"]
+        titles = {"original": "原图", "gray": "灰度", "denoised": "去噪", "binary": "二值化", "cropped": "裁剪", "deskewed": "旋转校正", "normalized": "归一化"}
+        columns = st.columns(4)
+        for index, name in enumerate(preferred):
+            if name in stage_paths:
+                columns[index % 4].image(stage_paths[name], caption=titles[name], width="stretch")
+
+    json_text = to_json_text(report)
+    st.download_button(
+        "下载 JSON 报告", json_text, file_name=f"{key_prefix}_report.json",
+        mime="application/json", key=f"json_{key_prefix}",
+    )
+    if export_pdf:
+        pdf_result = save_pdf(report, OUTPUT_DIR / f"{key_prefix}_report.pdf")
+        if pdf_result["success"]:
+            st.download_button(
+                "下载 PDF 报告", Path(pdf_result["path"]).read_bytes(),
+                file_name=f"{key_prefix}_report.pdf", mime="application/pdf", key=f"pdf_{key_prefix}",
+            )
+        else:
+            st.caption(pdf_result["message"])
+
+
+st.title("基于计算机视觉的分子结构图像识别与性质分析系统")
+st.caption("图片 → OpenCV 预处理 → OCSR → SMILES → RDKit 校验 → 性质分析 → 报告")
+
+with st.sidebar:
+    st.header("运行设置")
+    backend = st.selectbox("OCSR 后端", ["demo", "molscribe", "decimer"], index=0)
+    show_preprocessing = st.checkbox("显示预处理过程", value=True)
+    export_pdf = st.checkbox("启用 PDF 报告", value=False)
+    if backend == "demo":
+        st.warning("当前未检测到真实 OCSR 模型，正在使用演示模式，请安装 MolScribe/DECIMER 后切换为真实识别模式。")
+    st.caption("CPU 可运行；真实模型可按各自配置自动使用相应设备。")
+
+image_tab, smiles_tab, batch_tab, about_tab = st.tabs(["图片识别", "SMILES 分析", "批量处理", "项目说明"])
+
+with image_tab:
+    uploaded = st.file_uploader("上传 PNG/JPG/JPEG 分子结构图", type=["png", "jpg", "jpeg"], key="single_upload")
+    if uploaded is not None:
+        st.image(uploaded, caption=f"上传原图：{uploaded.name}", width=500)
+        if st.button("开始识别与分析", type="primary", key="analyze_image"):
+            with st.spinner("正在执行图像预处理、OCSR 与 RDKit 分析……"):
+                suffix = Path(uploaded.name).suffix.lower()
+                prefix = Path(uploaded.name).stem + "_"
+                with tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False) as temporary:
+                    temporary.write(uploaded.getvalue())
+                    temporary_path = Path(temporary.name)
+                try:
+                    st.session_state["image_report"] = MoleculeReportGenerator(backend, OUTPUT_DIR).generate(image_path=temporary_path)
+                    st.session_state["image_report"]["input"]["filename"] = uploaded.name
+                finally:
+                    temporary_path.unlink(missing_ok=True)
+        if "image_report" in st.session_state:
+            show_report(st.session_state["image_report"], show_preprocessing, export_pdf, "image")
+
+with smiles_tab:
+    smiles_input = st.text_input("输入 SMILES", value="CCO", placeholder="例如：CCO")
+    if st.button("分析 SMILES", type="primary", key="analyze_smiles"):
+        with st.spinner("正在进行 RDKit 校验与性质计算……"):
+            st.session_state["smiles_report"] = MoleculeReportGenerator(backend, OUTPUT_DIR).generate(smiles=smiles_input)
+    if "smiles_report" in st.session_state:
+        show_report(st.session_state["smiles_report"], False, export_pdf, "smiles")
+
+with batch_tab:
+    st.write("可输入服务器上的文件夹路径，或一次上传多张图片。")
+    folder_path = st.text_input("输入文件夹路径（可选）", value="")
+    uploaded_files = st.file_uploader(
+        "批量上传图片", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="batch_upload"
+    )
+    if st.button("开始批量处理", type="primary", key="analyze_batch"):
+        with st.spinner("正在逐张处理并生成汇总……"):
+            try:
+                if uploaded_files:
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        for item in uploaded_files:
+                            (Path(temp_dir) / Path(item.name).name).write_bytes(item.getvalue())
+                        st.session_state["batch_result"] = BatchAnalyzer(backend, OUTPUT_DIR).analyze_folder(temp_dir)
+                elif folder_path.strip():
+                    st.session_state["batch_result"] = BatchAnalyzer(backend, OUTPUT_DIR).analyze_folder(folder_path.strip())
+                else:
+                    st.warning("请上传至少一张图片或填写输入文件夹路径。")
+            except Exception as exc:
+                st.error(f"批量处理失败：{exc}")
+    if "batch_result" in st.session_state:
+        batch_result = st.session_state["batch_result"]
+        summary = batch_result["summary"]
+        metrics = st.columns(4)
+        metrics[0].metric("总图片", summary["total"])
+        metrics[1].metric("成功", summary["successful"])
+        metrics[2].metric("有效 SMILES", summary["valid_smiles"])
+        metrics[3].metric("成功率", f"{summary['success_rate']:.1%}")
+        st.dataframe(batch_result["dataframe"], width="stretch", hide_index=True)
+        chart = batch_result["exports"]["summary_chart"]
+        if Path(chart).is_file():
+            st.image(chart, caption="批量结果统计", width=700)
+        csv_bytes = Path(batch_result["exports"]["csv"]).read_bytes()
+        st.download_button("下载 batch_results.csv", csv_bytes, "batch_results.csv", "text/csv", key="batch_csv")
+        st.download_button(
+            "下载 batch_results.json", to_json_text({"summary": summary, "results": batch_result["reports"]}),
+            "batch_results.json", "application/json", key="batch_json",
+        )
+
+with about_tab:
+    st.markdown("""
+### 项目背景
+
+医药研发、化学文献与专利中存在大量无法直接检索和计算的分子结构图片。本系统将二维结构图转换为 SMILES，并完成校验、重绘和基础性质分析。
+
+### 技术路线
+
+1. Pillow/OpenCV 读取图片并执行灰度化、去噪、二值化、白边裁剪、旋转校正和尺寸归一化；
+2. 通过可替换的 MolScribe、DECIMER 或 demo 适配器识别 SMILES；
+3. 使用 RDKit 校验、标准化、绘图并计算 MW、LogP、TPSA、HBD、HBA 等描述符；
+4. 通过 Lipinski 与扩展规则给出教学性质的风险提示；
+5. 导出 JSON、CSV 和可选 PDF 报告。
+
+### 局限性
+
+- 主要支持清晰的二维分子结构图片；复杂背景、手绘结构和低分辨率图片可能失败；
+- demo 模式只按样例文件名匹配，不是真实 OCSR；
+- 真实识别需要单独安装和配置 MolScribe 或 DECIMER；
+- 性质与规则分析仅供教学演示，不能替代药物实验或专业决策。
+""")

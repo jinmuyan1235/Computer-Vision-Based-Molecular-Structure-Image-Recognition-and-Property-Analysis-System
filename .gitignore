@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+data/outputs/*
+!data/outputs/.gitkeep
+data/batch_input/*
+!data/batch_input/.gitkeep
+*.onnx
+*.pth
+*.pt
