@@ -11,3 +11,20 @@ def test_streamlit_app_starts_without_exception() -> None:
     assert not app.exception
     assert app.title[0].value == "基于计算机视觉的分子结构图像识别与性质分析系统"
     assert len(app.tabs) == 4
+
+
+def test_smiles_result_page_renders_without_exception(tmp_path: Path) -> None:
+    """Execute result widgets directly so image/dataframe API errors cannot hide."""
+    from app import show_report
+    from src.analysis.molecule_report import MoleculeReportGenerator
+
+    report = MoleculeReportGenerator("demo", tmp_path).generate(smiles="CCO")
+    assert report["status"] == "success"
+    show_report(report, show_preprocessing=False, export_pdf=False, key_prefix="test_smiles")
+
+
+def test_app_avoids_newer_only_stretch_width_api() -> None:
+    """Keep the UI compatible with the project's existing Streamlit 1.41 environment."""
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    source = app_path.read_text(encoding="utf-8")
+    assert 'width="stretch"' not in source

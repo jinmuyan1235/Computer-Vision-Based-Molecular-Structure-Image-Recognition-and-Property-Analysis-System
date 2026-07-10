@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from config import OUTPUT_DIR
+from config import OCSR_BACKEND, OUTPUT_DIR
 from src.analysis.batch_analyzer import BatchAnalyzer
 from src.analysis.molecule_report import MoleculeReportGenerator
 from src.export.json_exporter import to_json_text
@@ -55,7 +55,7 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
         st.subheader("标准化结构重绘")
         drawing = (report.get("images") or {}).get("redrawn_molecule")
         if drawing:
-            st.image(drawing, width="stretch")
+            st.image(drawing, use_container_width=True)
 
     descriptors = report.get("descriptors") or {}
     st.subheader("分子基本性质")
@@ -67,7 +67,7 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
     property_frame = pd.DataFrame(
         [{"性质": display_names.get(key, key), "数值": str(value)} for key, value in descriptors.items()]
     )
-    st.dataframe(property_frame, hide_index=True, width="stretch")
+    st.dataframe(property_frame, hide_index=True, use_container_width=True)
 
     lipinski = report.get("lipinski") or {}
     if lipinski.get("passed"):
@@ -96,7 +96,9 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
         columns = st.columns(4)
         for index, name in enumerate(preferred):
             if name in stage_paths:
-                columns[index % 4].image(stage_paths[name], caption=titles[name], width="stretch")
+                columns[index % 4].image(
+                    stage_paths[name], caption=titles[name], use_container_width=True
+                )
 
     json_text = to_json_text(report)
     st.download_button(
@@ -119,11 +121,16 @@ st.caption("图片 → OpenCV 预处理 → OCSR → SMILES → RDKit 校验 →
 
 with st.sidebar:
     st.header("运行设置")
-    backend = st.selectbox("OCSR 后端", ["demo", "molscribe", "decimer"], index=0)
+    backend_options = ["demo", "molscribe", "decimer"]
+    backend_index = backend_options.index(OCSR_BACKEND) if OCSR_BACKEND in backend_options else 0
+    backend = st.selectbox("OCSR 后端", backend_options, index=backend_index)
     show_preprocessing = st.checkbox("显示预处理过程", value=True)
     export_pdf = st.checkbox("启用 PDF 报告", value=False)
     if backend == "demo":
-        st.warning("当前未检测到真实 OCSR 模型，正在使用演示模式，请安装 MolScribe/DECIMER 后切换为真实识别模式。")
+        st.info(
+            "当前主动选择的是 demo 演示后端；这与 RDKit/OpenCV 是否安装无关。"
+            "如已安装并配置 MolScribe/DECIMER，请在上方切换对应后端。"
+        )
     backend_status = get_report_generator(backend).recognizer.status()
     if backend_status["available"]:
         st.success(backend_status["message"])
@@ -188,7 +195,7 @@ with batch_tab:
         metrics[1].metric("成功", summary["successful"])
         metrics[2].metric("有效 SMILES", summary["valid_smiles"])
         metrics[3].metric("成功率", f"{summary['success_rate']:.1%}")
-        st.dataframe(batch_result["dataframe"], width="stretch", hide_index=True)
+        st.dataframe(batch_result["dataframe"], use_container_width=True, hide_index=True)
         chart = batch_result["exports"]["summary_chart"]
         if Path(chart).is_file():
             st.image(chart, caption="批量结果统计", width=700)
