@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from config import OUTPUT_DIR
 from src.chem.descriptors import calculate_descriptors
@@ -13,6 +14,7 @@ from src.chem.mol_drawer import draw_molecule
 from src.chem.smiles_validator import validate_smiles
 from src.ocsr.base import OCSRResult
 from src.ocsr.recognizer import MoleculeRecognizer
+from src.ml.admet_baseline import ConfiguredADMETPredictor
 from src.preprocess.image_preprocessor import ImagePreprocessor
 from src.preprocess.visualization import save_preprocessing_stages
 from src.utils.file_utils import ensure_directory, safe_stem
@@ -25,10 +27,12 @@ class MoleculeReportGenerator:
         self.output_dir = ensure_directory(output_dir)
         self.recognizer = MoleculeRecognizer(backend)
         self.preprocessor = ImagePreprocessor()
+        self.admet_predictor = ConfiguredADMETPredictor()
 
     @staticmethod
     def _base_report(input_data: dict[str, Any]) -> dict[str, Any]:
         return {
+            "analysis_id": uuid4().hex,
             "status": "failed",
             "message": "分析尚未完成。",
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -37,6 +41,7 @@ class MoleculeReportGenerator:
             "validation": {"valid": False, "canonical_smiles": None, "error": None},
             "descriptors": None,
             "lipinski": None,
+            "admet": None,
             "images": {"preprocessing": {}, "preprocessed": None, "redrawn_molecule": None},
         }
 
@@ -48,8 +53,8 @@ class MoleculeReportGenerator:
 
     def _from_image(self, image_path: str | Path) -> dict[str, Any]:
         path = Path(image_path).expanduser().resolve()
-        prefix = safe_stem(path.stem)
         report = self._base_report({"type": "image", "filename": path.name, "path": str(path)})
+        prefix = f"{safe_stem(path.stem)}_{report['analysis_id'][:8]}"
         try:
             stages = self.preprocessor.preprocess_pipeline(path)
             stage_paths = save_preprocessing_stages(stages, self.output_dir / "preprocessed", prefix)
@@ -69,8 +74,8 @@ class MoleculeReportGenerator:
         return self._complete_chemistry(report, result.smiles, prefix)
 
     def _from_smiles(self, smiles: str) -> dict[str, Any]:
-        prefix = f"manual_{safe_stem(smiles, 'smiles')[:50]}"
         report = self._base_report({"type": "smiles", "smiles": smiles})
+        prefix = f"manual_{safe_stem(smiles, 'smiles')[:40]}_{report['analysis_id'][:8]}"
         report["ocsr"] = OCSRResult(
             smiles=smiles,
             confidence=None,
@@ -93,6 +98,7 @@ class MoleculeReportGenerator:
             drawing_path = self.output_dir / "redrawn" / f"{prefix}_structure.png"
             report["descriptors"] = descriptors
             report["lipinski"] = lipinski
+            report["admet"] = self.admet_predictor.predict(canonical)
             report["images"]["redrawn_molecule"] = draw_molecule(canonical, drawing_path)
             report["status"] = "success"
             report["message"] = "分子识别与性质分析完成。"

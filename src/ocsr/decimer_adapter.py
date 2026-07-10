@@ -30,12 +30,33 @@ class DECIMERAdapter(BaseOCSRAdapter):
         if self.predictor is None:
             return OCSRResult(None, None, self.backend_name, "failed", self.import_error or "DECIMER 不可用。")
         try:
-            # TODO: Confirm the import path/API against the installed DECIMER version.
-            prediction = self.predictor(str(Path(image_path_or_array)))
-            smiles = prediction.get("smiles") if isinstance(prediction, dict) else prediction
+            image_path = str(Path(image_path_or_array))
+            try:
+                prediction = self.predictor(image_path, confidence=True)
+            except TypeError:
+                # Compatibility with DECIMER releases without the confidence flag.
+                prediction = self.predictor(image_path)
+            if isinstance(prediction, dict):
+                smiles = prediction.get("smiles") or prediction.get("SMILES")
+                confidence = prediction.get("confidence")
+            elif isinstance(prediction, (tuple, list)):
+                smiles = prediction[0] if prediction else None
+                confidence = prediction[1] if len(prediction) > 1 else None
+            else:
+                smiles, confidence = prediction, None
             if not smiles:
                 return OCSRResult(None, None, self.backend_name, "failed", "DECIMER 未返回 SMILES。")
-            confidence = prediction.get("confidence") if isinstance(prediction, dict) else None
-            return OCSRResult(str(smiles), confidence, self.backend_name, "success", "DECIMER 识别完成。")
+            numeric_confidence = float(confidence) if confidence is not None else None
+            return OCSRResult(str(smiles), numeric_confidence, self.backend_name, "success", "DECIMER 识别完成。")
         except Exception as exc:
             return OCSRResult(None, None, self.backend_name, "failed", f"DECIMER 推理失败：{exc}")
+
+    @property
+    def is_available(self) -> bool:
+        """Return whether DECIMER exposed its prediction function."""
+        return self.predictor is not None
+
+    @property
+    def availability_message(self) -> str:
+        """Describe the current DECIMER import state."""
+        return self.import_error or "DECIMER 后端已加载。"

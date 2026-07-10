@@ -34,6 +34,14 @@
 - 超限项：
 - 简单结论：
 
+## 可选 ADMET baseline
+
+- 状态：disabled / unavailable / failed / success
+- 预测终点：
+- 预测值：
+- 模型置信度（如有）：
+- 免责声明：该预测仅为教学 baseline，不能替代实验、毒理研究或专业决策。
+
 ## 图像附件
 
 - 各预处理阶段：

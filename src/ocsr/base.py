@@ -27,6 +27,24 @@ class BaseOCSRAdapter(ABC):
 
     backend_name = "base"
 
+    @property
+    def is_available(self) -> bool:
+        """Return whether this backend is ready for inference."""
+        return True
+
+    @property
+    def availability_message(self) -> str:
+        """Return a short human-readable backend readiness message."""
+        return f"{self.backend_name} 后端可用。"
+
+    def status(self) -> dict[str, Any]:
+        """Return JSON-friendly backend availability information."""
+        return {
+            "backend": self.backend_name,
+            "available": self.is_available,
+            "message": self.availability_message,
+        }
+
     @abstractmethod
     def recognize(self, image_path_or_array: Any) -> OCSRResult:
         """Recognize a molecular image and return an OCSRResult."""

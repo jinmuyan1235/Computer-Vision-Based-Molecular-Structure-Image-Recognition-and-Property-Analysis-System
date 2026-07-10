@@ -36,8 +36,12 @@ class MolScribeAdapter(BaseOCSRAdapter):
         if self.model is None:
             return OCSRResult(None, None, self.backend_name, "failed", self.import_error or "MolScribe 不可用。")
         try:
-            # MolScribe releases may expose slightly different return fields.
-            prediction = self.model.predict_image_file(str(Path(image_path_or_array)))
+            image_path = str(Path(image_path_or_array))
+            try:
+                prediction = self.model.predict_image_file(image_path, return_confidence=True)
+            except TypeError:
+                # Older releases may not expose the return_confidence keyword.
+                prediction = self.model.predict_image_file(image_path)
             if isinstance(prediction, dict):
                 smiles = prediction.get("smiles") or prediction.get("predicted_smiles")
                 confidence = prediction.get("confidence")
@@ -47,6 +51,14 @@ class MolScribeAdapter(BaseOCSRAdapter):
                 return OCSRResult(None, confidence, self.backend_name, "failed", "MolScribe 未返回 SMILES。")
             return OCSRResult(str(smiles), confidence, self.backend_name, "success", "MolScribe 识别完成。")
         except Exception as exc:
-            # TODO: If a selected MolScribe release changes its inference API,
-            # adapt the call above according to that release's documentation.
             return OCSRResult(None, None, self.backend_name, "failed", f"MolScribe 推理失败：{exc}")
+
+    @property
+    def is_available(self) -> bool:
+        """Return whether a MolScribe checkpoint was loaded successfully."""
+        return self.model is not None
+
+    @property
+    def availability_message(self) -> str:
+        """Describe the current MolScribe configuration state."""
+        return self.import_error or "MolScribe 模型已加载。"

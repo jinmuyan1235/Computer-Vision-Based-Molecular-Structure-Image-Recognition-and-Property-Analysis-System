@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Mapping
+from xml.sax.saxutils import escape
 
 
 def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, Any]:
@@ -26,20 +27,45 @@ def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, An
     try:
         styles = getSampleStyleSheet()
         story = [Paragraph("Molecule Vision OCSR Report", styles["Title"]), Spacer(1, 0.4 * cm)]
+        cell_style = styles["BodyText"].clone("ReportTableCell")
+        cell_style.fontSize = 8
+        cell_style.leading = 10
+
+        def cell(value: Any) -> Paragraph:
+            """Create a wrapping, XML-safe table cell."""
+            return Paragraph(escape(str(value)), cell_style)
+
         validation = report.get("validation", {}) or {}
         ocsr = report.get("ocsr", {}) or {}
         descriptors = report.get("descriptors", {}) or {}
         lipinski = report.get("lipinski", {}) or {}
+        admet = report.get("admet", {}) or {}
+        violations = lipinski.get("violations") or []
+        rule_summary = (
+            "Passed Lipinski and extended rotatable-bond checks."
+            if lipinski.get("passed")
+            else f"Violated checks: {', '.join(str(item) for item in violations) or 'unknown'}"
+        )
         rows = [
-            ["Field", "Value"],
-            ["Input", str(report.get("input", {}).get("filename") or report.get("input", {}).get("smiles", ""))],
-            ["Backend", str(ocsr.get("backend", "manual"))],
-            ["SMILES", str(ocsr.get("smiles") or report.get("input", {}).get("smiles", ""))],
-            ["Canonical SMILES", str(validation.get("canonical_smiles", ""))],
-            ["Valid", str(validation.get("valid", False))],
+            [cell("Field"), cell("Value")],
+            [cell("Analysis ID"), cell(report.get("analysis_id", ""))],
+            [cell("Input"), cell(report.get("input", {}).get("filename") or report.get("input", {}).get("smiles", ""))],
+            [cell("Backend"), cell(ocsr.get("backend", "manual"))],
+            [cell("SMILES"), cell(ocsr.get("smiles") or report.get("input", {}).get("smiles", ""))],
+            [cell("Canonical SMILES"), cell(validation.get("canonical_smiles", ""))],
+            [cell("Valid"), cell(validation.get("valid", False))],
         ]
-        rows.extend([[str(key), str(value)] for key, value in descriptors.items()])
-        rows.append(["Rule passed", str(lipinski.get("passed", ""))])
+        rows.extend([[cell(key), cell(value)] for key, value in descriptors.items()])
+        rows.extend([
+            [cell("Rule passed"), cell(lipinski.get("passed", ""))],
+            [cell("Rule summary"), cell(rule_summary)],
+        ])
+        if admet:
+            rows.extend([
+                [cell("ADMET status"), cell(admet.get("status", ""))],
+                [cell("ADMET endpoint"), cell(admet.get("target", ""))],
+                [cell("ADMET prediction"), cell(admet.get("prediction", ""))],
+            ])
         table = Table(rows, colWidths=[4.5 * cm, 12 * cm], repeatRows=1)
         table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#24445c")),
@@ -53,6 +79,13 @@ def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, An
         redrawn = (report.get("images", {}) or {}).get("redrawn_molecule")
         if redrawn and Path(redrawn).is_file():
             story.extend([Spacer(1, 0.5 * cm), Image(redrawn, width=12 * cm, height=9 * cm)])
+        story.extend([
+            Spacer(1, 0.4 * cm),
+            Paragraph(
+                "For teaching and data organization only. This report does not replace experimental, toxicology, or professional assessment.",
+                styles["Italic"],
+            ),
+        ])
         SimpleDocTemplate(str(destination), pagesize=A4).build(story)
         return {"success": True, "path": str(destination), "message": "PDF 报告已生成。"}
     except Exception as exc:
