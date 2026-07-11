@@ -39,6 +39,7 @@ def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, An
         ocsr = report.get("ocsr", {}) or {}
         correction = report.get("correction", {}) or {}
         final = report.get("final", {}) or {}
+        consensus = ocsr.get("consensus", {}) or {}
         descriptors = report.get("descriptors", {}) or {}
         lipinski = report.get("lipinski", {}) or {}
         admet = report.get("admet", {}) or {}
@@ -53,6 +54,9 @@ def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, An
             [cell("Analysis ID"), cell(report.get("analysis_id", ""))],
             [cell("Input"), cell(report.get("input", {}).get("filename") or report.get("input", {}).get("smiles", ""))],
             [cell("Backend"), cell(ocsr.get("backend", "manual"))],
+            [cell("Consensus Status"), cell(consensus.get("status", ""))],
+            [cell("Recommended Backend"), cell(consensus.get("recommended_backend", ""))],
+            [cell("Consensus Reason"), cell(consensus.get("reason", ""))],
             [cell("Predicted SMILES"), cell(ocsr.get("predicted_smiles") or ocsr.get("smiles") or "")],
             [cell("Predicted Canonical SMILES"), cell(ocsr.get("predicted_canonical_smiles", ""))],
             [cell("Correction Applied"), cell(correction.get("applied", False))],
@@ -74,6 +78,13 @@ def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, An
                 [cell("ADMET status"), cell(admet.get("status", ""))],
                 [cell("ADMET endpoint"), cell(admet.get("target", ""))],
                 [cell("ADMET prediction"), cell(admet.get("prediction", ""))],
+            ])
+        for candidate in ocsr.get("candidates", []) or []:
+            rows.extend([
+                [cell(f"Candidate {candidate.get('backend')} raw"), cell(candidate.get("raw_smiles", ""))],
+                [cell(f"Candidate {candidate.get('backend')} canonical"), cell(candidate.get("canonical_smiles", ""))],
+                [cell(f"Candidate {candidate.get('backend')} valid"), cell(candidate.get("valid", ""))],
+                [cell(f"Candidate {candidate.get('backend')} error"), cell(candidate.get("error", ""))],
             ])
         table = Table(rows, colWidths=[4.5 * cm, 12 * cm], repeatRows=1)
         table.setStyle(TableStyle([

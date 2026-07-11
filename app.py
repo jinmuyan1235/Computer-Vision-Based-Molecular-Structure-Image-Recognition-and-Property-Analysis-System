@@ -51,6 +51,50 @@ def remember_backend_status(backend: str) -> None:
     st.session_state["backend_last_status"] = get_report_generator(backend).recognizer.status()
 
 
+def show_ensemble_details(ocsr: dict) -> None:
+    """Render ensemble candidates and disagreement diagnostics."""
+    candidates = ocsr.get("candidates") or []
+    consensus = ocsr.get("consensus") or {}
+    if not candidates and not consensus:
+        return
+    st.subheader("多后端候选与共识")
+    status = consensus.get("status") or "unknown"
+    reason = consensus.get("reason") or ""
+    if status == "agreement":
+        st.success(f"共识：{reason}")
+    elif status == "disagreement":
+        st.warning(consensus.get("warning") or reason)
+        st.caption(reason)
+    elif status in {"single_valid", "invalid_candidates", "all_failed"}:
+        st.info(reason)
+    if consensus.get("recommended_smiles"):
+        st.write(f"**推荐结果：** `{consensus.get('recommended_smiles')}`")
+        st.write(f"**推荐来源：** {consensus.get('recommended_backend')}")
+    if consensus.get("confidence_policy"):
+        st.caption(consensus.get("confidence_policy"))
+    if candidates:
+        rows = [
+            {
+                "backend": candidate.get("backend"),
+                "status": candidate.get("status"),
+                "raw_smiles": candidate.get("raw_smiles"),
+                "canonical_smiles": candidate.get("canonical_smiles"),
+                "valid": candidate.get("valid"),
+                "confidence": candidate.get("confidence"),
+                "time_ms": candidate.get("inference_time_ms"),
+                "model": candidate.get("model_name"),
+                "device": candidate.get("device"),
+                "error": candidate.get("error"),
+            }
+            for candidate in candidates
+        ]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    similarity = ocsr.get("similarity_analysis") or []
+    if similarity:
+        st.caption("候选差异指标只解释模型输出之间的差异，不代表与原图一致。")
+        st.dataframe(pd.DataFrame(similarity), hide_index=True, use_container_width=True)
+
+
 def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_prefix: str) -> None:
     """Render a molecule analysis report in Streamlit."""
     if report.get("status") != "success":
@@ -58,6 +102,7 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
         ocsr = report.get("ocsr") or {}
         if ocsr:
             st.caption(f"后端：{ocsr.get('backend')} · 状态：{ocsr.get('status')}")
+            show_ensemble_details(ocsr)
         return
 
     ocsr = report.get("ocsr") or {}
@@ -88,6 +133,7 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
         if diagnostic_line:
             st.caption(diagnostic_line)
         st.write(f"**RDKit 校验：** {'有效' if validation.get('valid') else '无效'}")
+        show_ensemble_details(ocsr)
     with right:
         st.subheader("标准化结构重绘")
         drawing = (report.get("images") or {}).get("redrawn_molecule")
@@ -235,7 +281,7 @@ st.caption("图片 → OpenCV 预处理 → OCSR → SMILES → RDKit 校验 →
 
 with st.sidebar:
     st.header("运行设置")
-    backend_options = ["demo", "molscribe", "decimer"]
+    backend_options = ["demo", "molscribe", "decimer", "ensemble"]
     backend_index = backend_options.index(OCSR_BACKEND) if OCSR_BACKEND in backend_options else 0
     backend = st.selectbox("OCSR 后端", backend_options, index=backend_index)
     show_preprocessing = st.checkbox("显示预处理过程", value=True)
@@ -254,6 +300,8 @@ with st.sidebar:
             st.warning("MolScribe 当前不可用。请配置模型权重，或切换 demo 后端，也可以使用手动 SMILES 分析。")
         if backend == "decimer":
             st.warning("DECIMER 当前不可用。请安装兼容 decimer 包并确认 TensorFlow/设备环境，或切换 demo 后端。")
+        if backend == "ensemble":
+            st.warning("ensemble 当前没有可用真实子后端时不会伪装成功；可继续使用人工 SMILES 分析。")
     st.write(f"**当前后端：** {backend_status.get('backend', backend)}")
     st.write(f"**是否可用：** {'是' if backend_status.get('available') else '否'}")
     st.write(f"**模型：** {backend_status.get('model_name') or backend_status.get('model_path') or '无'}")
@@ -261,9 +309,17 @@ with st.sidebar:
     st.write(f"**包版本：** {backend_status.get('package_version') or '未安装/未提供'}")
     if backend_status.get("image_strategy"):
         st.write(f"**输入策略：** {backend_status.get('image_strategy')}")
+    if backend_status.get("enabled_backends"):
+        st.write(f"**子后端：** {', '.join(backend_status.get('enabled_backends') or [])}")
+        st.write(f"**执行模式：** {'并行' if backend_status.get('parallel') else '串行安全'}")
+    for child in backend_status.get("child_statuses") or []:
+        st.caption(
+            f"{child.get('backend')}: {'可用' if child.get('available') else '不可用'} · "
+            f"{child.get('device') or 'device n/a'} · {child.get('message') or ''}"
+        )
     last_time = backend_status.get("last_inference_time_ms")
     st.write(f"**最近推理耗时：** {last_time} ms" if last_time is not None else "**最近推理耗时：** 暂无")
-    st.caption("CPU 可运行；真实模型可按各自配置自动使用相应设备。")
+    st.caption("默认串行安全运行；MolScribe 可用 PyTorch CUDA，DECIMER 可用 TensorFlow GPU/auto。")
 
 image_tab, smiles_tab, batch_tab, about_tab = st.tabs(["图片识别", "SMILES 分析", "批量处理", "项目说明"])
 
@@ -347,7 +403,7 @@ with about_tab:
 ### 技术路线
 
 1. Pillow/OpenCV 读取图片并执行灰度化、去噪、二值化、白边裁剪、旋转校正和尺寸归一化；
-2. 通过可替换的 MolScribe、DECIMER 或 demo 适配器识别 SMILES；
+2. 通过可替换的 MolScribe、DECIMER、ensemble 或 demo 适配器识别 SMILES；
 3. 使用 RDKit 校验、标准化、绘图并计算 MW、LogP、TPSA、HBD、HBA 等描述符；
 4. 通过 Lipinski 与扩展规则给出教学性质的风险提示；
 5. 导出 JSON、CSV 和可选 PDF 报告。
@@ -356,6 +412,6 @@ with about_tab:
 
 - 主要支持清晰的二维分子结构图片；复杂背景、手绘结构和低分辨率图片可能失败；
 - demo 模式只按样例文件名匹配，不是真实 OCSR；
-- 真实识别需要单独安装和配置 MolScribe 或 DECIMER；
+- 真实识别需要单独安装和配置 MolScribe 或 DECIMER；ensemble 只解释模型一致/分歧，不会证明哪个候选一定符合原图；
 - 性质与规则分析仅供教学演示，不能替代药物实验或专业决策。
 """)

@@ -19,7 +19,7 @@ from src.evaluation.report_writer import create_run_directory, write_report_bund
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate an OCSR backend against a CSV manifest.")
     parser.add_argument("--manifest", required=True, help="CSV manifest path.")
-    parser.add_argument("--backend", default="demo", choices=["demo", "molscribe", "decimer"], help="OCSR backend.")
+    parser.add_argument("--backend", default="demo", choices=["demo", "molscribe", "decimer", "ensemble"], help="OCSR backend.")
     parser.add_argument("--output", default="data/outputs/benchmark", help="Output root for benchmark runs.")
     parser.add_argument("--dataset-root", default=str(PROJECT_ROOT), help="Root directory image paths must stay inside.")
     parser.add_argument(

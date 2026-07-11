@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,8 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
     validation = report.get("validation") or {}
     descriptors = report.get("descriptors") or {}
     lipinski = report.get("lipinski") or {}
+    consensus = ocsr.get("consensus") or {}
+    candidates = ocsr.get("candidates") or []
     return {
         "filename": input_data.get("filename"),
         "status": report.get("status"),
@@ -44,6 +47,11 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
         "model_name": ocsr.get("model_name"),
         "model_version": ocsr.get("model_version"),
         "device": ocsr.get("device"),
+        "candidate_count": len(candidates),
+        "consensus_status": consensus.get("status"),
+        "recommended_backend": consensus.get("recommended_backend"),
+        "ensemble_disagreement": consensus.get("status") == "disagreement",
+        "ensemble_candidates": json.dumps(candidates, ensure_ascii=False),
         "valid": bool(validation.get("valid", False)),
         "canonical_smiles": validation.get("canonical_smiles"),
         "formula": descriptors.get("formula"),

@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.ocsr.demo_adapter import DemoOCSRAdapter
 from src.ocsr.decimer_adapter import DECIMERAdapter
+from src.ocsr.ensemble import EnsembleOCSRAdapter
 from src.ocsr.molscribe_adapter import MolScribeAdapter
 
 
@@ -53,6 +54,11 @@ def check_backend(backend: str) -> dict[str, Any]:
         status = adapter.diagnose(load_model=True)
         status["python_version"] = platform.python_version()
         return status
+    if backend == "ensemble":
+        adapter = EnsembleOCSRAdapter()
+        status = adapter.status()
+        status["python_version"] = platform.python_version()
+        return status
     adapter = MolScribeAdapter()
     status = adapter.diagnose(load_model=True)
     status["python_version"] = platform.python_version()
@@ -61,7 +67,7 @@ def check_backend(backend: str) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check OCSR backend readiness.")
-    parser.add_argument("--backend", choices=["molscribe", "demo", "decimer"], default="molscribe")
+    parser.add_argument("--backend", choices=["molscribe", "demo", "decimer", "ensemble"], default="molscribe")
     args = parser.parse_args()
     status = check_backend(args.backend)
     print(json.dumps(status, ensure_ascii=False, indent=2))
