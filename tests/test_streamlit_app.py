@@ -35,3 +35,11 @@ def test_streamlit_molscribe_unavailable_selection_does_not_crash() -> None:
     app = AppTest.from_file(str(app_path), default_timeout=30).run()
     app.selectbox[0].set_value("molscribe").run()
     assert not app.exception
+
+
+def test_streamlit_correction_widgets_are_present() -> None:
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    source = app_path.read_text(encoding="utf-8")
+    assert "校验并应用修正" in source
+    assert "恢复模型原始结果" in source
+    assert "保存为纠错反馈样本" in source
