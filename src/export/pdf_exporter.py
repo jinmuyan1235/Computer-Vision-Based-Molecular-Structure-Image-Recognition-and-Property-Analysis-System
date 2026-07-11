@@ -37,6 +37,8 @@ def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, An
 
         validation = report.get("validation", {}) or {}
         ocsr = report.get("ocsr", {}) or {}
+        correction = report.get("correction", {}) or {}
+        final = report.get("final", {}) or {}
         descriptors = report.get("descriptors", {}) or {}
         lipinski = report.get("lipinski", {}) or {}
         admet = report.get("admet", {}) or {}
@@ -51,7 +53,14 @@ def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, An
             [cell("Analysis ID"), cell(report.get("analysis_id", ""))],
             [cell("Input"), cell(report.get("input", {}).get("filename") or report.get("input", {}).get("smiles", ""))],
             [cell("Backend"), cell(ocsr.get("backend", "manual"))],
-            [cell("SMILES"), cell(ocsr.get("smiles") or report.get("input", {}).get("smiles", ""))],
+            [cell("Predicted SMILES"), cell(ocsr.get("predicted_smiles") or ocsr.get("smiles") or "")],
+            [cell("Predicted Canonical SMILES"), cell(ocsr.get("predicted_canonical_smiles", ""))],
+            [cell("Correction Applied"), cell(correction.get("applied", False))],
+            [cell("Corrected SMILES"), cell(correction.get("corrected_smiles", ""))],
+            [cell("Corrected Canonical SMILES"), cell(correction.get("corrected_canonical_smiles", ""))],
+            [cell("Corrected At"), cell(correction.get("corrected_at", ""))],
+            [cell("Final SMILES"), cell(final.get("smiles") or ocsr.get("smiles") or report.get("input", {}).get("smiles", ""))],
+            [cell("Final Result Source"), cell(final.get("source", ""))],
             [cell("Canonical SMILES"), cell(validation.get("canonical_smiles", ""))],
             [cell("Valid"), cell(validation.get("valid", False))],
         ]
@@ -78,7 +87,16 @@ def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, An
         story.append(table)
         redrawn = (report.get("images", {}) or {}).get("redrawn_molecule")
         if redrawn and Path(redrawn).is_file():
-            story.extend([Spacer(1, 0.5 * cm), Image(redrawn, width=12 * cm, height=9 * cm)])
+            story.extend([
+                Spacer(1, 0.5 * cm),
+                Paragraph("Final structure", styles["Heading3"]),
+                Image(redrawn, width=12 * cm, height=9 * cm),
+            ])
+        predicted_image = (report.get("images", {}) or {}).get("predicted_molecule")
+        corrected_image = (report.get("images", {}) or {}).get("corrected_molecule")
+        for title, image_path in (("Original prediction structure", predicted_image), ("Human correction structure", corrected_image)):
+            if image_path and Path(image_path).is_file():
+                story.extend([Spacer(1, 0.4 * cm), Paragraph(title, styles["Heading3"]), Image(image_path, width=10 * cm, height=7 * cm)])
         story.extend([
             Spacer(1, 0.4 * cm),
             Paragraph(

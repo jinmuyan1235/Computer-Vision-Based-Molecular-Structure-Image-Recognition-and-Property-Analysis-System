@@ -11,6 +11,12 @@ import streamlit as st
 
 from config import OCSR_BACKEND, OUTPUT_DIR
 from src.analysis.batch_analyzer import BatchAnalyzer
+from src.analysis.correction import (
+    apply_smiles_correction,
+    restore_original_prediction,
+    save_correction_feedback,
+    structure_similarity,
+)
 from src.analysis.molecule_report import MoleculeReportGenerator
 from src.export.json_exporter import to_json_text
 from src.export.pdf_exporter import save_pdf
@@ -55,15 +61,20 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
         return
 
     ocsr = report.get("ocsr") or {}
+    correction = report.get("correction") or {}
+    final = report.get("final") or {}
     validation = report.get("validation") or {}
     st.success(report.get("message", "分析完成。"))
     left, right = st.columns([1.1, 1])
     with left:
         st.subheader("结构识别")
-        st.code(ocsr.get("smiles") or "", language=None)
-        st.write(f"**Canonical SMILES：** `{validation.get('canonical_smiles')}`")
+        st.code(final.get("smiles") or ocsr.get("smiles") or "", language=None)
+        st.write(f"**Canonical SMILES：** `{final.get('canonical_smiles') or validation.get('canonical_smiles')}`")
         confidence = ocsr.get("confidence")
         st.write(f"**识别后端：** {ocsr.get('backend')}　 **置信度：** {confidence if confidence is not None else '模型未提供'}")
+        st.write(f"**当前结果来源：** {final.get('source') or 'unknown'}")
+        if correction.get("applied"):
+            st.info(f"已应用人工修正：`{correction.get('corrected_canonical_smiles')}`")
         diagnostic_line = " · ".join(
             item
             for item in [
@@ -142,6 +153,83 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
             st.caption(pdf_result["message"])
 
 
+def show_correction_panel(report: dict) -> dict:
+    """Render human correction controls for an image report and return the current report."""
+    if (report.get("input") or {}).get("type") != "image":
+        return report
+    analysis_id = report.get("analysis_id") or "image"
+    ocsr = report.get("ocsr") or {}
+    correction = report.get("correction") or {}
+    final = report.get("final") or {}
+    predicted = ocsr.get("predicted_smiles") or ocsr.get("smiles") or ""
+    default_smiles = correction.get("corrected_smiles") or final.get("smiles") or predicted
+
+    st.subheader("人工纠错")
+    status_label = "已人工修正" if correction.get("applied") else "未人工修正"
+    st.caption(f"纠错状态：{status_label} · 当前结果来源：{final.get('source') or '暂无有效结果'}")
+    st.text_input("模型原始预测", value=predicted, disabled=True, key=f"predicted_{analysis_id}")
+    corrected_input = st.text_input(
+        "修正 SMILES",
+        value=default_smiles or "",
+        key=f"corrected_smiles_{analysis_id}",
+        placeholder="OCSR 失败时也可以在这里手动输入 SMILES",
+    )
+    actions = st.columns([1, 1, 1])
+    current_report = report
+    if actions[0].button("校验并应用修正", type="primary", key=f"apply_correction_{analysis_id}"):
+        candidate = apply_smiles_correction(report, corrected_input, OUTPUT_DIR)
+        error = (candidate.get("correction") or {}).get("last_error")
+        if error:
+            st.error(error)
+        else:
+            current_report = candidate
+            st.session_state["image_report"] = current_report
+            st.success("人工修正已应用，性质和结构图已重新生成。")
+    if actions[1].button("恢复模型原始结果", key=f"restore_prediction_{analysis_id}"):
+        candidate = restore_original_prediction(report, OUTPUT_DIR)
+        error = (candidate.get("correction") or {}).get("last_error")
+        if error:
+            st.warning(error)
+        else:
+            current_report = candidate
+            st.session_state["image_report"] = current_report
+            st.success("已恢复为模型原始预测。")
+
+    updated_correction = current_report.get("correction") or {}
+    feedback_notes = st.text_area("反馈备注（可选）", value="", key=f"feedback_notes_{analysis_id}", height=80)
+    if actions[2].button(
+        "保存为纠错反馈样本",
+        key=f"save_feedback_{analysis_id}",
+        disabled=not bool(updated_correction.get("applied")),
+    ):
+        feedback_path = save_correction_feedback(current_report, OUTPUT_DIR, feedback_notes)
+        st.session_state[f"feedback_path_{analysis_id}"] = feedback_path
+        st.success(f"反馈样本已保存：{feedback_path}")
+    if st.session_state.get(f"feedback_path_{analysis_id}"):
+        st.caption(f"最近保存的反馈样本：{st.session_state[f'feedback_path_{analysis_id}']}")
+
+    images = current_report.get("images") or {}
+    predicted_image = images.get("predicted_molecule")
+    corrected_image = images.get("corrected_molecule")
+    if predicted_image or corrected_image:
+        st.subheader("结构对比")
+        columns = st.columns(2) if predicted_image and corrected_image else st.columns(1)
+        if predicted_image:
+            columns[0].image(predicted_image, caption="模型预测结构", use_container_width=True)
+        elif predicted:
+            st.caption("模型原始预测不能被 RDKit 解析，无法绘制预测结构。")
+        if corrected_image:
+            target_column = columns[1] if predicted_image and corrected_image else columns[0]
+            target_column.image(corrected_image, caption="人工修正结构", use_container_width=True)
+        if predicted and updated_correction.get("corrected_smiles"):
+            similarity = structure_similarity(predicted, updated_correction.get("corrected_smiles"))
+            if similarity is not None:
+                st.caption(f"Morgan Tanimoto 相似度：{similarity:.3f}。该值只比较两个分子结果，不代表与原图一致。")
+    elif predicted:
+        st.caption("模型原始预测不能被 RDKit 解析，无法绘制预测结构。")
+    return current_report
+
+
 st.title("基于计算机视觉的分子结构图像识别与性质分析系统")
 st.caption("图片 → OpenCV 预处理 → OCSR → SMILES → RDKit 校验 → 性质分析 → 报告")
 
@@ -193,7 +281,8 @@ with image_tab:
                 finally:
                     temporary_path.unlink(missing_ok=True)
         if "image_report" in st.session_state:
-            show_report(st.session_state["image_report"], show_preprocessing, export_pdf, "image")
+            active_report = show_correction_panel(st.session_state["image_report"])
+            show_report(active_report, show_preprocessing, export_pdf, f"image_{active_report.get('analysis_id', 'report')[:8]}")
 
 with smiles_tab:
     smiles_input = st.text_input("输入 SMILES", value="CCO", placeholder="例如：CCO")

@@ -1,0 +1,239 @@
+"""Human SMILES correction workflow for image-based OCSR reports."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from rdkit import DataStructs
+from rdkit.Chem import AllChem
+
+from config import OUTPUT_DIR, PROJECT_ROOT
+from src.chem.descriptors import calculate_descriptors
+from src.chem.lipinski import evaluate_lipinski
+from src.chem.mol_drawer import draw_molecule
+from src.chem.smiles_validator import smiles_to_mol, validate_smiles
+from src.export.json_exporter import save_json
+from src.ml.admet_baseline import ConfiguredADMETPredictor
+from src.utils.file_utils import ensure_directory, safe_stem
+
+
+def utc_now_iso() -> str:
+    """Return a stable UTC timestamp for report metadata."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def sha256_file(path: str | Path) -> str | None:
+    """Return a SHA-256 digest for a local file when it is available."""
+    try:
+        digest = hashlib.sha256()
+        with Path(path).expanduser().resolve().open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return None
+
+
+def default_correction_state() -> dict[str, Any]:
+    """Return the default correction block for a report."""
+    return {
+        "applied": False,
+        "corrected_smiles": None,
+        "corrected_canonical_smiles": None,
+        "corrected_at": None,
+        "source": None,
+        "last_error": None,
+    }
+
+
+def default_final_state() -> dict[str, Any]:
+    """Return the default final result block for a report."""
+    return {"smiles": None, "canonical_smiles": None, "source": None}
+
+
+def normalize_ocsr_block(ocsr: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Add prediction-specific aliases while keeping legacy OCSR fields."""
+    if not ocsr:
+        return ocsr
+    normalized = dict(ocsr)
+    predicted = normalized.get("predicted_smiles")
+    if predicted is None:
+        predicted = normalized.get("smiles")
+    normalized["predicted_smiles"] = predicted
+    if "predicted_canonical_smiles" not in normalized:
+        validation = validate_smiles(predicted)
+        normalized["predicted_canonical_smiles"] = validation["canonical_smiles"] if validation["valid"] else None
+    return normalized
+
+
+def ensure_traceability_blocks(report: dict[str, Any]) -> dict[str, Any]:
+    """Ensure report contains correction/final blocks without mutating input."""
+    updated = copy.deepcopy(report)
+    updated["ocsr"] = normalize_ocsr_block(updated.get("ocsr"))
+    updated.setdefault("correction", default_correction_state())
+    for key, value in default_correction_state().items():
+        updated["correction"].setdefault(key, value)
+    updated.setdefault("final", default_final_state())
+    for key, value in default_final_state().items():
+        updated["final"].setdefault(key, value)
+    updated.setdefault("images", {})
+    updated["images"].setdefault("predicted_molecule", None)
+    updated["images"].setdefault("corrected_molecule", None)
+    return updated
+
+
+def structure_similarity(smiles_a: str | None, smiles_b: str | None) -> float | None:
+    """Return Morgan Tanimoto similarity between two valid SMILES strings."""
+    mol_a = smiles_to_mol(smiles_a or "")
+    mol_b = smiles_to_mol(smiles_b or "")
+    if mol_a is None or mol_b is None:
+        return None
+    try:
+        fp_a = AllChem.GetMorganFingerprintAsBitVect(mol_a, 2, nBits=2048)
+        fp_b = AllChem.GetMorganFingerprintAsBitVect(mol_b, 2, nBits=2048)
+        return round(float(DataStructs.TanimotoSimilarity(fp_a, fp_b)), 6)
+    except Exception:
+        return None
+
+
+def _report_prefix(report: dict[str, Any], suffix: str) -> str:
+    analysis_id = str(report.get("analysis_id") or "analysis")
+    filename = ((report.get("input") or {}).get("filename") or "molecule").rsplit(".", 1)[0]
+    return f"{safe_stem(filename)}_{analysis_id[:8]}_{suffix}"
+
+
+def _apply_final_smiles(
+    report: dict[str, Any],
+    smiles: str,
+    source: str,
+    output_dir: str | Path,
+    image_slot: str,
+    message: str,
+) -> dict[str, Any]:
+    """Validate and recalculate all chemistry fields for a final SMILES."""
+    validation = validate_smiles(smiles)
+    updated = ensure_traceability_blocks(report)
+    if not validation["valid"]:
+        updated["message"] = validation["error"]
+        updated["validation"] = validation
+        return updated
+    canonical = str(validation["canonical_smiles"])
+    descriptors = calculate_descriptors(canonical)
+    lipinski = evaluate_lipinski(descriptors)
+    output_root = ensure_directory(output_dir)
+    drawing_path = output_root / "redrawn" / f"{_report_prefix(updated, image_slot)}_structure.png"
+    drawing = draw_molecule(canonical, drawing_path)
+    updated["validation"] = validation
+    updated["descriptors"] = descriptors
+    updated["lipinski"] = lipinski
+    updated["admet"] = ConfiguredADMETPredictor().predict(canonical)
+    updated["final"] = {"smiles": smiles, "canonical_smiles": canonical, "source": source}
+    updated["images"]["redrawn_molecule"] = drawing
+    updated["images"][image_slot] = drawing
+    updated["status"] = "success"
+    updated["message"] = message
+    return updated
+
+
+def apply_smiles_correction(
+    report: dict[str, Any],
+    corrected_smiles: str,
+    output_dir: str | Path = OUTPUT_DIR,
+) -> dict[str, Any]:
+    """Return a corrected report without mutating the original report."""
+    updated = ensure_traceability_blocks(report)
+    attempted = (corrected_smiles or "").strip()
+    validation = validate_smiles(attempted)
+    if not validation["valid"]:
+        updated["correction"]["last_error"] = validation["error"]
+        updated["correction"]["attempted_smiles"] = attempted
+        updated["correction"]["attempted_at"] = utc_now_iso()
+        return updated
+    source = "manual_after_ocsr_failure"
+    ocsr = updated.get("ocsr") or {}
+    if ocsr.get("status") == "success" and ocsr.get("predicted_smiles"):
+        source = "user_correction"
+    corrected = _apply_final_smiles(
+        updated,
+        attempted,
+        source,
+        output_dir,
+        "corrected_molecule",
+        "已应用人工修正并重新计算性质。",
+    )
+    corrected["correction"] = {
+        "applied": True,
+        "corrected_smiles": attempted,
+        "corrected_canonical_smiles": validation["canonical_smiles"],
+        "corrected_at": utc_now_iso(),
+        "source": "user",
+        "last_error": None,
+    }
+    return corrected
+
+
+def restore_original_prediction(report: dict[str, Any], output_dir: str | Path = OUTPUT_DIR) -> dict[str, Any]:
+    """Return a report restored to its original model prediction when valid."""
+    updated = ensure_traceability_blocks(report)
+    ocsr = updated.get("ocsr") or {}
+    predicted = ocsr.get("predicted_smiles") or ocsr.get("smiles")
+    validation = validate_smiles(predicted)
+    if not validation["valid"]:
+        updated["correction"]["last_error"] = "原始模型预测无法被 RDKit 解析，不能恢复为最终分析结果。"
+        return updated
+    restored = _apply_final_smiles(
+        updated,
+        str(predicted),
+        "ocsr",
+        output_dir,
+        "predicted_molecule",
+        "已恢复为模型原始预测并重新计算性质。",
+    )
+    restored["correction"] = default_correction_state()
+    return restored
+
+
+def save_correction_feedback(
+    report: dict[str, Any],
+    output_dir: str | Path = OUTPUT_DIR,
+    notes: str = "",
+) -> str:
+    """Persist a user-triggered correction feedback sample without personal data."""
+    traced = ensure_traceability_blocks(report)
+    analysis_id = str(traced.get("analysis_id") or "analysis")
+    feedback_dir = ensure_directory(Path(output_dir) / "feedback")
+    input_data = traced.get("input") or {}
+    path = input_data.get("path")
+    relative_path = None
+    if path:
+        try:
+            resolved = Path(path).expanduser().resolve()
+            relative_path = str(resolved.relative_to(PROJECT_ROOT))
+        except Exception:
+            relative_path = None
+    ocsr = traced.get("ocsr") or {}
+    payload = {
+        "analysis_id": analysis_id,
+        "saved_at": utc_now_iso(),
+        "input": {
+            "filename": input_data.get("filename"),
+            "relative_path": relative_path,
+            "image_sha256": input_data.get("image_sha256"),
+        },
+        "prediction": {
+            "predicted_smiles": ocsr.get("predicted_smiles") or ocsr.get("smiles"),
+            "predicted_canonical_smiles": ocsr.get("predicted_canonical_smiles"),
+            "confidence": ocsr.get("confidence"),
+            "backend": ocsr.get("backend"),
+            "model_name": ocsr.get("model_name"),
+            "model_version": ocsr.get("model_version"),
+        },
+        "correction": traced.get("correction"),
+        "final": traced.get("final"),
+        "notes": notes,
+    }
+    return save_json(payload, feedback_dir / f"{safe_stem(analysis_id)}.json")
