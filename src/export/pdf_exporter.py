@@ -39,6 +39,9 @@ def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, An
         ocsr = report.get("ocsr", {}) or {}
         correction = report.get("correction", {}) or {}
         final = report.get("final", {}) or {}
+        identity = report.get("chemical_identity", {}) or {}
+        standardization = report.get("standardization", {}) or {}
+        structure_warnings = report.get("structure_warnings", []) or []
         consensus = ocsr.get("consensus", {}) or {}
         descriptors = report.get("descriptors", {}) or {}
         lipinski = report.get("lipinski", {}) or {}
@@ -59,13 +62,23 @@ def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, An
             [cell("Consensus Reason"), cell(consensus.get("reason", ""))],
             [cell("Predicted SMILES"), cell(ocsr.get("predicted_smiles") or ocsr.get("smiles") or "")],
             [cell("Predicted Canonical SMILES"), cell(ocsr.get("predicted_canonical_smiles", ""))],
+            [cell("Predicted Standardized SMILES"), cell(ocsr.get("predicted_standardized_smiles", ""))],
             [cell("Correction Applied"), cell(correction.get("applied", False))],
             [cell("Corrected SMILES"), cell(correction.get("corrected_smiles", ""))],
             [cell("Corrected Canonical SMILES"), cell(correction.get("corrected_canonical_smiles", ""))],
             [cell("Corrected At"), cell(correction.get("corrected_at", ""))],
             [cell("Final SMILES"), cell(final.get("smiles") or ocsr.get("smiles") or report.get("input", {}).get("smiles", ""))],
+            [cell("Final Raw SMILES"), cell(final.get("raw_smiles", ""))],
             [cell("Final Result Source"), cell(final.get("source", ""))],
             [cell("Canonical SMILES"), cell(validation.get("canonical_smiles", ""))],
+            [cell("Standardized SMILES"), cell(validation.get("standardized_smiles") or identity.get("standardized_smiles", ""))],
+            [cell("InChIKey"), cell(identity.get("inchikey", ""))],
+            [cell("Formula"), cell(identity.get("formula", ""))],
+            [cell("Formal charge"), cell(identity.get("formal_charge", ""))],
+            [cell("Fragment count"), cell(identity.get("fragment_count", ""))],
+            [cell("Standardization profile"), cell(standardization.get("profile", ""))],
+            [cell("Standardization changed"), cell(standardization.get("changed", False))],
+            [cell("Structure warning count"), cell(len(structure_warnings))],
             [cell("Valid"), cell(validation.get("valid", False))],
         ]
         rows.extend([[cell(key), cell(value)] for key, value in descriptors.items()])

@@ -92,6 +92,12 @@ def _parse_reliability_weights(raw: str) -> dict[str, float]:
 OCSR_ENSEMBLE_RELIABILITY_WEIGHTS = _parse_reliability_weights(
     os.getenv("OCSR_ENSEMBLE_RELIABILITY_WEIGHTS", "molscribe=1.0,decimer=1.0")
 )
+CHEM_STANDARDIZATION_PROFILE = os.getenv("CHEM_STANDARDIZATION_PROFILE", "conservative").strip().lower()
+if CHEM_STANDARDIZATION_PROFILE not in {"none", "conservative", "parent", "tautomer_canonical"}:
+    CHEM_STANDARDIZATION_PROFILE = "conservative"
+CHEM_STANDARDIZATION_COMPARE_MODE = os.getenv("CHEM_STANDARDIZATION_COMPARE_MODE", "raw").strip().lower()
+if CHEM_STANDARDIZATION_COMPARE_MODE not in {"raw", "standardized"}:
+    CHEM_STANDARDIZATION_COMPARE_MODE = "raw"
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
 for directory in (DATA_DIR, SAMPLE_DIR, BATCH_INPUT_DIR, OUTPUT_DIR, MODEL_DIR):

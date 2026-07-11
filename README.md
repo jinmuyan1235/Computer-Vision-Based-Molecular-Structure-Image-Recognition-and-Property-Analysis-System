@@ -533,3 +533,88 @@ python scripts/check_ocsr_backend.py --backend decimer
 ```
 
 确认 `gpu_available: true` 后再跑真实 benchmark。
+
+## 化学标准化与审计链
+
+系统在 RDKit 可解析之后会生成独立的化学身份与标准化审计块，且不会覆盖模型原始输出或人工修正输入。JSON 报告中会同时保留：
+
+- `ocsr.predicted_smiles`：模型原始 SMILES；
+- `ocsr.predicted_canonical_smiles` 和 `ocsr.predicted_standardized_smiles`：模型输出的解析与标准化结果；
+- `correction.corrected_smiles`：用户输入的人工修正；
+- `final.raw_smiles`：最终来源的原始输入；
+- `final.smiles` / `final.standardized_smiles`：用于性质计算和结构重绘的最终分析 SMILES；
+- `chemical_identity`：canonical SMILES、standardized SMILES、InChI、InChIKey、分子式、形式电荷、片段数和手性中心数；
+- `standardization.steps`：每一步的输入、输出、是否改变、warning、时间、RDKit 版本和 profile；
+- `structure_warnings`：结构质量提示。
+
+### 标准化 profile
+
+通过环境变量选择：
+
+```powershell
+$env:CHEM_STANDARDIZATION_PROFILE="conservative"
+python -m streamlit run app.py
+```
+
+可选值：
+
+| profile | 行为 |
+|---|---|
+| `none` | 只解析、canonicalize 和生成身份标识，不执行 RDKit 标准化转换 |
+| `conservative` | 默认值；执行 RDKit `Cleanup` / `Normalize`，不删除片段、不强制中和、不做互变异构归一 |
+| `parent` | 执行金属断开、FragmentParent、LargestFragmentChooser 和 Uncharger，可能去除盐/溶剂/配位成分 |
+| `tautomer_canonical` | 在 `parent` 基础上执行 Reionize 与 RDKit tautomer canonicalization |
+
+默认采用 `conservative`，避免自动删除用户可能关心的盐、溶剂、多片段或配位结构。`parent` 和 `tautomer_canonical` 都可能改变化学含义，应只在明确需要 parent identity 或去重时启用。
+
+### 结构质量提示
+
+系统会提示：
+
+- 多片段；
+- 非零电荷；
+- 未指定手性；
+- 未指定 E/Z 双键；
+- 异常价态或 RDKit sanitize 问题；
+- 同位素；
+- 金属或类金属。
+
+这些提示只说明结构表示和身份检索风险，不是毒理、药理或实验结论。
+
+### 批处理去重
+
+批处理 CSV 会增加：
+
+- `canonical_smiles`
+- `standardized_smiles`
+- `inchikey`
+- `standardization_profile`
+- `standardization_changed`
+- `structure_warnings`
+
+批处理 JSON summary 会增加 canonical SMILES、InChIKey 和 standardized SMILES 的重复统计，用于发现同一分子在不同图片或不同盐形式中的重复。
+
+### Benchmark 身份比较
+
+默认 benchmark 仍按 raw canonical SMILES 评价，避免历史指标语义改变：
+
+```bash
+python scripts/evaluate_ocsr.py --manifest benchmark/example_manifest.csv --backend demo --identity-comparison raw
+```
+
+如需按标准化身份比较：
+
+```bash
+python scripts/evaluate_ocsr.py \
+  --manifest benchmark/example_manifest.csv \
+  --backend ensemble \
+  --identity-comparison standardized \
+  --standardization-profile parent \
+  --output data/outputs/benchmark
+```
+
+标准化比较可以用于盐型、parent identity 或去重分析，但不能被解释为模型一定识别得更准确；它只改变“比较哪一种化学身份表示”的规则。
+
+### InChI 降级
+
+如果当前 RDKit 构建不支持 InChI，报告会把 `inchi` / `inchikey` 置空，并在 `standardization.warnings` 中记录原因；主流程、性质计算、JSON/CSV/PDF 导出不会因此中断。

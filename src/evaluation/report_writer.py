@@ -169,6 +169,8 @@ def _write_report(run_dir: Path, metadata: dict[str, Any], metrics: dict[str, An
         f"- OCSR backend: {metadata.get('backend')}",
         f"- Model info: {metadata.get('backend_status', {}).get('model_name') or 'not provided'}",
         f"- Input strategy: {metadata.get('preprocessing_strategy')}",
+        f"- Identity comparison: {metadata.get('identity_comparison', 'raw')}",
+        f"- Standardization profile: {metadata.get('standardization_profile', 'conservative')}",
         f"- Dataset sample count: {overall['total_samples']}",
         f"- Total runtime: {overall.get('total_runtime_ms')} ms",
         "",

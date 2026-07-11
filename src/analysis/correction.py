@@ -16,6 +16,7 @@ from src.chem.descriptors import calculate_descriptors
 from src.chem.lipinski import evaluate_lipinski
 from src.chem.mol_drawer import draw_molecule
 from src.chem.smiles_validator import smiles_to_mol, validate_smiles
+from src.chem.standardization import standardize_smiles
 from src.export.json_exporter import save_json
 from src.ml.admet_baseline import ConfiguredADMETPredictor
 from src.utils.file_utils import ensure_directory, safe_stem
@@ -44,6 +45,7 @@ def default_correction_state() -> dict[str, Any]:
         "applied": False,
         "corrected_smiles": None,
         "corrected_canonical_smiles": None,
+        "corrected_standardized_smiles": None,
         "corrected_at": None,
         "source": None,
         "last_error": None,
@@ -52,7 +54,7 @@ def default_correction_state() -> dict[str, Any]:
 
 def default_final_state() -> dict[str, Any]:
     """Return the default final result block for a report."""
-    return {"smiles": None, "canonical_smiles": None, "source": None}
+    return {"smiles": None, "raw_smiles": None, "canonical_smiles": None, "standardized_smiles": None, "source": None}
 
 
 def normalize_ocsr_block(ocsr: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -67,6 +69,13 @@ def normalize_ocsr_block(ocsr: dict[str, Any] | None) -> dict[str, Any] | None:
     if "predicted_canonical_smiles" not in normalized:
         validation = validate_smiles(predicted)
         normalized["predicted_canonical_smiles"] = validation["canonical_smiles"] if validation["valid"] else None
+    if "predicted_standardized_smiles" not in normalized:
+        standardized = standardize_smiles(predicted)
+        normalized["predicted_standardized_smiles"] = (
+            standardized["chemical_identity"]["standardized_smiles"] if standardized["valid"] else None
+        )
+        normalized["predicted_chemical_identity"] = standardized["chemical_identity"]
+        normalized["predicted_standardization"] = standardized["standardization"]
     return normalized
 
 
@@ -83,6 +92,9 @@ def ensure_traceability_blocks(report: dict[str, Any]) -> dict[str, Any]:
     updated.setdefault("images", {})
     updated["images"].setdefault("predicted_molecule", None)
     updated["images"].setdefault("corrected_molecule", None)
+    updated.setdefault("chemical_identity", None)
+    updated.setdefault("standardization", {"profile": None, "changed": False, "steps": [], "warnings": []})
+    updated.setdefault("structure_warnings", [])
     return updated
 
 
@@ -115,23 +127,43 @@ def _apply_final_smiles(
     message: str,
 ) -> dict[str, Any]:
     """Validate and recalculate all chemistry fields for a final SMILES."""
-    validation = validate_smiles(smiles)
+    standardization_result = standardize_smiles(smiles)
+    identity = standardization_result["chemical_identity"]
+    validation = {
+        "valid": standardization_result["valid"],
+        "canonical_smiles": identity.get("canonical_smiles"),
+        "standardized_smiles": identity.get("standardized_smiles"),
+        "error": standardization_result["error"],
+    }
     updated = ensure_traceability_blocks(report)
     if not validation["valid"]:
         updated["message"] = validation["error"]
         updated["validation"] = validation
+        updated["chemical_identity"] = identity
+        updated["standardization"] = standardization_result["standardization"]
+        updated["structure_warnings"] = standardization_result["structure_warnings"]
         return updated
     canonical = str(validation["canonical_smiles"])
-    descriptors = calculate_descriptors(canonical)
+    analysis_smiles = str(validation["standardized_smiles"] or canonical)
+    descriptors = calculate_descriptors(analysis_smiles)
     lipinski = evaluate_lipinski(descriptors)
     output_root = ensure_directory(output_dir)
     drawing_path = output_root / "redrawn" / f"{_report_prefix(updated, image_slot)}_structure.png"
-    drawing = draw_molecule(canonical, drawing_path)
+    drawing = draw_molecule(analysis_smiles, drawing_path)
     updated["validation"] = validation
+    updated["chemical_identity"] = identity
+    updated["standardization"] = standardization_result["standardization"]
+    updated["structure_warnings"] = standardization_result["structure_warnings"]
     updated["descriptors"] = descriptors
     updated["lipinski"] = lipinski
-    updated["admet"] = ConfiguredADMETPredictor().predict(canonical)
-    updated["final"] = {"smiles": smiles, "canonical_smiles": canonical, "source": source}
+    updated["admet"] = ConfiguredADMETPredictor().predict(analysis_smiles)
+    updated["final"] = {
+        "smiles": analysis_smiles,
+        "raw_smiles": smiles,
+        "canonical_smiles": canonical,
+        "standardized_smiles": analysis_smiles,
+        "source": source,
+    }
     updated["images"]["redrawn_molecule"] = drawing
     updated["images"][image_slot] = drawing
     updated["status"] = "success"
@@ -165,10 +197,12 @@ def apply_smiles_correction(
         "corrected_molecule",
         "已应用人工修正并重新计算性质。",
     )
+    corrected_validation = corrected.get("validation") or {}
     corrected["correction"] = {
         "applied": True,
         "corrected_smiles": attempted,
-        "corrected_canonical_smiles": validation["canonical_smiles"],
+        "corrected_canonical_smiles": corrected_validation.get("canonical_smiles"),
+        "corrected_standardized_smiles": corrected_validation.get("standardized_smiles"),
         "corrected_at": utc_now_iso(),
         "source": "user",
         "last_error": None,
@@ -227,6 +261,7 @@ def save_correction_feedback(
         "prediction": {
             "predicted_smiles": ocsr.get("predicted_smiles") or ocsr.get("smiles"),
             "predicted_canonical_smiles": ocsr.get("predicted_canonical_smiles"),
+            "predicted_standardized_smiles": ocsr.get("predicted_standardized_smiles"),
             "confidence": ocsr.get("confidence"),
             "backend": ocsr.get("backend"),
             "model_name": ocsr.get("model_name"),
