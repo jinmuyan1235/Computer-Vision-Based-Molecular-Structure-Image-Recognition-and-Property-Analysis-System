@@ -263,3 +263,96 @@ molecule-vision-ocsr/
 - MolScribe/DECIMER 的安装方式、模型权重和推理 API 可能随版本变化；
 - Lipinski 结果只反映简单规则，不代表吸收、毒性、疗效或可开发性；
 - 性质分析为教学演示，不能替代真实药物实验或专业判断。
+
+## 生产 MolScribe 后端配置
+
+本项目默认仍使用 `demo` 后端，demo 只用于教学演示：它会按内置样例文件名返回固定 SMILES，不是真实图片识别。真实 OCSR 需要单独安装 MolScribe、下载模型权重，并把 `OCSR_BACKEND` 切换为 `molscribe`。如果 MolScribe 未安装、模型文件缺失或加载失败，Streamlit、手动 SMILES、RDKit 性质分析、demo 后端和 DECIMER 后端仍会继续工作，并显示可读错误。
+
+本适配器按 MolScribe 官方仓库公开接口进行兼容：构造模型时优先使用 `MolScribe(model_path, device=...)`，推理时优先使用 `predict_image_file(path, return_confidence=True)`；不同发行版本若返回 `dict`、字符串、元组或列表，适配器会归一化为统一结果字段。已对公开仓库接口形状做验证，未声称支持未测试的私有改版 API。
+
+### 安装步骤
+
+```bash
+conda create -n molecule-vision-310 python=3.10
+conda activate molecule-vision-310
+conda install -c conda-forge rdkit
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+按 MolScribe 官方说明安装可选依赖。安装方式可能随 MolScribe 版本变化，请以其官方仓库为准：[thomas0809/MolScribe](https://github.com/thomas0809/MolScribe)。
+
+```bash
+pip install MolScribe
+```
+
+模型权重请从可信来源下载到本机，例如：
+
+```text
+models/molscribe_model.pth
+```
+
+不要把模型权重、大型数据集、虚拟环境或缓存文件提交到 Git。本仓库 `.gitignore` 已忽略 `models/*`、`*.pt`、`*.pth` 和 `*.onnx`。
+
+### 环境变量
+
+Windows PowerShell：
+
+```powershell
+$env:OCSR_BACKEND="molscribe"
+$env:MOLSCRIBE_MODEL_PATH="C:\path\to\molscribe_model.pth"
+$env:OCSR_DEVICE="cpu"
+$env:MOLSCRIBE_IMAGE_STRATEGY="original"
+python -m streamlit run app.py
+```
+
+Linux/macOS：
+
+```bash
+export OCSR_BACKEND=molscribe
+export MOLSCRIBE_MODEL_PATH=/path/to/molscribe_model.pth
+export OCSR_DEVICE=cpu
+export MOLSCRIBE_IMAGE_STRATEGY=original
+python -m streamlit run app.py
+```
+
+CUDA 示例：
+
+```powershell
+$env:OCSR_BACKEND="molscribe"
+$env:MOLSCRIBE_MODEL_PATH="C:\path\to\molscribe_model.pth"
+$env:OCSR_DEVICE="cuda"
+python -m streamlit run app.py
+```
+
+常用配置：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `MOLSCRIBE_MODEL_PATH` | `models/molscribe_model.pth` | MolScribe 权重文件路径，支持相对路径和绝对路径 |
+| `MOLSCRIBE_MODEL_NAME` | 权重文件名 | 侧边栏和结果中显示的模型名 |
+| `MOLSCRIBE_MODEL_VERSION` | 空 | 可选模型版本或标识 |
+| `OCSR_DEVICE` | `cpu` | `cpu`、`cuda` 或 `cuda:0` |
+| `OCSR_TIMEOUT_SECONDS` | `120` | 单次推理超时时间 |
+| `OCSR_STRICT_MODE` | `false` | 为 `true` 时 CUDA 不可用会直接报错；默认可回退 CPU |
+| `OCSR_USE_PREPROCESSED_IMAGE` | `false` | 兼容旧流程；默认 MolScribe 使用原图 |
+| `MOLSCRIBE_IMAGE_STRATEGY` | `original` | `original`、`grayscale`、`normalized`、`binary` |
+
+默认 `original` 更贴近 MolScribe 官方模型输入预期；不要默认假设二值化图片一定更好。只有在实验需要时再切换 `grayscale`、`normalized` 或 `binary`。
+
+### 诊断命令
+
+```bash
+python scripts/check_ocsr_backend.py --backend demo
+python scripts/check_ocsr_backend.py --backend molscribe
+```
+
+诊断输出包含 Python 版本、后端名称、包是否安装、包版本、模型路径、模型文件是否存在、设备、CUDA 是否可用、模型是否成功加载和可读错误。MolScribe 未安装时不会打印 Python 堆栈并崩溃。
+
+### 常见错误
+
+- `未安装 MolScribe`：先确认当前 Python 环境是否正确，再按官方说明安装 MolScribe。
+- `模型文件不存在`：检查 `MOLSCRIBE_MODEL_PATH`，Windows 路径建议使用 PowerShell 字符串。
+- `请求 CUDA 设备，但 torch.cuda.is_available() 为 False`：检查 NVIDIA 驱动、CUDA 版 PyTorch 和 `OCSR_DEVICE`；也可先用 `OCSR_DEVICE=cpu` 验证流程。
+- `模型加载失败`：通常是权重文件与 MolScribe 代码版本不匹配，或模型文件损坏。请重新下载与当前 MolScribe 版本匹配的权重。
+- `MolScribe 未返回 SMILES`：图片可能不符合模型输入分布，或该版本返回格式发生变化。可运行诊断脚本并保留错误信息用于适配。

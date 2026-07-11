@@ -12,6 +12,7 @@ class DemoOCSRAdapter(BaseOCSRAdapter):
     """Recognize a small set of named samples for reliable demonstrations."""
 
     backend_name = "demo"
+    preferred_image_stage = "original"
     SAMPLE_SMILES = {
         "aspirin": "CC(=O)OC1=CC=CC=C1C(=O)O",
         "caffeine": "Cn1cnc2c1c(=O)n(C)c(=O)n2C",
@@ -31,6 +32,9 @@ class DemoOCSRAdapter(BaseOCSRAdapter):
                         backend=self.backend_name,
                         status="success",
                         message=f"演示模式根据文件名匹配到 {keyword}。",
+                        model_name="demo-filename-map",
+                        model_version="built-in",
+                        device="cpu",
                     )
         return OCSRResult(
             smiles=None,
@@ -41,4 +45,7 @@ class DemoOCSRAdapter(BaseOCSRAdapter):
                 "演示模式无法识别该文件名。请将样例命名为 aspirin、caffeine、benzene 或 ethanol，"
                 "也可安装 MolScribe/DECIMER 或使用手动 SMILES 分析。"
             ),
+            model_name="demo-filename-map",
+            model_version="built-in",
+            device="cpu",
         )

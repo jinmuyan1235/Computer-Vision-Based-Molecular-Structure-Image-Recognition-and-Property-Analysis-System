@@ -6,10 +6,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import pandas as pd
+from PIL import Image, ImageDraw
 
 from config import OUTPUT_DIR
 from src.export.csv_exporter import save_csv
@@ -33,6 +31,10 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
         "ocsr_status": ocsr.get("status"),
         "smiles": ocsr.get("smiles"),
         "confidence": ocsr.get("confidence"),
+        "inference_time_ms": ocsr.get("inference_time_ms"),
+        "model_name": ocsr.get("model_name"),
+        "model_version": ocsr.get("model_version"),
+        "device": ocsr.get("device"),
         "valid": bool(validation.get("valid", False)),
         "canonical_smiles": validation.get("canonical_smiles"),
         "formula": descriptors.get("formula"),
@@ -95,15 +97,26 @@ class BatchAnalyzer:
     def _save_summary_chart(self, summary: dict[str, Any]) -> str:
         """Save a small success/validity/failure count chart."""
         path = self.output_dir / "batch_summary.png"
+        width, height = 700, 400
+        margin = 56
         labels = ["Successful", "Valid SMILES", "Failed"]
-        values = [summary["successful"], summary["valid_smiles"], summary["failed"]]
-        figure, axis = plt.subplots(figsize=(7, 4))
-        bars = axis.bar(labels, values, color=["#2a9d8f", "#457b9d", "#e76f51"])
-        axis.set_ylabel("Image count")
-        axis.set_title("Batch analysis summary")
-        axis.bar_label(bars, padding=3)
-        axis.set_ylim(0, max(values + [1]) * 1.2)
-        figure.tight_layout()
-        figure.savefig(path, dpi=150)
-        plt.close(figure)
+        values = [int(summary["successful"]), int(summary["valid_smiles"]), int(summary["failed"])]
+        colors = ["#2a9d8f", "#457b9d", "#e76f51"]
+        max_value = max(values + [1])
+        image = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(image)
+        draw.text((margin, 18), "Batch analysis summary", fill="#222222")
+        draw.line((margin, height - margin, width - margin // 2, height - margin), fill="#333333", width=2)
+        draw.line((margin, margin, margin, height - margin), fill="#333333", width=2)
+        bar_area_width = width - margin * 2
+        bar_width = 92
+        gap = (bar_area_width - bar_width * len(values)) // max(len(values) - 1, 1)
+        for index, (label, value, color) in enumerate(zip(labels, values, colors)):
+            x0 = margin + index * (bar_width + gap)
+            bar_height = int((height - margin * 2) * (value / max_value))
+            y0 = height - margin - bar_height
+            draw.rectangle((x0, y0, x0 + bar_width, height - margin), fill=color)
+            draw.text((x0 + 32, max(y0 - 20, margin - 8)), str(value), fill="#222222")
+            draw.text((x0, height - margin + 10), label, fill="#222222")
+        image.save(path)
         return str(path.resolve())

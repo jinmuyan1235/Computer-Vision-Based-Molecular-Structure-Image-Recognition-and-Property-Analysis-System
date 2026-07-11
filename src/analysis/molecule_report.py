@@ -64,7 +64,7 @@ class MoleculeReportGenerator:
             report["message"] = f"图像预处理失败：{exc}"
             return report
 
-        recognition_target = path if self.recognizer.is_demo else report["images"]["preprocessed"]
+        recognition_target = path if self.recognizer.preferred_image_stage == "original" else report["images"]["preprocessed"]
         result = self.recognizer.recognize(recognition_target)
         report["ocsr"] = result.to_dict()
         if result.status != "success" or not result.smiles:
@@ -82,6 +82,10 @@ class MoleculeReportGenerator:
             backend="manual",
             status="success",
             message="使用手动输入的 SMILES。",
+            inference_time_ms=0.0,
+            model_name="manual",
+            model_version="built-in",
+            device="cpu",
         ).to_dict()
         return self._complete_chemistry(report, smiles, prefix)
 

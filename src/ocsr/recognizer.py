@@ -39,6 +39,11 @@ class MoleculeRecognizer:
         return self.adapter.status()
 
     @property
+    def preferred_image_stage(self) -> str:
+        """Return which preprocessing stage should be sent to the selected backend."""
+        return getattr(self.adapter, "preferred_image_stage", "preprocessed")
+
+    @property
     def is_demo(self) -> bool:
         """Return whether the recognizer is using the demonstration backend."""
         return self.backend == "demo"

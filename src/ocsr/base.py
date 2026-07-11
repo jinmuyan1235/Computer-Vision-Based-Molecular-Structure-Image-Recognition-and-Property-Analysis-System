@@ -16,6 +16,11 @@ class OCSRResult:
     backend: str
     status: Literal["success", "failed"]
     message: str
+    inference_time_ms: float | None = None
+    model_name: str | None = None
+    model_version: str | None = None
+    device: str | None = None
+    package_version: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert this result to a JSON-serializable dictionary."""
@@ -26,6 +31,7 @@ class BaseOCSRAdapter(ABC):
     """Abstract interface implemented by all recognition adapters."""
 
     backend_name = "base"
+    preferred_image_stage = "preprocessed"
 
     @property
     def is_available(self) -> bool:
@@ -43,6 +49,11 @@ class BaseOCSRAdapter(ABC):
             "backend": self.backend_name,
             "available": self.is_available,
             "message": self.availability_message,
+            "model_name": None,
+            "model_version": None,
+            "device": None,
+            "package_version": None,
+            "last_inference_time_ms": None,
         }
 
     @abstractmethod
