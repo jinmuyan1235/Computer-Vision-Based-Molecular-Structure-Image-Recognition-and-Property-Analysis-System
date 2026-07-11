@@ -647,6 +647,18 @@ PDF rendering uses optional PyMuPDF when installed:
 python -m pip install pymupdf
 ```
 
+The locally verified document-rendering dependency set is:
+
+```bash
+python -m pip install -r requirements-documents.txt
+```
+
+Verified locally on Windows / Python 3.10:
+
+```text
+pymupdf==1.28.0
+```
+
 PyMuPDF/MuPDF is distributed by its upstream project under AGPL or commercial licensing. Review the official PyMuPDF license page before enabling it in proprietary or server deployments. If PyMuPDF is not installed, PDF inputs return a readable diagnostic; PNG/JPG/ZIP image workflows and the rest of the application keep working.
 
 Safety limits are configurable with environment variables:
