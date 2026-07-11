@@ -29,6 +29,8 @@ class EvaluationConfig:
     output: Path
     preprocessing_strategy: str
     similarity_threshold: float
+    identity_comparison: str
+    standardization_profile: str
     limit: int | None
     continue_on_error: bool
     save_predictions: bool
@@ -67,11 +69,15 @@ class OCSREvaluator:
         backend: str,
         preprocessing_strategy: str = "backend-default",
         similarity_threshold: float = 0.95,
+        identity_comparison: str = "raw",
+        standardization_profile: str | None = None,
         continue_on_error: bool = True,
     ) -> None:
         self.backend = backend
         self.preprocessing_strategy = preprocessing_strategy
         self.similarity_threshold = similarity_threshold
+        self.identity_comparison = identity_comparison
+        self.standardization_profile = standardization_profile or config.CHEM_STANDARDIZATION_PROFILE
         self.continue_on_error = continue_on_error
         self.recognizer = MoleculeRecognizer(backend)
         self.preprocessor = ImagePreprocessor()
@@ -180,7 +186,12 @@ class OCSREvaluator:
                     "package_version": None,
                 }
             )
-        return enrich_prediction(base_row, self.similarity_threshold)
+        return enrich_prediction(
+            base_row,
+            self.similarity_threshold,
+            identity_comparison=self.identity_comparison,
+            standardization_profile=self.standardization_profile,
+        )
 
     def run(self, samples: list[BenchmarkSample]) -> dict[str, Any]:
         """Evaluate all samples and return rows, metrics and run metadata."""
@@ -198,6 +209,8 @@ class OCSREvaluator:
             "backend": self.backend,
             "backend_status": self.recognizer.status(),
             "preprocessing_strategy": self.preprocessing_strategy,
+            "identity_comparison": self.identity_comparison,
+            "standardization_profile": self.standardization_profile,
             "similarity_threshold": self.similarity_threshold,
             "total_runtime_ms": total_runtime_ms,
             "limitations": (
@@ -218,6 +231,8 @@ def run_from_manifest(evaluation_config: EvaluationConfig) -> dict[str, Any]:
         backend=evaluation_config.backend,
         preprocessing_strategy=evaluation_config.preprocessing_strategy,
         similarity_threshold=evaluation_config.similarity_threshold,
+        identity_comparison=evaluation_config.identity_comparison,
+        standardization_profile=evaluation_config.standardization_profile,
         continue_on_error=evaluation_config.continue_on_error,
     )
     return evaluator.run(samples)

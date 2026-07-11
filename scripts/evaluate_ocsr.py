@@ -29,6 +29,12 @@ def parse_args() -> argparse.Namespace:
         help="Image input strategy used before calling the backend.",
     )
     parser.add_argument("--similarity-threshold", type=float, default=0.95)
+    parser.add_argument("--identity-comparison", choices=["raw", "standardized"], default="raw")
+    parser.add_argument(
+        "--standardization-profile",
+        choices=["none", "conservative", "parent", "tautomer_canonical"],
+        default="conservative",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Evaluate only the first N manifest rows.")
     parser.add_argument("--continue-on-error", action="store_true", default=True)
     parser.add_argument("--save-predictions", action="store_true", default=True)
@@ -44,6 +50,8 @@ def main() -> int:
         output=Path(args.output).expanduser().resolve(),
         preprocessing_strategy=args.preprocessing_strategy,
         similarity_threshold=args.similarity_threshold,
+        identity_comparison=args.identity_comparison,
+        standardization_profile=args.standardization_profile,
         limit=args.limit,
         continue_on_error=args.continue_on_error,
         save_predictions=args.save_predictions,
@@ -56,6 +64,8 @@ def main() -> int:
         "output": str(config.output),
         "run_dir": str(run_dir),
         "preprocessing_strategy": config.preprocessing_strategy,
+        "identity_comparison": config.identity_comparison,
+        "standardization_profile": config.standardization_profile,
         "similarity_threshold": config.similarity_threshold,
         "limit": config.limit,
         "continue_on_error": config.continue_on_error,

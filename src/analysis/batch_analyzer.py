@@ -24,6 +24,9 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
     correction = report.get("correction") or {}
     final = report.get("final") or {}
     validation = report.get("validation") or {}
+    identity = report.get("chemical_identity") or {}
+    standardization = report.get("standardization") or {}
+    structure_warnings = report.get("structure_warnings") or []
     descriptors = report.get("descriptors") or {}
     lipinski = report.get("lipinski") or {}
     consensus = ocsr.get("consensus") or {}
@@ -37,10 +40,13 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
         "smiles": ocsr.get("smiles"),
         "predicted_smiles": ocsr.get("predicted_smiles") or ocsr.get("smiles"),
         "predicted_canonical_smiles": ocsr.get("predicted_canonical_smiles"),
+        "predicted_standardized_smiles": ocsr.get("predicted_standardized_smiles"),
         "corrected_smiles": correction.get("corrected_smiles"),
         "corrected_canonical_smiles": correction.get("corrected_canonical_smiles"),
         "correction_applied": bool(correction.get("applied", False)),
         "final_smiles": final.get("smiles") or ocsr.get("smiles"),
+        "final_raw_smiles": final.get("raw_smiles"),
+        "final_standardized_smiles": final.get("standardized_smiles") or validation.get("standardized_smiles"),
         "final_result_source": final.get("source"),
         "confidence": ocsr.get("confidence"),
         "inference_time_ms": ocsr.get("inference_time_ms"),
@@ -54,6 +60,17 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
         "ensemble_candidates": json.dumps(candidates, ensure_ascii=False),
         "valid": bool(validation.get("valid", False)),
         "canonical_smiles": validation.get("canonical_smiles"),
+        "standardized_smiles": validation.get("standardized_smiles") or identity.get("standardized_smiles"),
+        "inchikey": identity.get("inchikey"),
+        "inchi": identity.get("inchi"),
+        "identity_formula": identity.get("formula"),
+        "formal_charge": identity.get("formal_charge"),
+        "fragment_count": identity.get("fragment_count"),
+        "stereocenter_count": identity.get("stereocenter_count"),
+        "standardization_profile": standardization.get("profile"),
+        "standardization_changed": bool(standardization.get("changed", False)),
+        "structure_warning_count": len(structure_warnings),
+        "structure_warnings": json.dumps(structure_warnings, ensure_ascii=False),
         "formula": descriptors.get("formula"),
         "molecular_weight": descriptors.get("molecular_weight"),
         "logp": descriptors.get("logp"),
@@ -91,6 +108,14 @@ class BatchAnalyzer:
         valid = sum(bool(row["valid"]) for row in rows)
         total = len(rows)
         failure_reasons = Counter(row["message"] for row in rows if row["status"] != "success")
+        canonical_counts = Counter(row.get("canonical_smiles") for row in rows if row.get("canonical_smiles"))
+        inchikey_counts = Counter(row.get("inchikey") for row in rows if row.get("inchikey"))
+        standardized_counts = Counter(row.get("standardized_smiles") for row in rows if row.get("standardized_smiles"))
+        duplicate_groups = {
+            "canonical_smiles": {key: value for key, value in canonical_counts.items() if value > 1},
+            "inchikey": {key: value for key, value in inchikey_counts.items() if value > 1},
+            "standardized_smiles": {key: value for key, value in standardized_counts.items() if value > 1},
+        }
         summary = {
             "total": total,
             "successful": successful,
@@ -99,6 +124,12 @@ class BatchAnalyzer:
             "success_rate": round(successful / total, 4) if total else 0.0,
             "valid_rate": round(valid / total, 4) if total else 0.0,
             "failure_reasons": dict(failure_reasons),
+            "duplicates": {
+                "canonical_duplicate_count": sum(count - 1 for count in canonical_counts.values() if count > 1),
+                "inchikey_duplicate_count": sum(count - 1 for count in inchikey_counts.values() if count > 1),
+                "standardized_duplicate_count": sum(count - 1 for count in standardized_counts.values() if count > 1),
+                "groups": duplicate_groups,
+            },
         }
         csv_path = save_csv(rows, self.output_dir / "batch_results.csv")
         json_path = save_json({"summary": summary, "results": reports}, self.output_dir / "batch_results.json")

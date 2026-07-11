@@ -95,6 +95,33 @@ def show_ensemble_details(ocsr: dict) -> None:
         st.dataframe(pd.DataFrame(similarity), hide_index=True, use_container_width=True)
 
 
+def show_chemical_identity(report: dict) -> None:
+    """Render chemical identity and standardization audit summary."""
+    identity = report.get("chemical_identity") or {}
+    standardization = report.get("standardization") or {}
+    warnings = report.get("structure_warnings") or []
+    if not identity:
+        return
+    st.subheader("化学身份与标准化")
+    columns = st.columns(3)
+    columns[0].metric("片段数", identity.get("fragment_count") if identity.get("fragment_count") is not None else "-")
+    columns[1].metric("形式电荷", identity.get("formal_charge") if identity.get("formal_charge") is not None else "-")
+    columns[2].metric("结构提示", len(warnings))
+    st.write(f"**Standardized SMILES：** `{identity.get('standardized_smiles') or '-'}`")
+    st.write(f"**InChIKey：** `{identity.get('inchikey') or '当前 RDKit/InChI 不可用或未生成'}`")
+    st.caption(
+        f"标准化 profile：{standardization.get('profile') or '-'} · "
+        f"是否改变：{'是' if standardization.get('changed') else '否'}。"
+        "结构提示只反映表示质量，不是毒理或药理结论。"
+    )
+    if warnings:
+        with st.expander("查看结构提示与标准化审计"):
+            st.dataframe(pd.DataFrame(warnings), hide_index=True, use_container_width=True)
+            steps = standardization.get("steps") or []
+            if steps:
+                st.dataframe(pd.DataFrame(steps), hide_index=True, use_container_width=True)
+
+
 def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_prefix: str) -> None:
     """Render a molecule analysis report in Streamlit."""
     if report.get("status") != "success":
@@ -115,6 +142,8 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
         st.subheader("结构识别")
         st.code(final.get("smiles") or ocsr.get("smiles") or "", language=None)
         st.write(f"**Canonical SMILES：** `{final.get('canonical_smiles') or validation.get('canonical_smiles')}`")
+        if final.get("standardized_smiles") or validation.get("standardized_smiles"):
+            st.write(f"**Standardized SMILES：** `{final.get('standardized_smiles') or validation.get('standardized_smiles')}`")
         confidence = ocsr.get("confidence")
         st.write(f"**识别后端：** {ocsr.get('backend')}　 **置信度：** {confidence if confidence is not None else '模型未提供'}")
         st.write(f"**当前结果来源：** {final.get('source') or 'unknown'}")
@@ -134,6 +163,7 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
             st.caption(diagnostic_line)
         st.write(f"**RDKit 校验：** {'有效' if validation.get('valid') else '无效'}")
         show_ensemble_details(ocsr)
+        show_chemical_identity(report)
     with right:
         st.subheader("标准化结构重绘")
         drawing = (report.get("images") or {}).get("redrawn_molecule")

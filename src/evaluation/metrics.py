@@ -10,6 +10,8 @@ from typing import Any
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
 
+import config
+from src.chem.standardization import identity_key, standardize_smiles
 from src.chem.smiles_validator import canonicalize_smiles, smiles_to_mol
 
 
@@ -26,10 +28,12 @@ def percentile(values: list[float], percent: float) -> float | None:
     return round(float(ordered[index]), 3)
 
 
-def molecule_identity(smiles: str | None) -> tuple[str | None, str | None]:
+def molecule_identity(smiles: str | None, mode: str = "raw", profile: str | None = None) -> tuple[str | None, str | None]:
     """Return canonical SMILES and InChIKey when RDKit can provide them."""
     if not smiles:
         return None, None
+    if mode == "standardized":
+        return identity_key(smiles, "standardized", profile)
     canonical = canonicalize_smiles(smiles)
     if canonical is None:
         return None, None
@@ -57,22 +61,52 @@ def tanimoto_similarity(ground_truth_smiles: str | None, predicted_smiles: str |
         return None
 
 
-def enrich_prediction(row: dict[str, Any], similarity_threshold: float) -> dict[str, Any]:
+def enrich_prediction(
+    row: dict[str, Any],
+    similarity_threshold: float,
+    identity_comparison: str = "raw",
+    standardization_profile: str | None = None,
+) -> dict[str, Any]:
     """Add RDKit validity, identity and similarity fields to one prediction row."""
     predicted_smiles = row.get("predicted_smiles")
-    truth_canonical, truth_inchikey = molecule_identity(row.get("ground_truth_smiles"))
-    predicted_canonical, predicted_inchikey = molecule_identity(predicted_smiles)
-    rdkit_valid = predicted_canonical is not None
-    canonical_exact = bool(rdkit_valid and predicted_canonical == truth_canonical)
+    profile = standardization_profile or config.CHEM_STANDARDIZATION_PROFILE
+    truth_raw_canonical, truth_raw_inchikey = molecule_identity(row.get("ground_truth_smiles"), "raw", profile)
+    predicted_raw_canonical, predicted_raw_inchikey = molecule_identity(predicted_smiles, "raw", profile)
+    truth_standardized, truth_standardized_inchikey = molecule_identity(row.get("ground_truth_smiles"), "standardized", profile)
+    predicted_standardized, predicted_standardized_inchikey = molecule_identity(predicted_smiles, "standardized", profile)
+    if identity_comparison == "standardized":
+        truth_canonical = truth_standardized
+        truth_inchikey = truth_standardized_inchikey
+        predicted_canonical = predicted_standardized
+        predicted_inchikey = predicted_standardized_inchikey
+    else:
+        truth_canonical = truth_raw_canonical
+        truth_inchikey = truth_raw_inchikey
+        predicted_canonical = predicted_raw_canonical
+        predicted_inchikey = predicted_raw_inchikey
+    predicted_standardization = standardize_smiles(predicted_smiles, profile) if predicted_smiles else None
+    rdkit_valid = predicted_raw_canonical is not None
+    comparison_valid = predicted_canonical is not None
+    canonical_exact = bool(comparison_valid and predicted_canonical == truth_canonical)
     equivalent = bool(canonical_exact or (truth_inchikey and predicted_inchikey and truth_inchikey == predicted_inchikey))
     similarity = tanimoto_similarity(row.get("ground_truth_smiles"), predicted_smiles)
     enriched = dict(row)
     enriched.update(
         {
-            "ground_truth_canonical_smiles": truth_canonical,
-            "predicted_canonical_smiles": predicted_canonical,
-            "ground_truth_inchikey": truth_inchikey,
-            "predicted_inchikey": predicted_inchikey,
+            "identity_comparison": identity_comparison,
+            "standardization_profile": profile,
+            "ground_truth_canonical_smiles": truth_raw_canonical,
+            "predicted_canonical_smiles": predicted_raw_canonical,
+            "ground_truth_standardized_smiles": truth_standardized,
+            "predicted_standardized_smiles": predicted_standardized,
+            "ground_truth_inchikey": truth_raw_inchikey,
+            "predicted_inchikey": predicted_raw_inchikey,
+            "comparison_ground_truth_smiles": truth_canonical,
+            "comparison_predicted_smiles": predicted_canonical,
+            "comparison_inchikey": predicted_inchikey,
+            "predicted_standardization_changed": (
+                bool(predicted_standardization["standardization"]["changed"]) if predicted_standardization else False
+            ),
             "rdkit_valid": rdkit_valid,
             "canonical_exact_match": canonical_exact,
             "molecule_equivalent": equivalent,

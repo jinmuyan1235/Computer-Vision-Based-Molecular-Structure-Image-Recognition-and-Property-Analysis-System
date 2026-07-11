@@ -11,7 +11,7 @@ from config import OUTPUT_DIR
 from src.chem.descriptors import calculate_descriptors
 from src.chem.lipinski import evaluate_lipinski
 from src.chem.mol_drawer import draw_molecule
-from src.chem.smiles_validator import validate_smiles
+from src.chem.standardization import standardize_smiles
 from src.analysis.correction import (
     default_correction_state,
     default_final_state,
@@ -46,7 +46,10 @@ class MoleculeReportGenerator:
             "ocsr": None,
             "correction": default_correction_state(),
             "final": default_final_state(),
-            "validation": {"valid": False, "canonical_smiles": None, "error": None},
+            "validation": {"valid": False, "canonical_smiles": None, "standardized_smiles": None, "error": None},
+            "chemical_identity": None,
+            "standardization": {"profile": None, "changed": False, "steps": [], "warnings": []},
+            "structure_warnings": [],
             "descriptors": None,
             "lipinski": None,
             "admet": None,
@@ -117,23 +120,40 @@ class MoleculeReportGenerator:
         prefix: str,
         final_source: str,
     ) -> dict[str, Any]:
-        validation = validate_smiles(smiles)
+        standardization_result = standardize_smiles(smiles)
+        identity = standardization_result["chemical_identity"]
+        validation = {
+            "valid": standardization_result["valid"],
+            "canonical_smiles": identity.get("canonical_smiles"),
+            "standardized_smiles": identity.get("standardized_smiles"),
+            "error": standardization_result["error"],
+        }
         report["validation"] = validation
+        report["chemical_identity"] = identity
+        report["standardization"] = standardization_result["standardization"]
+        report["structure_warnings"] = standardization_result["structure_warnings"]
         if not validation["valid"]:
             report["message"] = validation["error"]
             return report
-        canonical = validation["canonical_smiles"]
+        canonical = str(validation["canonical_smiles"])
+        analysis_smiles = str(validation["standardized_smiles"] or canonical)
         try:
-            descriptors = calculate_descriptors(canonical)
+            descriptors = calculate_descriptors(analysis_smiles)
             lipinski = evaluate_lipinski(descriptors)
             drawing_path = self.output_dir / "redrawn" / f"{prefix}_structure.png"
             report["descriptors"] = descriptors
             report["lipinski"] = lipinski
-            report["admet"] = self.admet_predictor.predict(canonical)
-            report["images"]["redrawn_molecule"] = draw_molecule(canonical, drawing_path)
+            report["admet"] = self.admet_predictor.predict(analysis_smiles)
+            report["images"]["redrawn_molecule"] = draw_molecule(analysis_smiles, drawing_path)
             if final_source in {"ocsr", "ensemble_recommendation"}:
                 report["images"]["predicted_molecule"] = report["images"]["redrawn_molecule"]
-            report["final"] = {"smiles": smiles, "canonical_smiles": canonical, "source": final_source}
+            report["final"] = {
+                "smiles": analysis_smiles,
+                "raw_smiles": smiles,
+                "canonical_smiles": canonical,
+                "standardized_smiles": analysis_smiles,
+                "source": final_source,
+            }
             report["status"] = "success"
             report["message"] = "分子识别与性质分析完成。"
         except Exception as exc:
