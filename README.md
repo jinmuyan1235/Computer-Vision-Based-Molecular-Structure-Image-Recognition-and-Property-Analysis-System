@@ -367,6 +367,23 @@ DECIMER 也是可选真实 OCSR 后端。未安装 DECIMER 或 TensorFlow 环境
 pip install decimer
 ```
 
+本仓库提供了可选依赖清单，用于复现当前已验证环境：
+
+```bash
+python -m pip install -r requirements-decimer.txt
+```
+
+已在 Windows / Python 3.10 环境验证的版本：
+
+```text
+decimer==2.8.0
+tensorflow==2.20.0
+wrapt==2.2.2
+tqdm==4.68.4
+```
+
+本机诊断还补齐了 TensorFlow/DECIMER 导入链需要的 `flatbuffers`、`libclang`、`termcolor`、`selfies`、`namex`、`tifffile`、`tensorboard-data-server` 和 `sympy`。这些依赖写在 `requirements-decimer.txt` 中，避免只在开发机上“临时可用”。DECIMER 首次初始化可能会把模型缓存下载到用户目录，例如 Windows 下的 `C:\Users\<用户名>\.data\DECIMER-V2`；该缓存不属于仓库内容，也不要提交到 Git。
+
 公开推理接口为：
 
 ```python
@@ -438,9 +455,11 @@ python scripts/check_ocsr_backend.py --backend decimer
 
 ### DECIMER 常见错误
 
-- `未安装 DECIMER`：确认当前 Python 环境后执行 `pip install decimer`。
+- `未安装 DECIMER`：确认当前 Python 环境后执行 `python -m pip install -r requirements-decimer.txt`。
+- `No module named 'wrapt'`：TensorFlow 导入依赖缺失，安装 `requirements-decimer.txt` 或执行 `python -m pip install wrapt`。
+- `No module named 'tqdm'`：DECIMER 依赖链缺失，安装 `requirements-decimer.txt` 或执行 `python -m pip install tqdm`。
 - `TensorFlow 未检测到可用 GPU`：检查 NVIDIA 驱动、CUDA/cuDNN 与 TensorFlow 版本；也可先用 `DECIMER_DEVICE=cpu` 验证流程。
 - `DECIMER 初始化失败`：可能是 TensorFlow、模型资源下载/缓存或版本兼容问题。请先运行诊断命令并记录包版本。
 - `DECIMER 未返回 SMILES`：图片可能不符合模型输入分布，或该版本返回格式发生变化。
 
-本机默认测试没有安装真实 DECIMER，因此只验证了 mock 后端、不可用诊断和接口兼容路径；真实识别能力需要你在目标环境中安装兼容 DECIMER 后另行运行 integration 测试或 benchmark。
+本机已验证 DECIMER 2.8.0 可以完成后端初始化诊断，并自动回退到 CPU。当前 Windows 环境未检测到 TensorFlow GPU，真实 GPU 推理仍需要你按目标平台配置匹配的 NVIDIA 驱动、CUDA/cuDNN 与 TensorFlow 运行时。默认单元测试仍使用 mock/fake 后端，不要求下载 DECIMER 模型。
