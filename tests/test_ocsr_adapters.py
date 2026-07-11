@@ -13,10 +13,12 @@ def test_demo_backend_reports_available() -> None:
     assert status["available"] is True
 
 
-def test_decimer_tuple_result_with_confidence() -> None:
+def test_decimer_tuple_result_with_confidence(tmp_path: Path) -> None:
+    image_path = tmp_path / "molecule.png"
+    image_path.write_bytes(b"fake-image")
     adapter = DECIMERAdapter()
     adapter.predictor = lambda _path, confidence=True: ("CCO", 0.88)
-    result = adapter.recognize("molecule.png")
+    result = adapter.recognize(image_path)
     assert result.status == "success"
     assert result.smiles == "CCO"
     assert result.confidence == 0.88

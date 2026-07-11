@@ -252,11 +252,15 @@ with st.sidebar:
         st.error(backend_status["message"])
         if backend == "molscribe":
             st.warning("MolScribe 当前不可用。请配置模型权重，或切换 demo 后端，也可以使用手动 SMILES 分析。")
+        if backend == "decimer":
+            st.warning("DECIMER 当前不可用。请安装兼容 decimer 包并确认 TensorFlow/设备环境，或切换 demo 后端。")
     st.write(f"**当前后端：** {backend_status.get('backend', backend)}")
     st.write(f"**是否可用：** {'是' if backend_status.get('available') else '否'}")
     st.write(f"**模型：** {backend_status.get('model_name') or backend_status.get('model_path') or '无'}")
     st.write(f"**设备：** {backend_status.get('device') or '未指定'}")
     st.write(f"**包版本：** {backend_status.get('package_version') or '未安装/未提供'}")
+    if backend_status.get("image_strategy"):
+        st.write(f"**输入策略：** {backend_status.get('image_strategy')}")
     last_time = backend_status.get("last_inference_time_ms")
     st.write(f"**最近推理耗时：** {last_time} ms" if last_time is not None else "**最近推理耗时：** 暂无")
     st.caption("CPU 可运行；真实模型可按各自配置自动使用相应设备。")

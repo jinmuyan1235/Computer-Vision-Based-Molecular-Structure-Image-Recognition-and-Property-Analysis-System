@@ -39,6 +39,22 @@ MOLSCRIBE_IMAGE_STRATEGY: Literal["original", "grayscale", "normalized", "binary
 ).strip().lower()  # type: ignore[assignment]
 if MOLSCRIBE_IMAGE_STRATEGY not in {"original", "grayscale", "normalized", "binary"}:
     MOLSCRIBE_IMAGE_STRATEGY = "original"
+DECIMER_DEVICE = os.getenv("DECIMER_DEVICE", os.getenv("OCSR_DEVICE", "auto")).strip().lower()
+if DECIMER_DEVICE not in {"cpu", "gpu", "auto"}:
+    DECIMER_DEVICE = "auto"
+DECIMER_TIMEOUT_SECONDS = float(os.getenv("DECIMER_TIMEOUT_SECONDS", os.getenv("OCSR_TIMEOUT_SECONDS", "120")).strip() or "120")
+DECIMER_IMAGE_STRATEGY: Literal["original", "grayscale", "normalized", "binary"] = os.getenv(
+    "DECIMER_IMAGE_STRATEGY", "original"
+).strip().lower()  # type: ignore[assignment]
+if DECIMER_IMAGE_STRATEGY not in {"original", "grayscale", "normalized", "binary"}:
+    DECIMER_IMAGE_STRATEGY = "original"
+DECIMER_MODEL_NAME = os.getenv("DECIMER_MODEL_NAME", "DECIMER Image Transformer").strip()
+DECIMER_MODEL_VERSION = os.getenv("DECIMER_MODEL_VERSION", "").strip() or None
+DECIMER_STRICT_MODE = os.getenv("DECIMER_STRICT_MODE", os.getenv("OCSR_STRICT_MODE", "false")).lower() in {
+    "1",
+    "true",
+    "yes",
+}
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
 for directory in (DATA_DIR, SAMPLE_DIR, BATCH_INPUT_DIR, OUTPUT_DIR, MODEL_DIR):
