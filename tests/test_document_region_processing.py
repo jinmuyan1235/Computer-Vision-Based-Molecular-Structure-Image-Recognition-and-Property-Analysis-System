@@ -89,6 +89,34 @@ def test_single_page_pdf_processes_with_fake_renderer(tmp_path: Path) -> None:
     assert Path(result["exports"]["zip"]).is_file()
 
 
+def test_real_pymupdf_pdf_rendering_when_available(tmp_path: Path) -> None:
+    pytest.importorskip("fitz")
+    pdf_path = tmp_path / "aspirin_real_pdf.pdf"
+    pdf = canvas.Canvas(str(pdf_path))
+    pdf.drawString(72, 720, "Aspirin PDF fixture")
+    pdf.drawImage(
+        str(PROJECT_ROOT / "data" / "samples" / "aspirin.png"),
+        90,
+        420,
+        width=260,
+        height=195,
+        preserveAspectRatio=True,
+        mask="auto",
+    )
+    pdf.showPage()
+    pdf.save()
+
+    result = DocumentOCSRProcessor("demo", tmp_path / "out").process(pdf_path)
+
+    assert result["summary"]["page_count"] == 1
+    assert result["summary"]["molecule_region_count"] >= 1
+    assert result["summary"]["recognized_region_count"] >= 1
+    molecule_region = next(region for region in result["regions"] if region["region_type"] == "molecule")
+    assert molecule_region["page_number"] == 1
+    assert molecule_region["bbox"][2] > molecule_region["bbox"][0]
+    assert Path(result["exports"]["json"]).is_file()
+
+
 def test_multi_page_pdf_and_blank_page(tmp_path: Path) -> None:
     molecule_page = _make_page(tmp_path / "aspirin_page.png", ["aspirin"])
     blank_page = _make_page(tmp_path / "blank.png", [])
