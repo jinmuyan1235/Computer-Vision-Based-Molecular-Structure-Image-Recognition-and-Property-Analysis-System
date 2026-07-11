@@ -19,7 +19,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="批量识别分子结构图片并导出结果")
     parser.add_argument("--input", required=True, help="包含 PNG/JPG/JPEG 的输入文件夹")
     parser.add_argument("--output", required=True, help="报告输出文件夹")
-    parser.add_argument("--backend", choices=["demo", "molscribe", "decimer"], default="demo")
+    parser.add_argument("--backend", choices=["demo", "molscribe", "decimer", "ensemble"], default="demo")
     args = parser.parse_args()
     try:
         result = BatchAnalyzer(args.backend, args.output).analyze_folder(args.input)

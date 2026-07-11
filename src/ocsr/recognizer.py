@@ -9,6 +9,7 @@ import config
 from .base import BaseOCSRAdapter, OCSRResult
 from .decimer_adapter import DECIMERAdapter
 from .demo_adapter import DemoOCSRAdapter
+from .ensemble import EnsembleOCSRAdapter
 from .molscribe_adapter import MolScribeAdapter
 
 
@@ -19,12 +20,13 @@ class MoleculeRecognizer:
         "demo": DemoOCSRAdapter,
         "molscribe": MolScribeAdapter,
         "decimer": DECIMERAdapter,
+        "ensemble": EnsembleOCSRAdapter,
     }
 
     def __init__(self, backend: str | None = None) -> None:
         self.backend = (backend or config.OCSR_BACKEND).strip().lower()
         if self.backend not in self.ADAPTERS:
-            raise ValueError(f"不支持的 OCSR 后端：{self.backend}。可选值：demo/molscribe/decimer。")
+            raise ValueError(f"不支持的 OCSR 后端：{self.backend}。可选值：demo/molscribe/decimer/ensemble。")
         self.adapter = self.ADAPTERS[self.backend]()
 
     def recognize(self, image_path_or_array: Any) -> OCSRResult:

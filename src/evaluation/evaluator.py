@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import platform
+import json
 import subprocess
 import sys
 import time
@@ -13,7 +14,7 @@ from typing import Any
 
 import config
 from src.evaluation.dataset import BenchmarkSample, load_manifest
-from src.evaluation.metrics import compute_metrics, enrich_prediction
+from src.evaluation.metrics import compute_metrics, enrich_prediction, molecule_identity, tanimoto_similarity
 from src.ocsr.recognizer import MoleculeRecognizer
 from src.preprocess.image_preprocessor import ImagePreprocessor
 
@@ -75,6 +76,45 @@ class OCSREvaluator:
         self.recognizer = MoleculeRecognizer(backend)
         self.preprocessor = ImagePreprocessor()
 
+    @staticmethod
+    def _safe_backend_key(backend: str) -> str:
+        return "".join(character if character.isalnum() else "_" for character in backend.lower())
+
+    def _add_ensemble_fields(self, row: dict[str, Any], result: Any) -> None:
+        candidates = list(result.candidates or [])
+        consensus = dict(result.consensus or {})
+        row.update(
+            {
+                "consensus_status": consensus.get("status"),
+                "recommended_backend": consensus.get("recommended_backend"),
+                "ensemble_agreement": consensus.get("status") == "agreement",
+                "ensemble_disagreement": consensus.get("status") == "disagreement",
+                "ensemble_candidate_count": len(candidates),
+                "ensemble_candidates_json": json.dumps(candidates, ensure_ascii=False),
+                "ensemble_similarity_json": json.dumps(result.similarity_analysis or [], ensure_ascii=False),
+            }
+        )
+        truth_canonical, truth_inchikey = molecule_identity(row.get("ground_truth_smiles"))
+        for candidate in candidates:
+            backend = self._safe_backend_key(str(candidate.get("backend") or "unknown"))
+            raw_smiles = candidate.get("raw_smiles")
+            candidate_canonical, candidate_inchikey = molecule_identity(raw_smiles)
+            exact = bool(candidate_canonical and candidate_canonical == truth_canonical)
+            equivalent = bool(exact or (truth_inchikey and candidate_inchikey and truth_inchikey == candidate_inchikey))
+            row.update(
+                {
+                    f"candidate_{backend}_predicted_smiles": raw_smiles,
+                    f"candidate_{backend}_canonical_smiles": candidate_canonical,
+                    f"candidate_{backend}_recognition_success": candidate.get("status") == "success" and bool(raw_smiles),
+                    f"candidate_{backend}_rdkit_valid": candidate_canonical is not None,
+                    f"candidate_{backend}_canonical_exact_match": exact,
+                    f"candidate_{backend}_molecule_equivalent": equivalent,
+                    f"candidate_{backend}_tanimoto_similarity": tanimoto_similarity(row.get("ground_truth_smiles"), raw_smiles),
+                    f"candidate_{backend}_inference_time_ms": candidate.get("inference_time_ms"),
+                    f"candidate_{backend}_error": candidate.get("error"),
+                }
+            )
+
     def _select_input(self, sample: BenchmarkSample) -> Any:
         strategy = self.preprocessing_strategy
         if strategy == "backend-default":
@@ -120,6 +160,7 @@ class OCSREvaluator:
                     "package_version": result.package_version,
                 }
             )
+            self._add_ensemble_fields(base_row, result)
         except Exception as exc:
             if not self.continue_on_error:
                 raise

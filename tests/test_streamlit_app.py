@@ -44,9 +44,17 @@ def test_streamlit_decimer_unavailable_selection_does_not_crash() -> None:
     assert not app.exception
 
 
+def test_streamlit_ensemble_selection_does_not_crash() -> None:
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    app = AppTest.from_file(str(app_path), default_timeout=30).run()
+    app.selectbox[0].set_value("ensemble").run()
+    assert not app.exception
+
+
 def test_streamlit_correction_widgets_are_present() -> None:
     app_path = Path(__file__).resolve().parents[1] / "app.py"
     source = app_path.read_text(encoding="utf-8")
     assert "校验并应用修正" in source
     assert "恢复模型原始结果" in source
     assert "保存为纠错反馈样本" in source
+    assert "多后端候选与共识" in source

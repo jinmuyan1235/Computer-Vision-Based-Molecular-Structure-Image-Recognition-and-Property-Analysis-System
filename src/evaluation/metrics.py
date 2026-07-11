@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import statistics
 from collections import Counter, defaultdict
+import re
 from typing import Any
 
 from rdkit import Chem, DataStructs
@@ -163,4 +164,82 @@ def compute_metrics(rows: list[dict[str, Any]], similarity_threshold: float = 0.
     return {
         "overall": summarize_rows(rows, similarity_threshold),
         "groups": group_metrics(rows, similarity_threshold),
+        "ensemble": ensemble_metrics(rows),
+    }
+
+
+def _candidate_backends(rows: list[dict[str, Any]]) -> list[str]:
+    backends: set[str] = set()
+    pattern = re.compile(r"^candidate_(.+)_canonical_exact_match$")
+    for row in rows:
+        for key in row:
+            match = pattern.match(key)
+            if match:
+                backends.add(match.group(1))
+    return sorted(backends)
+
+
+def ensemble_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize ensemble-specific diagnostics without claiming unproven improvement."""
+    ensemble_rows = [row for row in rows if row.get("backend") == "ensemble"]
+    total = len(ensemble_rows)
+    agreement = sum(bool(row.get("ensemble_agreement")) for row in ensemble_rows)
+    disagreement = sum(bool(row.get("ensemble_disagreement")) for row in ensemble_rows)
+    candidate_backend_metrics: dict[str, Any] = {}
+    candidate_backends = _candidate_backends(ensemble_rows)
+    for backend in candidate_backends:
+        success_key = f"candidate_{backend}_recognition_success"
+        valid_key = f"candidate_{backend}_rdkit_valid"
+        exact_key = f"candidate_{backend}_canonical_exact_match"
+        equivalent_key = f"candidate_{backend}_molecule_equivalent"
+        candidate_backend_metrics[backend] = {
+            "total_samples": total,
+            "recognition_success_count": sum(bool(row.get(success_key)) for row in ensemble_rows),
+            "recognition_success_rate": _rate(sum(bool(row.get(success_key)) for row in ensemble_rows), total),
+            "rdkit_valid_count": sum(bool(row.get(valid_key)) for row in ensemble_rows),
+            "rdkit_valid_rate": _rate(sum(bool(row.get(valid_key)) for row in ensemble_rows), total),
+            "canonical_exact_match_count": sum(bool(row.get(exact_key)) for row in ensemble_rows),
+            "canonical_exact_match_rate": _rate(sum(bool(row.get(exact_key)) for row in ensemble_rows), total),
+            "molecule_equivalent_count": sum(bool(row.get(equivalent_key)) for row in ensemble_rows),
+            "molecule_equivalent_rate": _rate(sum(bool(row.get(equivalent_key)) for row in ensemble_rows), total),
+        }
+    pairwise: dict[str, int] = {}
+    if len(candidate_backends) >= 2:
+        for first_index, first in enumerate(candidate_backends):
+            for second in candidate_backends[first_index + 1 :]:
+                first_key = f"candidate_{first}_canonical_exact_match"
+                second_key = f"candidate_{second}_canonical_exact_match"
+                pairwise[f"{first}_only_correct_vs_{second}"] = sum(
+                    bool(row.get(first_key)) and not bool(row.get(second_key)) for row in ensemble_rows
+                )
+                pairwise[f"{second}_only_correct_vs_{first}"] = sum(
+                    bool(row.get(second_key)) and not bool(row.get(first_key)) for row in ensemble_rows
+                )
+    any_candidate_correct = [
+        any(bool(row.get(f"candidate_{backend}_canonical_exact_match")) for backend in candidate_backends)
+        for row in ensemble_rows
+    ]
+    ensemble_correct = [bool(row.get("canonical_exact_match")) for row in ensemble_rows]
+    ensemble_only_correct = sum(
+        bool(ensemble_value) and not bool(candidate_value)
+        for ensemble_value, candidate_value in zip(ensemble_correct, any_candidate_correct)
+    )
+    ensemble_missed_candidate_correct = sum(
+        bool(candidate_value) and not bool(ensemble_value)
+        for ensemble_value, candidate_value in zip(ensemble_correct, any_candidate_correct)
+    )
+    return {
+        "total_ensemble_samples": total,
+        "agreement_count": agreement,
+        "agreement_rate": _rate(agreement, total),
+        "disagreement_count": disagreement,
+        "disagreement_rate": _rate(disagreement, total),
+        "candidate_backend_metrics": candidate_backend_metrics,
+        "single_model_correct_distribution": pairwise,
+        "ensemble_only_correct_count": ensemble_only_correct,
+        "ensemble_missed_available_correct_count": ensemble_missed_candidate_correct,
+        "improvement_claim": (
+            "No accuracy improvement is claimed unless benchmark data shows ensemble_only_correct_count "
+            "exceeds ensemble_missed_available_correct_count on a representative dataset."
+        ),
     }

@@ -90,7 +90,8 @@ class MoleculeReportGenerator:
             report["message"] = result.message
             report["validation"]["error"] = "未获得可校验的 SMILES。"
             return report
-        return self._complete_chemistry(report, result.smiles, prefix, final_source="ocsr")
+        final_source = "ensemble_recommendation" if result.backend == "ensemble" else "ocsr"
+        return self._complete_chemistry(report, result.smiles, prefix, final_source=final_source)
 
     def _from_smiles(self, smiles: str) -> dict[str, Any]:
         report = self._base_report({"type": "smiles", "smiles": smiles})
@@ -130,7 +131,7 @@ class MoleculeReportGenerator:
             report["lipinski"] = lipinski
             report["admet"] = self.admet_predictor.predict(canonical)
             report["images"]["redrawn_molecule"] = draw_molecule(canonical, drawing_path)
-            if final_source == "ocsr":
+            if final_source in {"ocsr", "ensemble_recommendation"}:
                 report["images"]["predicted_molecule"] = report["images"]["redrawn_molecule"]
             report["final"] = {"smiles": smiles, "canonical_smiles": canonical, "source": final_source}
             report["status"] = "success"
