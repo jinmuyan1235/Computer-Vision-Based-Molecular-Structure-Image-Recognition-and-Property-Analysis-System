@@ -356,3 +356,110 @@ python scripts/check_ocsr_backend.py --backend molscribe
 - `请求 CUDA 设备，但 torch.cuda.is_available() 为 False`：检查 NVIDIA 驱动、CUDA 版 PyTorch 和 `OCSR_DEVICE`；也可先用 `OCSR_DEVICE=cpu` 验证流程。
 - `模型加载失败`：通常是权重文件与 MolScribe 代码版本不匹配，或模型文件损坏。请重新下载与当前 MolScribe 版本匹配的权重。
 - `MolScribe 未返回 SMILES`：图片可能不符合模型输入分布，或该版本返回格式发生变化。可运行诊断脚本并保留错误信息用于适配。
+
+## 生产 DECIMER 后端配置
+
+DECIMER 也是可选真实 OCSR 后端。未安装 DECIMER 或 TensorFlow 环境不可用时，demo、MolScribe、手动 SMILES、RDKit、批处理和评测框架仍应继续运行。系统不会在 DECIMER 不可用时自动伪装成 demo 识别成功。
+
+本适配器按 DECIMER Image Transformer 官方公开用法适配：[Kohulan/DECIMER-Image_Transformer](https://github.com/Kohulan/DECIMER-Image_Transformer)。官方安装方式为：
+
+```bash
+pip install decimer
+```
+
+本仓库提供了可选依赖清单，用于复现当前已验证环境：
+
+```bash
+python -m pip install -r requirements-decimer.txt
+```
+
+已在 Windows / Python 3.10 环境验证的版本：
+
+```text
+decimer==2.8.0
+tensorflow==2.20.0
+wrapt==2.2.2
+tqdm==4.68.4
+```
+
+本机诊断还补齐了 TensorFlow/DECIMER 导入链需要的 `flatbuffers`、`libclang`、`termcolor`、`selfies`、`namex`、`tifffile`、`tensorboard-data-server` 和 `sympy`。这些依赖写在 `requirements-decimer.txt` 中，避免只在开发机上“临时可用”。DECIMER 首次初始化可能会把模型缓存下载到用户目录，例如 Windows 下的 `C:\Users\<用户名>\.data\DECIMER-V2`；该缓存不属于仓库内容，也不要提交到 Git。
+
+公开推理接口为：
+
+```python
+from DECIMER import predict_SMILES
+predict_SMILES(image_input, confidence=False, hand_drawn=False)
+```
+
+其中 `image_input` 可以是图片路径或 numpy 图像数组。不同版本可能返回字符串、元组、列表或字典；适配器会统一归一化为 `OCSRResult`。如果 DECIMER 只返回 token 级置信度或不返回可信整体置信度，系统会把 `confidence` 置为 `null`，不会伪造数值。
+
+### CPU 启动
+
+Windows PowerShell：
+
+```powershell
+$env:OCSR_BACKEND="decimer"
+$env:DECIMER_DEVICE="cpu"
+$env:DECIMER_IMAGE_STRATEGY="original"
+python -m streamlit run app.py
+```
+
+Linux/macOS：
+
+```bash
+export OCSR_BACKEND=decimer
+export DECIMER_DEVICE=cpu
+export DECIMER_IMAGE_STRATEGY=original
+python -m streamlit run app.py
+```
+
+### GPU/auto 启动
+
+```powershell
+$env:OCSR_BACKEND="decimer"
+$env:DECIMER_DEVICE="auto"   # auto 会在 TensorFlow 检测到 GPU 时使用 GPU，否则回退 CPU
+python -m streamlit run app.py
+```
+
+严格 GPU 模式：
+
+```powershell
+$env:OCSR_BACKEND="decimer"
+$env:DECIMER_DEVICE="gpu"
+$env:DECIMER_STRICT_MODE="true"
+python -m streamlit run app.py
+```
+
+如果 strict 模式下 TensorFlow 未检测到 GPU，DECIMER 会返回清晰错误；非 strict 模式会安全回退 CPU，并在状态中显示实际设备。
+
+### DECIMER 配置项
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `DECIMER_DEVICE` | `auto` | `cpu`、`gpu` 或 `auto` |
+| `DECIMER_TIMEOUT_SECONDS` | `120` | 单次初始化/推理超时时间 |
+| `DECIMER_IMAGE_STRATEGY` | `original` | `original`、`grayscale`、`normalized`、`binary` |
+| `DECIMER_MODEL_NAME` | `DECIMER Image Transformer` | 报告和界面显示用模型名 |
+| `DECIMER_MODEL_VERSION` | 空 | 可选模型/包版本备注 |
+| `DECIMER_STRICT_MODE` | `false` | 为 `true` 时 GPU 不可用会报错，不回退 CPU |
+
+当前官方 `decimer` 包通常自行管理模型资源；本项目不新增伪造的 DECIMER checkpoint 路径配置。如你使用的发行版本需要外部模型目录，应先按该版本官方说明安装配置，再用诊断脚本确认。
+
+### DECIMER 诊断
+
+```bash
+python scripts/check_ocsr_backend.py --backend decimer
+```
+
+诊断输出包括 Python 版本、DECIMER 是否安装、包版本、TensorFlow 版本、GPU 状态、检测到的 GPU、设备选择、输入策略、初始化是否成功、最近推理耗时和可读错误信息。未安装或版本不兼容时不会直接打印未处理堆栈。
+
+### DECIMER 常见错误
+
+- `未安装 DECIMER`：确认当前 Python 环境后执行 `python -m pip install -r requirements-decimer.txt`。
+- `No module named 'wrapt'`：TensorFlow 导入依赖缺失，安装 `requirements-decimer.txt` 或执行 `python -m pip install wrapt`。
+- `No module named 'tqdm'`：DECIMER 依赖链缺失，安装 `requirements-decimer.txt` 或执行 `python -m pip install tqdm`。
+- `TensorFlow 未检测到可用 GPU`：检查 NVIDIA 驱动、CUDA/cuDNN 与 TensorFlow 版本；也可先用 `DECIMER_DEVICE=cpu` 验证流程。
+- `DECIMER 初始化失败`：可能是 TensorFlow、模型资源下载/缓存或版本兼容问题。请先运行诊断命令并记录包版本。
+- `DECIMER 未返回 SMILES`：图片可能不符合模型输入分布，或该版本返回格式发生变化。
+
+本机已验证 DECIMER 2.8.0 可以完成后端初始化诊断，并自动回退到 CPU。当前 Windows 环境未检测到 TensorFlow GPU，真实 GPU 推理仍需要你按目标平台配置匹配的 NVIDIA 驱动、CUDA/cuDNN 与 TensorFlow 运行时。默认单元测试仍使用 mock/fake 后端，不要求下载 DECIMER 模型。
