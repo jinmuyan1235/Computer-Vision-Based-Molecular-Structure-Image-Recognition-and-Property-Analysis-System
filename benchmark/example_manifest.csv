@@ -1,0 +1,4 @@
+sample_id,image_path,ground_truth_smiles,category,source,notes
+aspirin_demo,data/samples/aspirin.png,CC(=O)Oc1ccccc1C(=O)O,clean_generated,local_demo,Demo sample for validating benchmark plumbing only
+benzene_demo,data/samples/benzene.png,c1ccccc1,clean_generated,local_demo,Demo sample for validating benchmark plumbing only
+ethanol_demo,data/samples/ethanol.png,CCO,clean_generated,local_demo,Demo sample for validating benchmark plumbing only
