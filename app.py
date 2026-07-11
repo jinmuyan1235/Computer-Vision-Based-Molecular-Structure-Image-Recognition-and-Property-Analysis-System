@@ -31,6 +31,20 @@ def get_batch_analyzer(backend: str) -> BatchAnalyzer:
     return BatchAnalyzer(backend, OUTPUT_DIR)
 
 
+def get_backend_status(backend: str) -> dict:
+    """Return current backend status, including recent inference details."""
+    status = get_report_generator(backend).recognizer.status()
+    latest = st.session_state.get("backend_last_status") or {}
+    if latest.get("backend") == backend:
+        status.update({key: value for key, value in latest.items() if value is not None})
+    return status
+
+
+def remember_backend_status(backend: str) -> None:
+    """Store backend diagnostics after an inference or batch run."""
+    st.session_state["backend_last_status"] = get_report_generator(backend).recognizer.status()
+
+
 def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_prefix: str) -> None:
     """Render a molecule analysis report in Streamlit."""
     if report.get("status") != "success":
@@ -50,6 +64,18 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
         st.write(f"**Canonical SMILES：** `{validation.get('canonical_smiles')}`")
         confidence = ocsr.get("confidence")
         st.write(f"**识别后端：** {ocsr.get('backend')}　 **置信度：** {confidence if confidence is not None else '模型未提供'}")
+        diagnostic_line = " · ".join(
+            item
+            for item in [
+                f"设备：{ocsr.get('device')}" if ocsr.get("device") else None,
+                f"模型：{ocsr.get('model_name')}" if ocsr.get("model_name") else None,
+                f"模型版本：{ocsr.get('model_version')}" if ocsr.get("model_version") else None,
+                f"耗时：{ocsr.get('inference_time_ms')} ms" if ocsr.get("inference_time_ms") is not None else None,
+            ]
+            if item
+        )
+        if diagnostic_line:
+            st.caption(diagnostic_line)
         st.write(f"**RDKit 校验：** {'有效' if validation.get('valid') else '无效'}")
     with right:
         st.subheader("标准化结构重绘")
@@ -131,11 +157,20 @@ with st.sidebar:
             "当前主动选择的是 demo 演示后端；这与 RDKit/OpenCV 是否安装无关。"
             "如已安装并配置 MolScribe/DECIMER，请在上方切换对应后端。"
         )
-    backend_status = get_report_generator(backend).recognizer.status()
+    backend_status = get_backend_status(backend)
     if backend_status["available"]:
         st.success(backend_status["message"])
     else:
         st.error(backend_status["message"])
+        if backend == "molscribe":
+            st.warning("MolScribe 当前不可用。请配置模型权重，或切换 demo 后端，也可以使用手动 SMILES 分析。")
+    st.write(f"**当前后端：** {backend_status.get('backend', backend)}")
+    st.write(f"**是否可用：** {'是' if backend_status.get('available') else '否'}")
+    st.write(f"**模型：** {backend_status.get('model_name') or backend_status.get('model_path') or '无'}")
+    st.write(f"**设备：** {backend_status.get('device') or '未指定'}")
+    st.write(f"**包版本：** {backend_status.get('package_version') or '未安装/未提供'}")
+    last_time = backend_status.get("last_inference_time_ms")
+    st.write(f"**最近推理耗时：** {last_time} ms" if last_time is not None else "**最近推理耗时：** 暂无")
     st.caption("CPU 可运行；真实模型可按各自配置自动使用相应设备。")
 
 image_tab, smiles_tab, batch_tab, about_tab = st.tabs(["图片识别", "SMILES 分析", "批量处理", "项目说明"])
@@ -154,6 +189,7 @@ with image_tab:
                 try:
                     st.session_state["image_report"] = get_report_generator(backend).generate(image_path=temporary_path)
                     st.session_state["image_report"]["input"]["filename"] = uploaded.name
+                    remember_backend_status(backend)
                 finally:
                     temporary_path.unlink(missing_ok=True)
         if "image_report" in st.session_state:
@@ -164,6 +200,7 @@ with smiles_tab:
     if st.button("分析 SMILES", type="primary", key="analyze_smiles"):
         with st.spinner("正在进行 RDKit 校验与性质计算……"):
             st.session_state["smiles_report"] = get_report_generator(backend).generate(smiles=smiles_input)
+            remember_backend_status(backend)
     if "smiles_report" in st.session_state:
         show_report(st.session_state["smiles_report"], False, export_pdf, "smiles")
 
@@ -181,8 +218,10 @@ with batch_tab:
                         for item in uploaded_files:
                             (Path(temp_dir) / Path(item.name).name).write_bytes(item.getvalue())
                         st.session_state["batch_result"] = get_batch_analyzer(backend).analyze_folder(temp_dir)
+                        remember_backend_status(backend)
                 elif folder_path.strip():
                     st.session_state["batch_result"] = get_batch_analyzer(backend).analyze_folder(folder_path.strip())
+                    remember_backend_status(backend)
                 else:
                     st.warning("请上传至少一张图片或填写输入文件夹路径。")
             except Exception as exc:

@@ -28,3 +28,10 @@ def test_app_avoids_newer_only_stretch_width_api() -> None:
     app_path = Path(__file__).resolve().parents[1] / "app.py"
     source = app_path.read_text(encoding="utf-8")
     assert 'width="stretch"' not in source
+
+
+def test_streamlit_molscribe_unavailable_selection_does_not_crash() -> None:
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    app = AppTest.from_file(str(app_path), default_timeout=30).run()
+    app.selectbox[0].set_value("molscribe").run()
+    assert not app.exception

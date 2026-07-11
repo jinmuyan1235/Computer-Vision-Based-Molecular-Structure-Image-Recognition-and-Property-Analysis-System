@@ -1,64 +1,356 @@
-"""Safe, optional MolScribe backend adapter."""
+"""Production-oriented, optional MolScribe backend adapter."""
 
 from __future__ import annotations
 
-import os
+import importlib
+import importlib.metadata
+import importlib.util
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Literal
 
+import numpy as np
+from PIL import Image
+
+import config
 from .base import BaseOCSRAdapter, OCSRResult
+
+ImageStrategy = Literal["original", "grayscale", "normalized", "binary"]
+
+
+class MolScribeAdapterError(RuntimeError):
+    """Base class for classified MolScribe adapter errors."""
+
+
+class MolScribeDependencyError(MolScribeAdapterError):
+    """Raised when the optional MolScribe package is unavailable."""
+
+
+class MolScribeConfigurationError(MolScribeAdapterError):
+    """Raised when model path or device configuration is invalid."""
+
+
+class MolScribeModelLoadError(MolScribeAdapterError):
+    """Raised when the MolScribe model cannot be constructed."""
+
+
+class MolScribeInferenceError(MolScribeAdapterError):
+    """Raised when MolScribe inference fails or returns no SMILES."""
 
 
 class MolScribeAdapter(BaseOCSRAdapter):
-    """Wrap MolScribe without making it a mandatory project dependency."""
+    """Wrap MolScribe without requiring it for demo, RDKit or Streamlit startup."""
 
     backend_name = "molscribe"
 
-    def __init__(self, model_path: str | None = None, device: str | None = None) -> None:
-        self.model_path = model_path or os.getenv("MOLSCRIBE_MODEL_PATH")
-        self.device = device or os.getenv("OCSR_DEVICE", "cpu")
-        self.model = None
-        self.import_error: str | None = None
-        try:
-            from molscribe import MolScribe  # type: ignore
+    def __init__(
+        self,
+        model_path: str | Path | None = None,
+        device: str | None = None,
+        timeout_seconds: float | None = None,
+        image_strategy: ImageStrategy | None = None,
+        strict_mode: bool | None = None,
+        model_name: str | None = None,
+        model_version: str | None = None,
+    ) -> None:
+        self.model_path = self._coerce_model_path(model_path)
+        self.device = (device or config.OCSR_DEVICE or "cpu").strip().lower()
+        self.timeout_seconds = float(timeout_seconds or config.OCSR_TIMEOUT_SECONDS)
+        self.image_strategy: ImageStrategy = image_strategy or config.MOLSCRIBE_IMAGE_STRATEGY
+        self.strict_mode = config.OCSR_STRICT_MODE if strict_mode is None else strict_mode
+        self.model_name = model_name or (self.model_path.name if model_path is not None else config.MOLSCRIBE_MODEL_NAME)
+        self.model_version = model_version or config.MOLSCRIBE_MODEL_VERSION
+        self.package_version = self._detect_package_version()
+        self.model: Any | None = None
+        self._load_error: str | None = None
+        self._device_object: Any | None = None
+        self.last_inference_time_ms: float | None = None
+        self.preferred_image_stage = "preprocessed" if config.OCSR_USE_PREPROCESSED_IMAGE else "original"
 
-            if self.model_path:
-                self.model = MolScribe(self.model_path, device=self.device)
-            else:
-                self.import_error = "已检测到 MolScribe，但未设置 MOLSCRIBE_MODEL_PATH。"
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.import_error = f"未安装 MolScribe：{exc}"
+    @staticmethod
+    def _coerce_model_path(model_path: str | Path | None) -> Path:
+        path = Path(model_path).expanduser() if model_path is not None else config.MOLSCRIBE_MODEL_PATH
+        return (path if path.is_absolute() else config.PROJECT_ROOT / path).resolve()
+
+    @staticmethod
+    def _detect_package_version() -> str | None:
+        for package_name in ("molscribe", "MolScribe"):
+            try:
+                return importlib.metadata.version(package_name)
+            except importlib.metadata.PackageNotFoundError:
+                continue
+        return None
+
+    @staticmethod
+    def _package_installed() -> bool:
+        return importlib.util.find_spec("molscribe") is not None
+
+    def _import_molscribe_class(self) -> type[Any]:
+        if not self._package_installed():
+            raise MolScribeDependencyError("未安装 MolScribe。请先按 README 安装可选真实 OCSR 后端。")
+        try:
+            module = importlib.import_module("molscribe")
+            return getattr(module, "MolScribe")
+        except (ImportError, AttributeError) as exc:
+            raise MolScribeDependencyError(f"MolScribe 包已发现，但无法导入 MolScribe 类：{exc}") from exc
+
+    def _resolve_device_object(self) -> Any:
+        requested = self.device
+        if requested.startswith("cuda"):
+            try:
+                import torch
+            except Exception as exc:
+                raise MolScribeConfigurationError(f"请求 CUDA 设备，但 PyTorch 不可导入：{exc}") from exc
+            if not torch.cuda.is_available():
+                if self.strict_mode:
+                    raise MolScribeConfigurationError("请求 CUDA 设备，但 torch.cuda.is_available() 为 False。")
+                self.device = "cpu"
+                return torch.device("cpu")
+            return torch.device(requested)
+        try:
+            import torch
+
+            return torch.device("cpu")
+        except Exception:
+            return "cpu"
+
+    def _load_model(self) -> Any:
+        if self.model is not None:
+            return self.model
+        if not self._package_installed():
+            raise MolScribeDependencyError("未安装 MolScribe。请先按 README 安装可选真实 OCSR 后端。")
+        if not self.model_path.is_file():
+            raise MolScribeConfigurationError(f"MolScribe 模型文件不存在：{self.model_path}")
+        molscribe_class = self._import_molscribe_class()
+        try:
+            self._device_object = self._resolve_device_object()
+            self.model = molscribe_class(str(self.model_path), device=self._device_object)
+            self._load_error = None
+            return self.model
+        except MolScribeAdapterError:
+            raise
         except Exception as exc:
-            self.import_error = f"MolScribe 模型加载失败：{exc}"
+            self._load_error = str(exc)
+            raise MolScribeModelLoadError(f"MolScribe 模型加载失败：{exc}") from exc
+
+    def _result(
+        self,
+        smiles: str | None,
+        confidence: float | None,
+        status: Literal["success", "failed"],
+        message: str,
+        inference_time_ms: float | None = None,
+    ) -> OCSRResult:
+        return OCSRResult(
+            smiles=smiles,
+            confidence=confidence,
+            backend=self.backend_name,
+            status=status,
+            message=message,
+            inference_time_ms=inference_time_ms,
+            model_name=self.model_name,
+            model_version=self.model_version,
+            device=self.device,
+            package_version=self.package_version,
+        )
+
+    @staticmethod
+    def _normalize_confidence(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _normalize_prediction(self, prediction: Any) -> tuple[str | None, float | None]:
+        if isinstance(prediction, dict):
+            smiles = (
+                prediction.get("smiles")
+                or prediction.get("SMILES")
+                or prediction.get("predicted_smiles")
+                or prediction.get("pred")
+            )
+            confidence = (
+                prediction.get("confidence")
+                or prediction.get("score")
+                or prediction.get("probability")
+                or prediction.get("confidence_score")
+            )
+            return (str(smiles).strip() if smiles else None, self._normalize_confidence(confidence))
+        if isinstance(prediction, (tuple, list)):
+            if prediction and isinstance(prediction[0], dict):
+                return self._normalize_prediction(prediction[0])
+            smiles = prediction[0] if prediction else None
+            confidence = prediction[1] if len(prediction) > 1 else None
+            return (str(smiles).strip() if smiles else None, self._normalize_confidence(confidence))
+        smiles = getattr(prediction, "smiles", None) or getattr(prediction, "SMILES", None)
+        confidence = getattr(prediction, "confidence", None)
+        if smiles:
+            return str(smiles).strip(), self._normalize_confidence(confidence)
+        if isinstance(prediction, str):
+            return prediction.strip(), None
+        return None, None
+
+    @staticmethod
+    def _load_array_from_path(path: Path) -> np.ndarray:
+        with Image.open(path) as image:
+            return np.asarray(image.convert("RGB"))
+
+    @staticmethod
+    def _normalize_array(image: Any) -> np.ndarray:
+        array = np.asarray(image)
+        if array.ndim not in {2, 3}:
+            raise MolScribeInferenceError(f"不支持的图像数组维度：{array.ndim}")
+        if array.dtype != np.uint8:
+            clipped = np.clip(array, 0, 255)
+            if clipped.max(initial=0) <= 1:
+                clipped = clipped * 255
+            array = clipped.astype(np.uint8)
+        if array.ndim == 2:
+            array = np.stack([array] * 3, axis=-1)
+        if array.shape[-1] == 4:
+            array = array[..., :3]
+        return array
+
+    def _prepare_image_array(self, image_path_or_array: Any) -> np.ndarray:
+        if isinstance(image_path_or_array, (str, Path)):
+            path = Path(image_path_or_array).expanduser().resolve()
+            if not path.is_file():
+                raise MolScribeInferenceError(f"输入图片不存在：{path}")
+            array = self._load_array_from_path(path)
+        else:
+            array = self._normalize_array(image_path_or_array)
+
+        if self.image_strategy == "original":
+            return self._normalize_array(array)
+        gray = np.asarray(Image.fromarray(self._normalize_array(array)).convert("L"))
+        if self.image_strategy == "grayscale":
+            return np.stack([gray] * 3, axis=-1)
+        if self.image_strategy == "binary":
+            threshold = int(gray.mean())
+            binary = np.where(gray > threshold, 255, 0).astype(np.uint8)
+            return np.stack([binary] * 3, axis=-1)
+        normalized = gray.astype(np.float32)
+        minimum = float(normalized.min(initial=0))
+        maximum = float(normalized.max(initial=255))
+        if maximum > minimum:
+            normalized = (normalized - minimum) * (255.0 / (maximum - minimum))
+        return np.stack([normalized.astype(np.uint8)] * 3, axis=-1)
+
+    def _predict_with_model(self, model: Any, image_path_or_array: Any) -> Any:
+        if isinstance(image_path_or_array, (str, Path)) and self.image_strategy == "original":
+            path = Path(image_path_or_array).expanduser().resolve()
+            if not path.is_file():
+                raise MolScribeInferenceError(f"输入图片不存在：{path}")
+            if hasattr(model, "predict_image_file"):
+                try:
+                    return model.predict_image_file(str(path), return_confidence=True)
+                except TypeError:
+                    return model.predict_image_file(str(path))
+
+        image_array = self._prepare_image_array(image_path_or_array)
+        if hasattr(model, "predict_image"):
+            try:
+                return model.predict_image(image_array, return_confidence=True)
+            except TypeError:
+                return model.predict_image(image_array)
+        if isinstance(image_path_or_array, (str, Path)) and hasattr(model, "predict_image_file"):
+            return model.predict_image_file(str(Path(image_path_or_array).expanduser().resolve()))
+        raise MolScribeInferenceError("当前 MolScribe 模型对象不支持 predict_image_file 或 predict_image。")
+
+    def _run_with_timeout(self, function: Callable[[], Any]) -> Any:
+        if self.timeout_seconds <= 0:
+            return function()
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(function)
+        try:
+            return future.result(timeout=self.timeout_seconds)
+        except TimeoutError as exc:
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise MolScribeInferenceError(f"MolScribe 推理超过 {self.timeout_seconds:.1f} 秒超时。") from exc
+        finally:
+            if future.done():
+                executor.shutdown(wait=True)
 
     def recognize(self, image_path_or_array: Any) -> OCSRResult:
-        """Run MolScribe inference when its package and checkpoint are available."""
-        if self.model is None:
-            return OCSRResult(None, None, self.backend_name, "failed", self.import_error or "MolScribe 不可用。")
+        """Run MolScribe inference and return a diagnostic-rich normalized result."""
+        start = time.perf_counter()
         try:
-            image_path = str(Path(image_path_or_array))
-            try:
-                prediction = self.model.predict_image_file(image_path, return_confidence=True)
-            except TypeError:
-                # Older releases may not expose the return_confidence keyword.
-                prediction = self.model.predict_image_file(image_path)
-            if isinstance(prediction, dict):
-                smiles = prediction.get("smiles") or prediction.get("predicted_smiles")
-                confidence = prediction.get("confidence")
-            else:
-                smiles, confidence = str(prediction), None
+            model = self._load_model()
+            prediction = self._run_with_timeout(lambda: self._predict_with_model(model, image_path_or_array))
+            smiles, confidence = self._normalize_prediction(prediction)
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
+            self.last_inference_time_ms = elapsed_ms
             if not smiles:
-                return OCSRResult(None, confidence, self.backend_name, "failed", "MolScribe 未返回 SMILES。")
-            return OCSRResult(str(smiles), confidence, self.backend_name, "success", "MolScribe 识别完成。")
+                raise MolScribeInferenceError("MolScribe 未返回 SMILES。")
+            return self._result(smiles, confidence, "success", "MolScribe 识别完成。", elapsed_ms)
+        except MolScribeAdapterError as exc:
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
+            self.last_inference_time_ms = elapsed_ms
+            return self._result(None, None, "failed", str(exc), elapsed_ms)
         except Exception as exc:
-            return OCSRResult(None, None, self.backend_name, "failed", f"MolScribe 推理失败：{exc}")
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
+            self.last_inference_time_ms = elapsed_ms
+            return self._result(None, None, "failed", f"MolScribe 推理失败：{exc}", elapsed_ms)
 
     @property
     def is_available(self) -> bool:
-        """Return whether a MolScribe checkpoint was loaded successfully."""
-        return self.model is not None
+        """Return whether MolScribe appears configured for lazy model loading."""
+        return self._package_installed() and self.model_path.is_file() and self._load_error is None
 
     @property
     def availability_message(self) -> str:
-        """Describe the current MolScribe configuration state."""
-        return self.import_error or "MolScribe 模型已加载。"
+        """Describe the current MolScribe configuration state without importing torch/model weights."""
+        if not self._package_installed():
+            return "未安装 MolScribe。demo、手动 SMILES 和 RDKit 分析仍可正常使用。"
+        if not self.model_path.is_file():
+            return f"MolScribe 模型文件不存在：{self.model_path}"
+        if self._load_error:
+            return f"MolScribe 模型加载失败：{self._load_error}"
+        if self.model is None:
+            return "MolScribe 已配置；模型将在第一次真实识别时延迟加载。"
+        return "MolScribe 模型已加载。"
+
+    def status(self) -> dict[str, Any]:
+        """Return JSON-friendly backend diagnostics for Streamlit and scripts."""
+        return {
+            "backend": self.backend_name,
+            "available": self.is_available,
+            "message": self.availability_message,
+            "package_installed": self._package_installed(),
+            "package_version": self.package_version,
+            "model_path": str(self.model_path),
+            "model_exists": self.model_path.is_file(),
+            "model_loaded": self.model is not None,
+            "model_name": self.model_name,
+            "model_version": self.model_version,
+            "device": self.device,
+            "image_strategy": self.image_strategy,
+            "timeout_seconds": self.timeout_seconds,
+            "strict_mode": self.strict_mode,
+            "last_inference_time_ms": self.last_inference_time_ms,
+        }
+
+    def diagnose(self, load_model: bool = False) -> dict[str, Any]:
+        """Return detailed diagnostics, optionally attempting model construction."""
+        diagnostics = self.status()
+        try:
+            import torch
+
+            diagnostics["cuda_available"] = bool(torch.cuda.is_available())
+        except Exception as exc:
+            diagnostics["cuda_available"] = False
+            diagnostics["torch_error"] = str(exc)
+        if load_model:
+            try:
+                self._load_model()
+                diagnostics.update(self.status())
+                diagnostics["model_loaded"] = True
+            except MolScribeAdapterError as exc:
+                diagnostics.update(self.status())
+                diagnostics["model_loaded"] = False
+                diagnostics["load_error"] = str(exc)
+        return diagnostics

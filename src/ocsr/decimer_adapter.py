@@ -47,7 +47,14 @@ class DECIMERAdapter(BaseOCSRAdapter):
             if not smiles:
                 return OCSRResult(None, None, self.backend_name, "failed", "DECIMER 未返回 SMILES。")
             numeric_confidence = float(confidence) if confidence is not None else None
-            return OCSRResult(str(smiles), numeric_confidence, self.backend_name, "success", "DECIMER 识别完成。")
+            return OCSRResult(
+                str(smiles),
+                numeric_confidence,
+                self.backend_name,
+                "success",
+                "DECIMER 识别完成。",
+                model_name="DECIMER",
+            )
         except Exception as exc:
             return OCSRResult(None, None, self.backend_name, "failed", f"DECIMER 推理失败：{exc}")
 
