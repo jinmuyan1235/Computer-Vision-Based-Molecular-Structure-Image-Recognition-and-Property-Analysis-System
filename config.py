@@ -15,7 +15,7 @@ MODEL_DIR = PROJECT_ROOT / "models"
 
 DEFAULT_IMAGE_SIZE = (512, 512)
 OCSR_BACKEND = os.getenv("OCSR_BACKEND", "demo").strip().lower()
-OCSR_DEVICE = os.getenv("OCSR_DEVICE", "cpu").strip().lower()
+OCSR_DEVICE = os.getenv("OCSR_DEVICE", "auto").strip().lower()
 OCSR_TIMEOUT_SECONDS = float(os.getenv("OCSR_TIMEOUT_SECONDS", "120").strip() or "120")
 OCSR_USE_PREPROCESSED_IMAGE = os.getenv("OCSR_USE_PREPROCESSED_IMAGE", "false").lower() in {"1", "true", "yes"}
 OCSR_STRICT_MODE = os.getenv("OCSR_STRICT_MODE", "false").lower() in {"1", "true", "yes"}
@@ -39,6 +39,59 @@ MOLSCRIBE_IMAGE_STRATEGY: Literal["original", "grayscale", "normalized", "binary
 ).strip().lower()  # type: ignore[assignment]
 if MOLSCRIBE_IMAGE_STRATEGY not in {"original", "grayscale", "normalized", "binary"}:
     MOLSCRIBE_IMAGE_STRATEGY = "original"
+DECIMER_DEVICE = os.getenv("DECIMER_DEVICE", os.getenv("OCSR_DEVICE", "auto")).strip().lower()
+if DECIMER_DEVICE not in {"cpu", "gpu", "auto"}:
+    DECIMER_DEVICE = "auto"
+DECIMER_TIMEOUT_SECONDS = float(os.getenv("DECIMER_TIMEOUT_SECONDS", os.getenv("OCSR_TIMEOUT_SECONDS", "120")).strip() or "120")
+DECIMER_IMAGE_STRATEGY: Literal["original", "grayscale", "normalized", "binary"] = os.getenv(
+    "DECIMER_IMAGE_STRATEGY", "original"
+).strip().lower()  # type: ignore[assignment]
+if DECIMER_IMAGE_STRATEGY not in {"original", "grayscale", "normalized", "binary"}:
+    DECIMER_IMAGE_STRATEGY = "original"
+DECIMER_MODEL_NAME = os.getenv("DECIMER_MODEL_NAME", "DECIMER Image Transformer").strip()
+DECIMER_MODEL_VERSION = os.getenv("DECIMER_MODEL_VERSION", "").strip() or None
+DECIMER_STRICT_MODE = os.getenv("DECIMER_STRICT_MODE", os.getenv("OCSR_STRICT_MODE", "false")).lower() in {
+    "1",
+    "true",
+    "yes",
+}
+OCSR_ENSEMBLE_BACKENDS = tuple(
+    backend.strip().lower()
+    for backend in os.getenv("OCSR_ENSEMBLE_BACKENDS", "molscribe,decimer").split(",")
+    if backend.strip()
+)
+OCSR_ENSEMBLE_BACKEND_PRIORITY = tuple(
+    backend.strip().lower()
+    for backend in os.getenv("OCSR_ENSEMBLE_BACKEND_PRIORITY", "molscribe,decimer").split(",")
+    if backend.strip()
+)
+OCSR_ENSEMBLE_PARALLEL = os.getenv("OCSR_ENSEMBLE_PARALLEL", "false").lower() in {"1", "true", "yes"}
+OCSR_ENSEMBLE_CONTINUE_ON_ERROR = os.getenv("OCSR_ENSEMBLE_CONTINUE_ON_ERROR", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+OCSR_ENSEMBLE_TOTAL_TIMEOUT_SECONDS = float(
+    os.getenv("OCSR_ENSEMBLE_TOTAL_TIMEOUT_SECONDS", os.getenv("OCSR_TIMEOUT_SECONDS", "240")).strip() or "240"
+)
+
+
+def _parse_reliability_weights(raw: str) -> dict[str, float]:
+    weights: dict[str, float] = {}
+    for item in raw.split(","):
+        if "=" not in item:
+            continue
+        backend, value = item.split("=", 1)
+        try:
+            weights[backend.strip().lower()] = float(value.strip())
+        except ValueError:
+            continue
+    return weights
+
+
+OCSR_ENSEMBLE_RELIABILITY_WEIGHTS = _parse_reliability_weights(
+    os.getenv("OCSR_ENSEMBLE_RELIABILITY_WEIGHTS", "molscribe=1.0,decimer=1.0")
+)
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
 for directory in (DATA_DIR, SAMPLE_DIR, BATCH_INPUT_DIR, OUTPUT_DIR, MODEL_DIR):

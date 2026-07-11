@@ -11,6 +11,12 @@ import streamlit as st
 
 from config import OCSR_BACKEND, OUTPUT_DIR
 from src.analysis.batch_analyzer import BatchAnalyzer
+from src.analysis.correction import (
+    apply_smiles_correction,
+    restore_original_prediction,
+    save_correction_feedback,
+    structure_similarity,
+)
 from src.analysis.molecule_report import MoleculeReportGenerator
 from src.export.json_exporter import to_json_text
 from src.export.pdf_exporter import save_pdf
@@ -45,6 +51,50 @@ def remember_backend_status(backend: str) -> None:
     st.session_state["backend_last_status"] = get_report_generator(backend).recognizer.status()
 
 
+def show_ensemble_details(ocsr: dict) -> None:
+    """Render ensemble candidates and disagreement diagnostics."""
+    candidates = ocsr.get("candidates") or []
+    consensus = ocsr.get("consensus") or {}
+    if not candidates and not consensus:
+        return
+    st.subheader("多后端候选与共识")
+    status = consensus.get("status") or "unknown"
+    reason = consensus.get("reason") or ""
+    if status == "agreement":
+        st.success(f"共识：{reason}")
+    elif status == "disagreement":
+        st.warning(consensus.get("warning") or reason)
+        st.caption(reason)
+    elif status in {"single_valid", "invalid_candidates", "all_failed"}:
+        st.info(reason)
+    if consensus.get("recommended_smiles"):
+        st.write(f"**推荐结果：** `{consensus.get('recommended_smiles')}`")
+        st.write(f"**推荐来源：** {consensus.get('recommended_backend')}")
+    if consensus.get("confidence_policy"):
+        st.caption(consensus.get("confidence_policy"))
+    if candidates:
+        rows = [
+            {
+                "backend": candidate.get("backend"),
+                "status": candidate.get("status"),
+                "raw_smiles": candidate.get("raw_smiles"),
+                "canonical_smiles": candidate.get("canonical_smiles"),
+                "valid": candidate.get("valid"),
+                "confidence": candidate.get("confidence"),
+                "time_ms": candidate.get("inference_time_ms"),
+                "model": candidate.get("model_name"),
+                "device": candidate.get("device"),
+                "error": candidate.get("error"),
+            }
+            for candidate in candidates
+        ]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    similarity = ocsr.get("similarity_analysis") or []
+    if similarity:
+        st.caption("候选差异指标只解释模型输出之间的差异，不代表与原图一致。")
+        st.dataframe(pd.DataFrame(similarity), hide_index=True, use_container_width=True)
+
+
 def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_prefix: str) -> None:
     """Render a molecule analysis report in Streamlit."""
     if report.get("status") != "success":
@@ -52,18 +102,24 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
         ocsr = report.get("ocsr") or {}
         if ocsr:
             st.caption(f"后端：{ocsr.get('backend')} · 状态：{ocsr.get('status')}")
+            show_ensemble_details(ocsr)
         return
 
     ocsr = report.get("ocsr") or {}
+    correction = report.get("correction") or {}
+    final = report.get("final") or {}
     validation = report.get("validation") or {}
     st.success(report.get("message", "分析完成。"))
     left, right = st.columns([1.1, 1])
     with left:
         st.subheader("结构识别")
-        st.code(ocsr.get("smiles") or "", language=None)
-        st.write(f"**Canonical SMILES：** `{validation.get('canonical_smiles')}`")
+        st.code(final.get("smiles") or ocsr.get("smiles") or "", language=None)
+        st.write(f"**Canonical SMILES：** `{final.get('canonical_smiles') or validation.get('canonical_smiles')}`")
         confidence = ocsr.get("confidence")
         st.write(f"**识别后端：** {ocsr.get('backend')}　 **置信度：** {confidence if confidence is not None else '模型未提供'}")
+        st.write(f"**当前结果来源：** {final.get('source') or 'unknown'}")
+        if correction.get("applied"):
+            st.info(f"已应用人工修正：`{correction.get('corrected_canonical_smiles')}`")
         diagnostic_line = " · ".join(
             item
             for item in [
@@ -77,6 +133,7 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
         if diagnostic_line:
             st.caption(diagnostic_line)
         st.write(f"**RDKit 校验：** {'有效' if validation.get('valid') else '无效'}")
+        show_ensemble_details(ocsr)
     with right:
         st.subheader("标准化结构重绘")
         drawing = (report.get("images") or {}).get("redrawn_molecule")
@@ -142,12 +199,89 @@ def show_report(report: dict, show_preprocessing: bool, export_pdf: bool, key_pr
             st.caption(pdf_result["message"])
 
 
+def show_correction_panel(report: dict) -> dict:
+    """Render human correction controls for an image report and return the current report."""
+    if (report.get("input") or {}).get("type") != "image":
+        return report
+    analysis_id = report.get("analysis_id") or "image"
+    ocsr = report.get("ocsr") or {}
+    correction = report.get("correction") or {}
+    final = report.get("final") or {}
+    predicted = ocsr.get("predicted_smiles") or ocsr.get("smiles") or ""
+    default_smiles = correction.get("corrected_smiles") or final.get("smiles") or predicted
+
+    st.subheader("人工纠错")
+    status_label = "已人工修正" if correction.get("applied") else "未人工修正"
+    st.caption(f"纠错状态：{status_label} · 当前结果来源：{final.get('source') or '暂无有效结果'}")
+    st.text_input("模型原始预测", value=predicted, disabled=True, key=f"predicted_{analysis_id}")
+    corrected_input = st.text_input(
+        "修正 SMILES",
+        value=default_smiles or "",
+        key=f"corrected_smiles_{analysis_id}",
+        placeholder="OCSR 失败时也可以在这里手动输入 SMILES",
+    )
+    actions = st.columns([1, 1, 1])
+    current_report = report
+    if actions[0].button("校验并应用修正", type="primary", key=f"apply_correction_{analysis_id}"):
+        candidate = apply_smiles_correction(report, corrected_input, OUTPUT_DIR)
+        error = (candidate.get("correction") or {}).get("last_error")
+        if error:
+            st.error(error)
+        else:
+            current_report = candidate
+            st.session_state["image_report"] = current_report
+            st.success("人工修正已应用，性质和结构图已重新生成。")
+    if actions[1].button("恢复模型原始结果", key=f"restore_prediction_{analysis_id}"):
+        candidate = restore_original_prediction(report, OUTPUT_DIR)
+        error = (candidate.get("correction") or {}).get("last_error")
+        if error:
+            st.warning(error)
+        else:
+            current_report = candidate
+            st.session_state["image_report"] = current_report
+            st.success("已恢复为模型原始预测。")
+
+    updated_correction = current_report.get("correction") or {}
+    feedback_notes = st.text_area("反馈备注（可选）", value="", key=f"feedback_notes_{analysis_id}", height=80)
+    if actions[2].button(
+        "保存为纠错反馈样本",
+        key=f"save_feedback_{analysis_id}",
+        disabled=not bool(updated_correction.get("applied")),
+    ):
+        feedback_path = save_correction_feedback(current_report, OUTPUT_DIR, feedback_notes)
+        st.session_state[f"feedback_path_{analysis_id}"] = feedback_path
+        st.success(f"反馈样本已保存：{feedback_path}")
+    if st.session_state.get(f"feedback_path_{analysis_id}"):
+        st.caption(f"最近保存的反馈样本：{st.session_state[f'feedback_path_{analysis_id}']}")
+
+    images = current_report.get("images") or {}
+    predicted_image = images.get("predicted_molecule")
+    corrected_image = images.get("corrected_molecule")
+    if predicted_image or corrected_image:
+        st.subheader("结构对比")
+        columns = st.columns(2) if predicted_image and corrected_image else st.columns(1)
+        if predicted_image:
+            columns[0].image(predicted_image, caption="模型预测结构", use_container_width=True)
+        elif predicted:
+            st.caption("模型原始预测不能被 RDKit 解析，无法绘制预测结构。")
+        if corrected_image:
+            target_column = columns[1] if predicted_image and corrected_image else columns[0]
+            target_column.image(corrected_image, caption="人工修正结构", use_container_width=True)
+        if predicted and updated_correction.get("corrected_smiles"):
+            similarity = structure_similarity(predicted, updated_correction.get("corrected_smiles"))
+            if similarity is not None:
+                st.caption(f"Morgan Tanimoto 相似度：{similarity:.3f}。该值只比较两个分子结果，不代表与原图一致。")
+    elif predicted:
+        st.caption("模型原始预测不能被 RDKit 解析，无法绘制预测结构。")
+    return current_report
+
+
 st.title("基于计算机视觉的分子结构图像识别与性质分析系统")
 st.caption("图片 → OpenCV 预处理 → OCSR → SMILES → RDKit 校验 → 性质分析 → 报告")
 
 with st.sidebar:
     st.header("运行设置")
-    backend_options = ["demo", "molscribe", "decimer"]
+    backend_options = ["demo", "molscribe", "decimer", "ensemble"]
     backend_index = backend_options.index(OCSR_BACKEND) if OCSR_BACKEND in backend_options else 0
     backend = st.selectbox("OCSR 后端", backend_options, index=backend_index)
     show_preprocessing = st.checkbox("显示预处理过程", value=True)
@@ -164,14 +298,28 @@ with st.sidebar:
         st.error(backend_status["message"])
         if backend == "molscribe":
             st.warning("MolScribe 当前不可用。请配置模型权重，或切换 demo 后端，也可以使用手动 SMILES 分析。")
+        if backend == "decimer":
+            st.warning("DECIMER 当前不可用。请安装兼容 decimer 包并确认 TensorFlow/设备环境，或切换 demo 后端。")
+        if backend == "ensemble":
+            st.warning("ensemble 当前没有可用真实子后端时不会伪装成功；可继续使用人工 SMILES 分析。")
     st.write(f"**当前后端：** {backend_status.get('backend', backend)}")
     st.write(f"**是否可用：** {'是' if backend_status.get('available') else '否'}")
     st.write(f"**模型：** {backend_status.get('model_name') or backend_status.get('model_path') or '无'}")
     st.write(f"**设备：** {backend_status.get('device') or '未指定'}")
     st.write(f"**包版本：** {backend_status.get('package_version') or '未安装/未提供'}")
+    if backend_status.get("image_strategy"):
+        st.write(f"**输入策略：** {backend_status.get('image_strategy')}")
+    if backend_status.get("enabled_backends"):
+        st.write(f"**子后端：** {', '.join(backend_status.get('enabled_backends') or [])}")
+        st.write(f"**执行模式：** {'并行' if backend_status.get('parallel') else '串行安全'}")
+    for child in backend_status.get("child_statuses") or []:
+        st.caption(
+            f"{child.get('backend')}: {'可用' if child.get('available') else '不可用'} · "
+            f"{child.get('device') or 'device n/a'} · {child.get('message') or ''}"
+        )
     last_time = backend_status.get("last_inference_time_ms")
     st.write(f"**最近推理耗时：** {last_time} ms" if last_time is not None else "**最近推理耗时：** 暂无")
-    st.caption("CPU 可运行；真实模型可按各自配置自动使用相应设备。")
+    st.caption("默认串行安全运行；MolScribe 可用 PyTorch CUDA，DECIMER 可用 TensorFlow GPU/auto。")
 
 image_tab, smiles_tab, batch_tab, about_tab = st.tabs(["图片识别", "SMILES 分析", "批量处理", "项目说明"])
 
@@ -193,7 +341,8 @@ with image_tab:
                 finally:
                     temporary_path.unlink(missing_ok=True)
         if "image_report" in st.session_state:
-            show_report(st.session_state["image_report"], show_preprocessing, export_pdf, "image")
+            active_report = show_correction_panel(st.session_state["image_report"])
+            show_report(active_report, show_preprocessing, export_pdf, f"image_{active_report.get('analysis_id', 'report')[:8]}")
 
 with smiles_tab:
     smiles_input = st.text_input("输入 SMILES", value="CCO", placeholder="例如：CCO")
@@ -254,7 +403,7 @@ with about_tab:
 ### 技术路线
 
 1. Pillow/OpenCV 读取图片并执行灰度化、去噪、二值化、白边裁剪、旋转校正和尺寸归一化；
-2. 通过可替换的 MolScribe、DECIMER 或 demo 适配器识别 SMILES；
+2. 通过可替换的 MolScribe、DECIMER、ensemble 或 demo 适配器识别 SMILES；
 3. 使用 RDKit 校验、标准化、绘图并计算 MW、LogP、TPSA、HBD、HBA 等描述符；
 4. 通过 Lipinski 与扩展规则给出教学性质的风险提示；
 5. 导出 JSON、CSV 和可选 PDF 报告。
@@ -263,6 +412,6 @@ with about_tab:
 
 - 主要支持清晰的二维分子结构图片；复杂背景、手绘结构和低分辨率图片可能失败；
 - demo 模式只按样例文件名匹配，不是真实 OCSR；
-- 真实识别需要单独安装和配置 MolScribe 或 DECIMER；
+- 真实识别需要单独安装和配置 MolScribe 或 DECIMER；ensemble 只解释模型一致/分歧，不会证明哪个候选一定符合原图；
 - 性质与规则分析仅供教学演示，不能替代药物实验或专业决策。
 """)

@@ -206,6 +206,10 @@ def _write_report(run_dir: Path, metadata: dict[str, Any], metrics: dict[str, An
         "molecule_equivalent_rate",
     ]))
     lines.extend([
+        "## Ensemble Diagnostics",
+        "",
+        json.dumps(metrics.get("ensemble", {}), ensure_ascii=False, indent=2),
+        "",
         "## Failure Reasons",
         "",
         json.dumps(overall.get("failure_reason_distribution", {}), ensure_ascii=False, indent=2),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
 from pathlib import Path
 from typing import Any
 
@@ -20,9 +21,13 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
     """Flatten a nested molecule report into one tabular row."""
     input_data = report.get("input") or {}
     ocsr = report.get("ocsr") or {}
+    correction = report.get("correction") or {}
+    final = report.get("final") or {}
     validation = report.get("validation") or {}
     descriptors = report.get("descriptors") or {}
     lipinski = report.get("lipinski") or {}
+    consensus = ocsr.get("consensus") or {}
+    candidates = ocsr.get("candidates") or []
     return {
         "filename": input_data.get("filename"),
         "status": report.get("status"),
@@ -30,11 +35,23 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
         "backend": ocsr.get("backend"),
         "ocsr_status": ocsr.get("status"),
         "smiles": ocsr.get("smiles"),
+        "predicted_smiles": ocsr.get("predicted_smiles") or ocsr.get("smiles"),
+        "predicted_canonical_smiles": ocsr.get("predicted_canonical_smiles"),
+        "corrected_smiles": correction.get("corrected_smiles"),
+        "corrected_canonical_smiles": correction.get("corrected_canonical_smiles"),
+        "correction_applied": bool(correction.get("applied", False)),
+        "final_smiles": final.get("smiles") or ocsr.get("smiles"),
+        "final_result_source": final.get("source"),
         "confidence": ocsr.get("confidence"),
         "inference_time_ms": ocsr.get("inference_time_ms"),
         "model_name": ocsr.get("model_name"),
         "model_version": ocsr.get("model_version"),
         "device": ocsr.get("device"),
+        "candidate_count": len(candidates),
+        "consensus_status": consensus.get("status"),
+        "recommended_backend": consensus.get("recommended_backend"),
+        "ensemble_disagreement": consensus.get("status") == "disagreement",
+        "ensemble_candidates": json.dumps(candidates, ensure_ascii=False),
         "valid": bool(validation.get("valid", False)),
         "canonical_smiles": validation.get("canonical_smiles"),
         "formula": descriptors.get("formula"),

@@ -97,23 +97,27 @@ class MolScribeAdapter(BaseOCSRAdapter):
 
     def _resolve_device_object(self) -> Any:
         requested = self.device
-        if requested.startswith("cuda"):
-            try:
-                import torch
-            except Exception as exc:
-                raise MolScribeConfigurationError(f"请求 CUDA 设备，但 PyTorch 不可导入：{exc}") from exc
-            if not torch.cuda.is_available():
-                if self.strict_mode:
-                    raise MolScribeConfigurationError("请求 CUDA 设备，但 torch.cuda.is_available() 为 False。")
-                self.device = "cpu"
-                return torch.device("cpu")
-            return torch.device(requested)
         try:
             import torch
-
-            return torch.device("cpu")
-        except Exception:
+        except Exception as exc:
+            if requested.startswith("cuda") or requested == "gpu":
+                raise MolScribeConfigurationError(f"请求 CUDA 设备，但 PyTorch 不可导入：{exc}") from exc
+            self.device = "cpu"
             return "cpu"
+        wants_cuda = requested == "auto" or requested == "gpu" or requested.startswith("cuda")
+        if wants_cuda and torch.cuda.is_available():
+            self.device = "cuda" if requested in {"auto", "gpu"} else requested
+            return torch.device(self.device)
+        if requested == "auto":
+            self.device = "cpu"
+            return torch.device("cpu")
+        if requested == "gpu" or requested.startswith("cuda"):
+            if self.strict_mode:
+                raise MolScribeConfigurationError("请求 CUDA 设备，但 torch.cuda.is_available() 为 False。")
+            self.device = "cpu"
+            return torch.device("cpu")
+        self.device = "cpu"
+        return torch.device("cpu")
 
     def _load_model(self) -> Any:
         if self.model is not None:
