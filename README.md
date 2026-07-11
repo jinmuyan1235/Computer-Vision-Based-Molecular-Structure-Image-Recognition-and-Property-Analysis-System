@@ -618,3 +618,76 @@ python scripts/evaluate_ocsr.py \
 ### InChI 降级
 
 如果当前 RDKit 构建不支持 InChI，报告会把 `inchi` / `inchikey` 置空，并在 `standardization.warnings` 中记录原因；主流程、性质计算、JSON/CSV/PDF 导出不会因此中断。
+
+## PDF and Multi-Molecule Document Processing
+
+The document workflow lets users upload a PDF, a full-page PNG/JPG image, or a ZIP archive of page images. It expands the input into page images, runs a lightweight OpenCV molecule-region detector, crops each region, sends molecule regions to the selected OCSR backend, and exports document-level results that keep page numbers and bbox coordinates.
+
+Example CLI:
+
+```bash
+python scripts/process_document.py \
+  --input data/documents/example.pdf \
+  --backend demo \
+  --output data/outputs/documents
+```
+
+Detect regions without running OCSR:
+
+```bash
+python scripts/process_document.py \
+  --input data/documents/page.png \
+  --backend demo \
+  --detect-only
+```
+
+PDF rendering uses optional PyMuPDF when installed:
+
+```bash
+python -m pip install pymupdf
+```
+
+PyMuPDF/MuPDF is distributed by its upstream project under AGPL or commercial licensing. Review the official PyMuPDF license page before enabling it in proprietary or server deployments. If PyMuPDF is not installed, PDF inputs return a readable diagnostic; PNG/JPG/ZIP image workflows and the rest of the application keep working.
+
+Safety limits are configurable with environment variables:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `DOCUMENT_OUTPUT_DIR` | `data/outputs/documents` | Document run output directory |
+| `DOCUMENT_RENDER_DPI` | `200` | PDF page render resolution |
+| `DOCUMENT_MAX_FILE_SIZE_MB` | `50` | Maximum uploaded PDF/image/ZIP size |
+| `DOCUMENT_MAX_PAGES` | `25` | Maximum PDF pages or ZIP images |
+| `DOCUMENT_MAX_PIXELS` | `25000000` | Maximum pixels per rendered page |
+| `DOCUMENT_MAX_REGIONS` | `80` | Maximum detected regions per document |
+
+Each region is exported with:
+
+```json
+{
+  "document_id": "...",
+  "page_number": 3,
+  "region_id": "p003_r005",
+  "bbox": [x1, y1, x2, y2],
+  "region_type": "molecule",
+  "detection_confidence": 0.88,
+  "crop_path": "...",
+  "ocsr": {},
+  "final_result": {}
+}
+```
+
+The fallback detector distinguishes `molecule`, `text`, `table`, `reaction_like`, and `unknown`. `reaction_like`, `text`, `table`, and manually marked `non_molecule` regions are not sent to single-molecule OCSR by default. Reaction parsing is not implemented in this task, so reaction-like graphics are recorded as unsupported rather than treated as ordinary molecules.
+
+Streamlit provides a `PDF/多分子文档` tab for page review, detected boxes, deletion of false positives, manual bbox addition, coordinate adjustment, region type changes, single-region reprocessing, and result downloads. User edits are recorded in each region's `audit` list with before/after bbox/type metadata and timestamp.
+
+Each document run writes an isolated output directory containing:
+
+- `document_result.json`
+- `regions.csv`
+- `failed_regions.csv`
+- `crops/`
+- `redrawn/`
+- `annotated_pages/`
+- `document_results.zip`
+
+The heuristic detector is intentionally conservative and is not a trained layout model. It can miss low-resolution structures, split dense diagrams, or mark complex reaction schemes as `reaction_like`. Use the manual region editor for review before treating document-level outputs as curated data.

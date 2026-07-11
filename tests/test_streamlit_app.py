@@ -10,7 +10,7 @@ def test_streamlit_app_starts_without_exception() -> None:
     app = AppTest.from_file(str(app_path), default_timeout=30).run()
     assert not app.exception
     assert app.title[0].value == "基于计算机视觉的分子结构图像识别与性质分析系统"
-    assert len(app.tabs) == 4
+    assert len(app.tabs) == 5
 
 
 def test_smiles_result_page_renders_without_exception(tmp_path: Path) -> None:
@@ -58,3 +58,5 @@ def test_streamlit_correction_widgets_are_present() -> None:
     assert "恢复模型原始结果" in source
     assert "保存为纠错反馈样本" in source
     assert "多后端候选与共识" in source
+    assert "PDF/多分子文档" in source
+    assert "Update bbox and rerun" in source

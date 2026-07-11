@@ -18,6 +18,8 @@ from src.analysis.correction import (
     structure_similarity,
 )
 from src.analysis.molecule_report import MoleculeReportGenerator
+from src.documents.input_loader import DocumentInputError, OptionalDependencyError
+from src.documents.processor import DocumentOCSRProcessor
 from src.export.json_exporter import to_json_text
 from src.export.pdf_exporter import save_pdf
 
@@ -35,6 +37,12 @@ def get_report_generator(backend: str) -> MoleculeReportGenerator:
 def get_batch_analyzer(backend: str) -> BatchAnalyzer:
     """Reuse a batch analyzer and its selected backend between reruns."""
     return BatchAnalyzer(backend, OUTPUT_DIR)
+
+
+@st.cache_resource(show_spinner=False)
+def get_document_processor(backend: str) -> DocumentOCSRProcessor:
+    """Reuse document detector and selected OCSR backend between reruns."""
+    return DocumentOCSRProcessor(backend=backend)
 
 
 def get_backend_status(backend: str) -> dict:
@@ -306,6 +314,107 @@ def show_correction_panel(report: dict) -> dict:
     return current_report
 
 
+def show_document_result(document_result: dict, backend: str) -> dict:
+    """Render document pages, detected regions, exports, and bbox edit controls."""
+    summary = document_result.get("summary") or {}
+    st.subheader("Document regions")
+    metrics = st.columns(4)
+    metrics[0].metric("Pages", summary.get("page_count", 0))
+    metrics[1].metric("Regions", summary.get("region_count", 0))
+    metrics[2].metric("Molecule regions", summary.get("molecule_region_count", 0))
+    metrics[3].metric("Recognized", summary.get("recognized_region_count", 0))
+    if document_result.get("detection_errors"):
+        st.warning(to_json_text(document_result.get("detection_errors"), indent=2))
+
+    annotated = [item for item in (document_result.get("exports", {}).get("annotated_pages") or "").split(",") if item]
+    if annotated:
+        st.subheader("Annotated pages")
+        columns = st.columns(min(3, max(1, len(annotated))))
+        for index, page_path in enumerate(annotated[:6]):
+            columns[index % len(columns)].image(page_path, caption=Path(page_path).name, use_container_width=True)
+
+    rows = DocumentOCSRProcessor.region_rows(document_result)
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("No molecule-like regions detected. You can add a region manually below.")
+
+    active_regions = [region for region in document_result.get("regions", []) if region.get("status") != "deleted"]
+    if active_regions:
+        region_ids = [region["region_id"] for region in active_regions]
+        selected_id = st.selectbox("Edit region", region_ids, key="document_region_select")
+        selected = next(region for region in active_regions if region["region_id"] == selected_id)
+        bbox = selected.get("bbox") or [0, 0, 1, 1]
+        edit_columns = st.columns(5)
+        x1 = edit_columns[0].number_input("x1", min_value=0, value=int(bbox[0]), key=f"edit_x1_{selected_id}")
+        y1 = edit_columns[1].number_input("y1", min_value=0, value=int(bbox[1]), key=f"edit_y1_{selected_id}")
+        x2 = edit_columns[2].number_input("x2", min_value=1, value=int(bbox[2]), key=f"edit_x2_{selected_id}")
+        y2 = edit_columns[3].number_input("y2", min_value=1, value=int(bbox[3]), key=f"edit_y2_{selected_id}")
+        allowed_types = ["molecule", "text", "table", "reaction_like", "unknown", "non_molecule"]
+        current_type = selected.get("region_type") if selected.get("region_type") in allowed_types else "unknown"
+        region_type = edit_columns[4].selectbox(
+            "type",
+            allowed_types,
+            index=allowed_types.index(current_type),
+            key=f"edit_type_{selected_id}",
+        )
+        actions = st.columns(3)
+        processor = get_document_processor(backend)
+        if actions[0].button("Update bbox and rerun", key=f"update_region_{selected_id}"):
+            document_result = processor.apply_edits(
+                document_result,
+                [{"action": "update", "region_id": selected_id, "bbox": [x1, y1, x2, y2], "region_type": region_type}],
+                rerun_ocsr=True,
+            )
+            st.session_state["document_result"] = document_result
+            st.success("Region updated and reprocessed.")
+        if actions[1].button("Delete region", key=f"delete_region_{selected_id}"):
+            document_result = processor.apply_edits(
+                document_result,
+                [{"action": "delete", "region_id": selected_id, "note": "Deleted in Streamlit UI."}],
+                rerun_ocsr=False,
+            )
+            st.session_state["document_result"] = document_result
+            st.success("Region marked as deleted.")
+        if actions[2].button("Mark non-molecule", key=f"mark_region_{selected_id}"):
+            document_result = processor.apply_edits(
+                document_result,
+                [{"action": "mark", "region_id": selected_id, "region_type": "non_molecule"}],
+                rerun_ocsr=False,
+            )
+            st.session_state["document_result"] = document_result
+            st.success("Region marked as non-molecule.")
+
+    st.subheader("Add missed region")
+    page_numbers = [int(page["page_number"]) for page in document_result.get("pages", [])]
+    if page_numbers:
+        add_columns = st.columns(6)
+        page_number = add_columns[0].selectbox("page", page_numbers, key="add_region_page")
+        add_x1 = add_columns[1].number_input("new x1", min_value=0, value=0, key="add_x1")
+        add_y1 = add_columns[2].number_input("new y1", min_value=0, value=0, key="add_y1")
+        add_x2 = add_columns[3].number_input("new x2", min_value=1, value=200, key="add_x2")
+        add_y2 = add_columns[4].number_input("new y2", min_value=1, value=200, key="add_y2")
+        add_type = add_columns[5].selectbox("new type", ["molecule", "text", "table", "reaction_like", "unknown"], key="add_type")
+        if st.button("Add region and rerun", key="add_region"):
+            processor = get_document_processor(backend)
+            document_result = processor.apply_edits(
+                document_result,
+                [{"action": "add", "page_number": page_number, "bbox": [add_x1, add_y1, add_x2, add_y2], "region_type": add_type}],
+                rerun_ocsr=True,
+            )
+            st.session_state["document_result"] = document_result
+            st.success("Region added.")
+
+    exports = document_result.get("exports") or {}
+    if exports.get("json") and Path(exports["json"]).is_file():
+        st.download_button("Download document_result.json", Path(exports["json"]).read_bytes(), "document_result.json", "application/json")
+    if exports.get("regions_csv") and Path(exports["regions_csv"]).is_file():
+        st.download_button("Download regions.csv", Path(exports["regions_csv"]).read_bytes(), "regions.csv", "text/csv")
+    if exports.get("zip") and Path(exports["zip"]).is_file():
+        st.download_button("Download ZIP result package", Path(exports["zip"]).read_bytes(), "document_results.zip", "application/zip")
+    return document_result
+
+
 st.title("基于计算机视觉的分子结构图像识别与性质分析系统")
 st.caption("图片 → OpenCV 预处理 → OCSR → SMILES → RDKit 校验 → 性质分析 → 报告")
 
@@ -351,7 +460,7 @@ with st.sidebar:
     st.write(f"**最近推理耗时：** {last_time} ms" if last_time is not None else "**最近推理耗时：** 暂无")
     st.caption("默认串行安全运行；MolScribe 可用 PyTorch CUDA，DECIMER 可用 TensorFlow GPU/auto。")
 
-image_tab, smiles_tab, batch_tab, about_tab = st.tabs(["图片识别", "SMILES 分析", "批量处理", "项目说明"])
+image_tab, document_tab, smiles_tab, batch_tab, about_tab = st.tabs(["图片识别", "PDF/多分子文档", "SMILES 分析", "批量处理", "项目说明"])
 
 with image_tab:
     uploaded = st.file_uploader("上传 PNG/JPG/JPEG 分子结构图", type=["png", "jpg", "jpeg"], key="single_upload")
@@ -373,6 +482,36 @@ with image_tab:
         if "image_report" in st.session_state:
             active_report = show_correction_panel(st.session_state["image_report"])
             show_report(active_report, show_preprocessing, export_pdf, f"image_{active_report.get('analysis_id', 'report')[:8]}")
+
+with document_tab:
+    st.write("Upload a PDF, a full-page PNG/JPG image, or a ZIP of page images. Regions keep page numbers and bbox coordinates.")
+    document_upload = st.file_uploader(
+        "Upload PDF / page image / ZIP",
+        type=["pdf", "png", "jpg", "jpeg", "zip"],
+        key="document_upload",
+    )
+    detect_only = st.checkbox("Detect only, do not run OCSR", value=False, key="document_detect_only")
+    if document_upload is not None and st.button("Process document", type="primary", key="process_document"):
+        suffix = Path(document_upload.name).suffix.lower()
+        prefix = Path(document_upload.name).stem + "_"
+        with tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False) as temporary:
+            temporary.write(document_upload.getvalue())
+            temporary_path = Path(temporary.name)
+        try:
+            with st.spinner("Rendering pages, detecting molecule regions, and processing region OCSR..."):
+                st.session_state["document_result"] = get_document_processor(backend).process(
+                    temporary_path,
+                    run_ocsr=not detect_only,
+                )
+                remember_backend_status(backend)
+        except OptionalDependencyError as exc:
+            st.error(str(exc))
+        except (DocumentInputError, FileNotFoundError, ValueError) as exc:
+            st.error(str(exc))
+        finally:
+            temporary_path.unlink(missing_ok=True)
+    if "document_result" in st.session_state:
+        st.session_state["document_result"] = show_document_result(st.session_state["document_result"], backend)
 
 with smiles_tab:
     smiles_input = st.text_input("输入 SMILES", value="CCO", placeholder="例如：CCO")

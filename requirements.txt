@@ -14,3 +14,6 @@ reportlab>=4.0,<5
 # Optional real OCSR backends (install separately according to their docs):
 # molscribe
 # DECIMER
+
+# Optional PDF page rendering for document upload:
+# pymupdf
