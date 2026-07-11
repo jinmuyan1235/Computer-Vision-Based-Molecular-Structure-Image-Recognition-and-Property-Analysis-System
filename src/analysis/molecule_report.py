@@ -12,6 +12,12 @@ from src.chem.descriptors import calculate_descriptors
 from src.chem.lipinski import evaluate_lipinski
 from src.chem.mol_drawer import draw_molecule
 from src.chem.smiles_validator import validate_smiles
+from src.analysis.correction import (
+    default_correction_state,
+    default_final_state,
+    normalize_ocsr_block,
+    sha256_file,
+)
 from src.ocsr.base import OCSRResult
 from src.ocsr.recognizer import MoleculeRecognizer
 from src.ml.admet_baseline import ConfiguredADMETPredictor
@@ -38,11 +44,19 @@ class MoleculeReportGenerator:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "input": input_data,
             "ocsr": None,
+            "correction": default_correction_state(),
+            "final": default_final_state(),
             "validation": {"valid": False, "canonical_smiles": None, "error": None},
             "descriptors": None,
             "lipinski": None,
             "admet": None,
-            "images": {"preprocessing": {}, "preprocessed": None, "redrawn_molecule": None},
+            "images": {
+                "preprocessing": {},
+                "preprocessed": None,
+                "redrawn_molecule": None,
+                "predicted_molecule": None,
+                "corrected_molecule": None,
+            },
         }
 
     def generate(self, image_path: str | Path | None = None, smiles: str | None = None) -> dict[str, Any]:
@@ -53,7 +67,12 @@ class MoleculeReportGenerator:
 
     def _from_image(self, image_path: str | Path) -> dict[str, Any]:
         path = Path(image_path).expanduser().resolve()
-        report = self._base_report({"type": "image", "filename": path.name, "path": str(path)})
+        report = self._base_report({
+            "type": "image",
+            "filename": path.name,
+            "path": str(path),
+            "image_sha256": sha256_file(path),
+        })
         prefix = f"{safe_stem(path.stem)}_{report['analysis_id'][:8]}"
         try:
             stages = self.preprocessor.preprocess_pipeline(path)
@@ -66,12 +85,12 @@ class MoleculeReportGenerator:
 
         recognition_target = path if self.recognizer.preferred_image_stage == "original" else report["images"]["preprocessed"]
         result = self.recognizer.recognize(recognition_target)
-        report["ocsr"] = result.to_dict()
+        report["ocsr"] = normalize_ocsr_block(result.to_dict())
         if result.status != "success" or not result.smiles:
             report["message"] = result.message
             report["validation"]["error"] = "未获得可校验的 SMILES。"
             return report
-        return self._complete_chemistry(report, result.smiles, prefix)
+        return self._complete_chemistry(report, result.smiles, prefix, final_source="ocsr")
 
     def _from_smiles(self, smiles: str) -> dict[str, Any]:
         report = self._base_report({"type": "smiles", "smiles": smiles})
@@ -87,9 +106,16 @@ class MoleculeReportGenerator:
             model_version="built-in",
             device="cpu",
         ).to_dict()
-        return self._complete_chemistry(report, smiles, prefix)
+        report["ocsr"] = normalize_ocsr_block(report["ocsr"])
+        return self._complete_chemistry(report, smiles, prefix, final_source="manual")
 
-    def _complete_chemistry(self, report: dict[str, Any], smiles: str, prefix: str) -> dict[str, Any]:
+    def _complete_chemistry(
+        self,
+        report: dict[str, Any],
+        smiles: str,
+        prefix: str,
+        final_source: str,
+    ) -> dict[str, Any]:
         validation = validate_smiles(smiles)
         report["validation"] = validation
         if not validation["valid"]:
@@ -104,6 +130,9 @@ class MoleculeReportGenerator:
             report["lipinski"] = lipinski
             report["admet"] = self.admet_predictor.predict(canonical)
             report["images"]["redrawn_molecule"] = draw_molecule(canonical, drawing_path)
+            if final_source == "ocsr":
+                report["images"]["predicted_molecule"] = report["images"]["redrawn_molecule"]
+            report["final"] = {"smiles": smiles, "canonical_smiles": canonical, "source": final_source}
             report["status"] = "success"
             report["message"] = "分子识别与性质分析完成。"
         except Exception as exc:
