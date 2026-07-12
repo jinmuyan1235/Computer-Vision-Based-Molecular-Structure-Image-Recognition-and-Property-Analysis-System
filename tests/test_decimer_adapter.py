@@ -86,6 +86,19 @@ def test_decimer_success_string_result(monkeypatch, tmp_path: Path) -> None:
     assert result.inference_time_ms is not None
 
 
+def test_decimer_invalid_smiles_is_failed_with_raw_output(monkeypatch, tmp_path: Path) -> None:
+    adapter = DECIMERAdapter(model_version="unit")
+    monkeypatch.setattr(adapter, "_package_installed", lambda: True)
+    monkeypatch.setattr(adapter, "_import_predictor", lambda: lambda _image, confidence=True, hand_drawn=False: "C1(CC")
+
+    result = adapter.recognize(_image(tmp_path / "invalid.png"))
+
+    assert result.status == "failed"
+    assert result.smiles is None
+    assert result.raw_output == "C1(CC"
+    assert "无法解析" in result.message
+
+
 def test_decimer_return_format_compatibility() -> None:
     adapter = DECIMERAdapter()
     assert adapter._normalize_prediction({"smiles": "CCO", "confidence": 0.7}) == ("CCO", 0.7)

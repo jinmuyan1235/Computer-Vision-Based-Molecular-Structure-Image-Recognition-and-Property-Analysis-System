@@ -51,6 +51,8 @@ def apply_region_edits(document_result: dict[str, Any], edits: list[dict[str, An
                 "ocsr": {},
                 "final_result": {},
                 "report": None,
+                "screening": {},
+                "processing_time_ms": None,
             }
             regions.append(region)
             continue
@@ -79,6 +81,8 @@ def apply_region_edits(document_result: dict[str, Any], edits: list[dict[str, An
             target["ocsr"] = {}
             target["final_result"] = {}
             target["report"] = None
+            target["screening"] = {}
+            target["processing_time_ms"] = None
             target.setdefault("audit", []).append(
                 _audit("update_bbox", before, {"bbox": target["bbox"], "region_type": target["region_type"]}, edit.get("note"))
             )

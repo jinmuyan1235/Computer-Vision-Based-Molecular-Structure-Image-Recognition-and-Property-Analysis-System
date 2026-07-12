@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any
 
-from rdkit import Chem
+from rdkit import Chem, rdBase
+
+
+@contextmanager
+def suppress_rdkit_parse_errors():
+    """Temporarily suppress expected RDKit SMILES parse errors."""
+    rdBase.DisableLog("rdApp.error")
+    try:
+        yield
+    finally:
+        rdBase.EnableLog("rdApp.error")
 
 
 def smiles_to_mol(smiles: str) -> Chem.Mol | None:
@@ -12,7 +23,8 @@ def smiles_to_mol(smiles: str) -> Chem.Mol | None:
     if not isinstance(smiles, str) or not smiles.strip():
         return None
     try:
-        return Chem.MolFromSmiles(smiles.strip())
+        with suppress_rdkit_parse_errors():
+            return Chem.MolFromSmiles(smiles.strip())
     except Exception:
         return None
 

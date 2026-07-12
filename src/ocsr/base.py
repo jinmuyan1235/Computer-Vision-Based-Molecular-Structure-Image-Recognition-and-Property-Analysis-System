@@ -24,6 +24,7 @@ class OCSRResult:
     candidates: list[dict[str, Any]] | None = None
     consensus: dict[str, Any] | None = None
     similarity_analysis: list[dict[str, Any]] | None = None
+    raw_output: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert this result to a JSON-serializable dictionary."""

@@ -10,6 +10,7 @@ from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
 import config
+from src.chem.smiles_validator import suppress_rdkit_parse_errors
 
 
 STANDARDIZATION_PROFILES: dict[str, list[str]] = {
@@ -108,13 +109,15 @@ def _parse_mol(smiles: str | None) -> tuple[Chem.Mol | None, list[dict[str, Any]
     if smiles is None or not isinstance(smiles, str) or not smiles.strip():
         return None, warnings, "SMILES 不能为空。"
     try:
-        mol = Chem.MolFromSmiles(smiles.strip())
+        with suppress_rdkit_parse_errors():
+            mol = Chem.MolFromSmiles(smiles.strip())
         if mol is not None:
             return mol, warnings, None
     except Exception as exc:
         warnings.append({"code": "parse_exception", "message": str(exc), "severity": "error"})
     try:
-        unsanitized = Chem.MolFromSmiles(smiles.strip(), sanitize=False)
+        with suppress_rdkit_parse_errors():
+            unsanitized = Chem.MolFromSmiles(smiles.strip(), sanitize=False)
         if unsanitized is not None:
             for problem in Chem.DetectChemistryProblems(unsanitized):
                 warnings.append({

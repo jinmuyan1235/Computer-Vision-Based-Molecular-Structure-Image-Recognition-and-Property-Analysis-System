@@ -47,6 +47,8 @@ class DocumentRegion:
     ocsr: dict[str, Any] = field(default_factory=dict)
     final_result: dict[str, Any] = field(default_factory=dict)
     report: dict[str, Any] | None = None
+    screening: dict[str, Any] = field(default_factory=dict)
+    processing_time_ms: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
