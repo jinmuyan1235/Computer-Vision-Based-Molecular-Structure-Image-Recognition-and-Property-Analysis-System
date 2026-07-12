@@ -51,6 +51,9 @@ def _backend_status(load_models: bool = False) -> dict[str, Any]:
 
 def build_report(load_models: bool = False) -> dict[str, Any]:
     model_path = config.MOLSCRIBE_MODEL_PATH
+    decimer_cache = Path.home() / ".data" / "DECIMER-V2"
+    decimer_model = decimer_cache / "DECIMER_model" / "saved_model.pb"
+    decimer_hand_model = decimer_cache / "DECIMER_HandDrawn_model" / "saved_model.pb"
     return {
         "environment": environment_status(run_matrix_test=True),
         "packages": {
@@ -66,6 +69,13 @@ def build_report(load_models: bool = False) -> dict[str, Any]:
             "molscribe_model_path": str(model_path),
             "molscribe_model_exists": model_path.is_file(),
             "molscribe_model_sha256": sha256_file(model_path),
+            "decimer_cache_dir": str(decimer_cache),
+            "decimer_model_exists": decimer_model.is_file(),
+            "decimer_model_saved_model_size": decimer_model.stat().st_size if decimer_model.is_file() else None,
+            "decimer_handdrawn_model_exists": decimer_hand_model.is_file(),
+            "decimer_handdrawn_saved_model_size": (
+                decimer_hand_model.stat().st_size if decimer_hand_model.is_file() else None
+            ),
         },
         "backends": _backend_status(load_models=load_models),
     }

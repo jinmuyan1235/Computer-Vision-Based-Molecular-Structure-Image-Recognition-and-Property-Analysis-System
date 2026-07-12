@@ -39,7 +39,7 @@ def test_decimer_import_error(monkeypatch, tmp_path: Path) -> None:
     assert "bad import" in result.message
 
 
-def test_decimer_unavailable_when_predictor_import_fails(monkeypatch) -> None:
+def test_decimer_diagnose_reports_predictor_import_failure(monkeypatch) -> None:
     adapter = DECIMERAdapter()
     monkeypatch.setattr(adapter, "_package_installed", lambda: True)
     monkeypatch.setattr(
@@ -53,16 +53,16 @@ def test_decimer_unavailable_when_predictor_import_fails(monkeypatch) -> None:
             "tensorflow": None,
         },
     )
-    def fail_probe(use_subprocess: bool = False) -> bool:
-        adapter._load_error = "keras mismatch"
-        return False
+    monkeypatch.setattr(
+        adapter,
+        "_import_predictor",
+        lambda: (_ for _ in ()).throw(DECIMERDependencyError("keras mismatch")),
+    )
 
-    monkeypatch.setattr(adapter, "_predictor_import_ready", fail_probe)
+    status = adapter.diagnose(load_model=True)
 
-    status = adapter.status()
-
-    assert status["available"] is False
-    assert "keras mismatch" in status["message"]
+    assert status["initialization_success"] is False
+    assert "keras mismatch" in status["load_error"]
 
 
 def test_decimer_initialization_error(monkeypatch, tmp_path: Path) -> None:

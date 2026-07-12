@@ -55,6 +55,11 @@ DECIMER_STRICT_MODE = os.getenv("DECIMER_STRICT_MODE", os.getenv("OCSR_STRICT_MO
     "true",
     "yes",
 }
+DECIMER_ISOLATED_SUBPROCESS = os.getenv("DECIMER_ISOLATED_SUBPROCESS", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 OCSR_ENSEMBLE_BACKENDS = tuple(
     backend.strip().lower()
     for backend in os.getenv("OCSR_ENSEMBLE_BACKENDS", "molscribe,decimer").split(",")
