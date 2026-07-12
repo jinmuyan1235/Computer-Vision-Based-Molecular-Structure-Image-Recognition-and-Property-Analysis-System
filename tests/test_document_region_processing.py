@@ -13,7 +13,7 @@ from reportlab.pdfgen import canvas
 import config
 from src.documents.detectors import HeuristicMoleculeRegionDetector
 from src.documents.input_loader import DocumentInputError, DocumentInputLoader, PDFRenderer, check_file_size
-from src.documents.models import DocumentPage
+from src.documents.models import DocumentPage, DocumentRegion
 from src.documents.processor import DocumentOCSRProcessor
 
 
@@ -71,6 +71,43 @@ class FakePDFRenderer(PDFRenderer):
         return pages
 
 
+class FakeDetector:
+    name = "fake-detector"
+
+    def __init__(self, regions: list[DocumentRegion]) -> None:
+        self.regions = regions
+
+    def detect(self, page: DocumentPage) -> list[DocumentRegion]:
+        return [
+            DocumentRegion(
+                document_id=page.document_id,
+                page_number=page.page_number,
+                region_id=region.region_id,
+                bbox=region.bbox,
+                region_type=region.region_type,
+                detection_confidence=region.detection_confidence,
+                detector_name=self.name,
+            )
+            for region in self.regions
+        ]
+
+
+class FakeReportGenerator:
+    def __init__(self) -> None:
+        self.calls: list[Path] = []
+        self.recognizer = types.SimpleNamespace(backend="demo")
+
+    def generate(self, image_path: str | Path) -> dict:
+        self.calls.append(Path(image_path))
+        return {
+            "status": "success",
+            "message": "fake ok",
+            "input": {},
+            "ocsr": {"backend": "demo", "status": "success", "smiles": "CCO"},
+            "final": {"smiles": "CCO", "canonical_smiles": "CCO"},
+        }
+
+
 def test_single_page_pdf_processes_with_fake_renderer(tmp_path: Path) -> None:
     page = _make_page(tmp_path / "aspirin_page.png", ["aspirin"], text="single molecule")
     pdf = _make_pdf(tmp_path / "aspirin_doc.pdf")
@@ -126,6 +163,59 @@ def test_multi_page_pdf_and_blank_page(tmp_path: Path) -> None:
     assert result["summary"]["page_count"] == 2
     assert any(page["quality"].get("blank") for page in result["pages"])
     assert result["summary"]["molecule_region_count"] >= 1
+
+
+def test_detect_only_mode_does_not_call_ocsr(tmp_path: Path) -> None:
+    page_path = _make_page(tmp_path / "aspirin_page.png", ["aspirin"])
+    detector = FakeDetector([
+        DocumentRegion("doc", 1, "p001_r001", (70, 120, 360, 380), "molecule", 0.9),
+    ])
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector)
+    fake_generator = FakeReportGenerator()
+    processor.report_generator = fake_generator
+
+    result = processor.process(page_path, run_ocsr=False)
+
+    assert result["processing"]["mode"] == "detect_only"
+    assert fake_generator.calls == []
+    assert result["regions"][0]["status"] == "detected"
+
+
+def test_full_document_mode_only_recognizes_screened_molecule_regions(tmp_path: Path) -> None:
+    page_path = _make_page(tmp_path / "aspirin_page.png", ["aspirin"], text="Aspirin")
+    detector = FakeDetector([
+        DocumentRegion("doc", 1, "p001_r001", (70, 120, 360, 380), "molecule", 0.9),
+        DocumentRegion("doc", 1, "p001_r002", (45, 20, 340, 70), "molecule", 0.8),
+        DocumentRegion("doc", 1, "p001_r003", (30, 480, 400, 540), "text", 0.8),
+    ])
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector)
+    fake_generator = FakeReportGenerator()
+    processor.report_generator = fake_generator
+
+    result = processor.process(page_path, run_ocsr=True)
+
+    assert result["processing"]["mode"] == "detect_and_recognize"
+    assert len(fake_generator.calls) == 1
+    statuses = {region["region_id"]: region for region in result["regions"]}
+    assert statuses["p001_r001"]["status"] == "recognized"
+    assert statuses["p001_r002"]["status"] == "skipped"
+    assert "文字" in statuses["p001_r002"]["message"] or "过小" in statuses["p001_r002"]["message"]
+    assert statuses["p001_r003"]["status"] == "skipped"
+
+
+def test_invalid_bbox_is_not_sent_to_ocsr(tmp_path: Path) -> None:
+    page_path = _make_page(tmp_path / "aspirin_page.png", ["aspirin"])
+    page = DocumentPage("doc", 1, str(page_path), 900, 600)
+    region = DocumentRegion("doc", 1, "p001_r001", (100, 100, 100, 120), "molecule", 0.9)
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out")
+    fake_generator = FakeReportGenerator()
+    processor.report_generator = fake_generator
+
+    processor.recognize_region(region, [page], tmp_path / "out")
+
+    assert region.status == "skipped"
+    assert fake_generator.calls == []
+    assert region.screening["passed"] is False
 
 
 def test_damaged_pdf_reports_readable_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

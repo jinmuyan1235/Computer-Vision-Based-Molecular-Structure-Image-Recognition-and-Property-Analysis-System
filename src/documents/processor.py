@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from time import perf_counter
+from typing import Any, Callable
 from uuid import uuid4
 import shutil
 import zipfile
@@ -41,8 +42,14 @@ class DocumentOCSRProcessor:
         self.loader = loader or DocumentInputLoader(self.output_dir)
         self.report_generator = MoleculeReportGenerator(backend=backend, output_dir=self.output_dir)
 
-    def process(self, input_path: str | Path, run_ocsr: bool = True) -> dict[str, Any]:
+    def process(
+        self,
+        input_path: str | Path,
+        run_ocsr: bool = True,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> dict[str, Any]:
         """Process a PDF, page image, or ZIP image collection."""
+        started = perf_counter()
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8]
         document_id, pages = self.loader.load(input_path)
         document_dir = ensure_directory(self.output_dir / f"{document_id}_{run_id}")
@@ -57,15 +64,35 @@ class DocumentOCSRProcessor:
                     detected = detected[:allowed]
                     detection_errors.append({
                         "page_number": page.page_number,
-                        "message": "Maximum region count reached; remaining detections were skipped.",
+                        "message": "已达到最大区域数量限制，剩余检测结果已跳过。",
                     })
                 regions.extend(detected)
             except Exception as exc:
                 detection_errors.append({"page_number": page.page_number, "message": str(exc)})
+        recognized_candidates = 0
+        skipped_candidates = 0
         if run_ocsr:
+            candidates: list[DocumentRegion] = []
             for region in regions:
-                self.recognize_region(region, pages, document_dir)
+                if self.prepare_region_for_ocsr(region, pages):
+                    candidates.append(region)
+                elif region.region_type == "molecule":
+                    skipped_candidates += 1
+            total = len(candidates)
+            for index, region in enumerate(candidates, start=1):
+                if progress_callback is not None:
+                    progress_callback(index, total, region.region_id)
+                self.recognize_region(region, pages, document_dir, screen=False)
+                if region.status == "recognized":
+                    recognized_candidates += 1
         result = self._result(input_path, document_id, document_dir, pages, regions, detection_errors)
+        result["processing"] = {
+            "mode": "detect_and_recognize" if run_ocsr else "detect_only",
+            "total_time_ms": round((perf_counter() - started) * 1000, 2),
+            "recognized_candidate_count": recognized_candidates,
+            "skipped_candidate_count": skipped_candidates,
+            "candidate_region_count": len([region for region in regions if region.region_type == "molecule"]),
+        }
         result["exports"] = self.export(result, document_dir)
         return result
 
@@ -74,6 +101,7 @@ class DocumentOCSRProcessor:
         region: DocumentRegion | dict[str, Any],
         pages: list[DocumentPage] | list[dict[str, Any]],
         document_dir: str | Path,
+        screen: bool = True,
     ) -> DocumentRegion | dict[str, Any]:
         """Crop and recognize one molecule region, leaving non-molecule regions untouched."""
         if isinstance(region, dict):
@@ -93,21 +121,23 @@ class DocumentOCSRProcessor:
                 ocsr=region.get("ocsr", {}),
                 final_result=region.get("final_result", {}),
                 report=region.get("report"),
+                screening=region.get("screening", {}),
+                processing_time_ms=region.get("processing_time_ms"),
             )
-            self.recognize_region(region_obj, pages, document_dir)
+            self.recognize_region(region_obj, pages, document_dir, screen=screen)
             region.update(region_obj.to_dict())
             return region
 
         if region.status == "deleted":
             return region
-        if region.region_type != "molecule":
-            region.status = "skipped"
-            region.message = region.message or f"Region type {region.region_type} is not sent to single-molecule OCSR."
+        if screen and not self.prepare_region_for_ocsr(region, pages):
             return region
         page = self._find_page(pages, region.page_number)
-        crop_path = self.crop_region(page, region, document_dir)
-        region.crop_path = str(crop_path.resolve())
+        region_started = perf_counter()
+        crop_path: Path | None = None
         try:
+            crop_path = self.crop_region(page, region, document_dir)
+            region.crop_path = str(crop_path.resolve())
             report = self.report_generator.generate(image_path=crop_path)
             report.setdefault("document_region", {})
             report["document_region"].update({
@@ -126,10 +156,12 @@ class DocumentOCSRProcessor:
             region.ocsr = report.get("ocsr") or {}
             region.final_result = report.get("final") or {}
             region.status = "recognized" if report.get("status") == "success" else "failed"
-            region.message = report.get("message")
+            region.message = report.get("message") or ("识别成功。" if region.status == "recognized" else "识别失败。")
+            region.processing_time_ms = round((perf_counter() - region_started) * 1000, 2)
         except Exception as exc:
             region.status = "failed"
-            region.message = f"Region OCSR failed: {exc}"
+            region.message = f"区域识别失败：{exc}"
+            region.processing_time_ms = round((perf_counter() - region_started) * 1000, 2)
             region.report = {
                 "status": "failed",
                 "message": region.message,
@@ -139,10 +171,100 @@ class DocumentOCSRProcessor:
                     "page_number": region.page_number,
                     "region_id": region.region_id,
                     "bbox": list(region.bbox),
-                    "path": str(crop_path),
+                    "path": str(crop_path) if crop_path is not None else None,
                 },
             }
         return region
+
+    def prepare_region_for_ocsr(
+        self,
+        region: DocumentRegion,
+        pages: list[DocumentPage] | list[dict[str, Any]],
+    ) -> bool:
+        """Run inexpensive safety and text filters before sending a crop to OCSR."""
+        if region.status == "deleted":
+            return False
+        if region.region_type != "molecule":
+            region.status = "skipped"
+            region.message = region.message or "该区域不是分子结构，已跳过单分子识别。"
+            region.screening = {"passed": False, "reason": region.message}
+            return False
+        try:
+            page = self._find_page(pages, region.page_number)
+            passed, screening = self._screen_region_candidate(page, region)
+        except Exception as exc:
+            region.status = "skipped"
+            region.message = f"区域检查失败，已跳过识别：{exc}"
+            region.screening = {"passed": False, "reason": region.message}
+            return False
+        region.screening = screening
+        if not passed:
+            region.status = "skipped"
+            region.message = str(screening.get("reason") or "未通过分子区域二次筛选，已跳过识别。")
+            return False
+        region.status = "detected"
+        region.message = str(screening.get("reason") or "通过分子区域二次筛选。")
+        return True
+
+    def _screen_region_candidate(
+        self,
+        page: DocumentPage | dict[str, Any],
+        region: DocumentRegion,
+    ) -> tuple[bool, dict[str, Any]]:
+        page_path = Path(page.image_path if isinstance(page, DocumentPage) else page["image_path"])
+        page_width = int(page.width if isinstance(page, DocumentPage) else page["width"])
+        page_height = int(page.height if isinstance(page, DocumentPage) else page["height"])
+        bbox = normalize_bbox(region.bbox, page_width, page_height)
+        region.bbox = bbox
+        x1, y1, x2, y2 = bbox
+        width, height = x2 - x1, y2 - y1
+        if width < 70 or height < 55:
+            return False, {
+                "passed": False,
+                "reason": "区域尺寸过小，已跳过识别。",
+                "width": width,
+                "height": height,
+            }
+        image = cv2.imdecode(np.fromfile(str(page_path), dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            return False, {"passed": False, "reason": "页面图片无法读取，已跳过识别。"}
+        crop = image[y1:y2, x1:x2]
+        if crop.size == 0:
+            return False, {"passed": False, "reason": "裁剪区域为空，已跳过识别。", "width": width, "height": height}
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        foreground = gray < 245
+        ink_ratio = float(np.mean(foreground))
+        aspect = width / max(height, 1)
+        binary = self.detector._foreground_binary(crop) if isinstance(self.detector, HeuristicMoleculeRegionDetector) else None
+        component_count = 0
+        significant_components = 0
+        if binary is not None:
+            count, _, stats, _ = cv2.connectedComponentsWithStats((binary > 0).astype(np.uint8), 8)
+            component_count = max(count - 1, 0)
+            significant_components = sum(1 for index in range(1, count) if int(stats[index, cv2.CC_STAT_AREA]) >= 6)
+        base = {
+            "passed": True,
+            "width": width,
+            "height": height,
+            "aspect": round(aspect, 3),
+            "ink_ratio": round(ink_ratio, 5),
+            "component_count": component_count,
+            "significant_component_count": significant_components,
+        }
+        if ink_ratio < 0.006:
+            base.update({"passed": False, "reason": "区域前景过少，疑似空白，已跳过识别。"})
+            return False, base
+        if ink_ratio > 0.38:
+            base.update({"passed": False, "reason": "区域前景过密，疑似正文或表格，已跳过识别。"})
+            return False, base
+        if (height < 90 and aspect > 1.8 and significant_components >= 2) or (aspect > 4.5 and height < 150):
+            base.update({"passed": False, "reason": "区域形态像单行文字标签，已跳过识别。"})
+            return False, base
+        if significant_components >= 12 and aspect > 1.4 and height < 240 and ink_ratio < 0.22:
+            base.update({"passed": False, "reason": "区域疑似正文文本，已跳过识别。"})
+            return False, base
+        base["reason"] = "通过分子区域二次筛选。"
+        return True, base
 
     def apply_edits(self, document_result: dict[str, Any], edits: list[dict[str, Any]], rerun_ocsr: bool = False) -> dict[str, Any]:
         """Apply human bbox/type edits and optionally re-run OCSR on edited molecule regions."""
@@ -225,6 +347,9 @@ class DocumentOCSRProcessor:
                 "message": region.get("message"),
                 "crop_path": relative_path(region.get("crop_path"), output_dir) if region.get("crop_path") else None,
                 "audit_count": len(region.get("audit") or []),
+                "screening_passed": (region.get("screening") or {}).get("passed"),
+                "screening_reason": (region.get("screening") or {}).get("reason"),
+                "processing_time_ms": region.get("processing_time_ms"),
             }
             row.update({key: value for key, value in flat.items() if key not in row})
             rows.append(row)

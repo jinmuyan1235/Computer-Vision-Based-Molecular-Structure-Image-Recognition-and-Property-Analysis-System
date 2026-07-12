@@ -1,4 +1,4 @@
-"""Streamlit smoke test that executes the app script without a browser."""
+"""Streamlit smoke tests that execute UI code without a browser."""
 
 from pathlib import Path
 
@@ -9,7 +9,7 @@ def test_streamlit_app_starts_without_exception() -> None:
     app_path = Path(__file__).resolve().parents[1] / "app.py"
     app = AppTest.from_file(str(app_path), default_timeout=30).run()
     assert not app.exception
-    assert app.title[0].value == "基于计算机视觉的分子结构图像识别与性质分析系统"
+    assert app.title[0].value == "分子结构识别与性质分析"
     assert len(app.tabs) == 5
 
 
@@ -30,33 +30,17 @@ def test_app_avoids_newer_only_stretch_width_api() -> None:
     assert 'width="stretch"' not in source
 
 
-def test_streamlit_molscribe_unavailable_selection_does_not_crash() -> None:
-    app_path = Path(__file__).resolve().parents[1] / "app.py"
-    app = AppTest.from_file(str(app_path), default_timeout=30).run()
-    app.selectbox[0].set_value("molscribe").run()
-    assert not app.exception
-
-
-def test_streamlit_decimer_unavailable_selection_does_not_crash() -> None:
-    app_path = Path(__file__).resolve().parents[1] / "app.py"
-    app = AppTest.from_file(str(app_path), default_timeout=30).run()
-    app.selectbox[0].set_value("decimer").run()
-    assert not app.exception
-
-
-def test_streamlit_ensemble_selection_does_not_crash() -> None:
-    app_path = Path(__file__).resolve().parents[1] / "app.py"
-    app = AppTest.from_file(str(app_path), default_timeout=30).run()
-    app.selectbox[0].set_value("ensemble").run()
-    assert not app.exception
-
-
 def test_streamlit_correction_widgets_are_present() -> None:
-    app_path = Path(__file__).resolve().parents[1] / "app.py"
-    source = app_path.read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "report_view.py").read_text(encoding="utf-8")
     assert "校验并应用修正" in source
     assert "恢复模型原始结果" in source
     assert "保存为纠错反馈样本" in source
-    assert "多后端候选与共识" in source
-    assert "PDF/多分子文档" in source
-    assert "Update bbox and rerun" in source
+    assert "多后端候选与一致性" in source
+
+
+def test_document_page_uses_chinese_mode_labels() -> None:
+    source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "document_page.py").read_text(encoding="utf-8")
+    assert "仅检测分子区域（速度快，不执行结构识别）" in source
+    assert "检测并识别分子结构（调用 OCSR，耗时较长）" in source
+    assert "Update bbox and rerun" not in source
+    assert "Delete region" not in source

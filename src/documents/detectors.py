@@ -70,7 +70,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         regions: list[DocumentRegion] = []
         for bbox in contours:
             region_type, confidence, message = self._classify(binary, bbox, image.shape[1], image.shape[0])
-            if region_type == "unknown" and confidence < 0.2:
+            if region_type == "unknown" and confidence < 0.28:
                 continue
             region_id = f"p{page.page_number:03d}_r{len(regions) + 1:03d}"
             regions.append(DocumentRegion(
@@ -125,7 +125,46 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             x2 = min(width, x + w + padding)
             y2 = min(height, y + h + padding)
             candidates.append((x1, y1, x2, y2))
-        return sorted(candidates, key=lambda item: (item[1], item[0]))
+        return self._merge_overlapping_boxes(sorted(candidates, key=lambda item: (item[1], item[0])))
+
+    @staticmethod
+    def _merge_overlapping_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+        """Merge highly overlapping boxes and discard near-duplicates."""
+        merged: list[tuple[int, int, int, int]] = []
+        for box in boxes:
+            current = box
+            changed = True
+            while changed:
+                changed = False
+                remaining: list[tuple[int, int, int, int]] = []
+                for existing in merged:
+                    overlap = HeuristicMoleculeRegionDetector._overlap_ratio(current, existing)
+                    if overlap >= 0.72:
+                        current = (
+                            min(current[0], existing[0]),
+                            min(current[1], existing[1]),
+                            max(current[2], existing[2]),
+                            max(current[3], existing[3]),
+                        )
+                        changed = True
+                    else:
+                        remaining.append(existing)
+                merged = remaining
+            merged.append(current)
+        return sorted(merged, key=lambda item: (item[1], item[0]))
+
+    @staticmethod
+    def _overlap_ratio(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        inter_w = max(0, min(ax2, bx2) - max(ax1, bx1))
+        inter_h = max(0, min(ay2, by2) - max(ay1, by1))
+        intersection = inter_w * inter_h
+        if intersection <= 0:
+            return 0.0
+        area_a = max((ax2 - ax1) * (ay2 - ay1), 1)
+        area_b = max((bx2 - bx1) * (by2 - by1), 1)
+        return intersection / min(area_a, area_b)
 
     def _classify(
         self,
@@ -149,15 +188,19 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         vertical_projection = np.max(np.sum(crop > 0, axis=0)) / max(height, 1)
         page_area_ratio = area / max(page_width * page_height, 1)
 
+        if ink_ratio < 0.006:
+            return "unknown", 0.05, "Sparse or blank region; not treated as a molecule."
+        if width < 70 or height < 55:
+            return "text", 0.45, "Region is too small for reliable single-molecule OCSR."
         if self._looks_like_table(crop, aspect, horizontal_projection, vertical_projection):
             return "table", 0.55, "Grid-like line structure; not sent to single-molecule OCSR by default."
         if self._looks_like_reaction(crop, aspect, width, height):
             return "reaction_like", 0.62, "Wide arrow/plus-like region; reaction parsing is not supported yet."
         if self._looks_like_text(width, height, aspect, ink_ratio, significant_components):
-            return "text", 0.5, "Text-like compact components; not treated as a molecule."
+            return "text", 0.68, "Text-like compact components; not treated as a molecule."
 
         confidence = 0.25
-        if 0.01 <= ink_ratio <= 0.28:
+        if 0.012 <= ink_ratio <= 0.24:
             confidence += 0.2
         if edge_ratio > 0.02:
             confidence += 0.15
@@ -167,8 +210,12 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             confidence += 0.12
         if 0.003 <= page_area_ratio <= 0.55:
             confidence += 0.08
+        if aspect > 3.8 or aspect < 0.22:
+            confidence -= 0.12
+        if ink_ratio > 0.32:
+            confidence -= 0.15
         confidence = min(confidence, 0.95)
-        if confidence >= 0.55:
+        if confidence >= 0.68:
             return "molecule", confidence, "Detected by OpenCV line/foreground-density fallback."
         return "unknown", confidence, "Region did not meet molecule confidence threshold."
 
@@ -191,7 +238,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             min(page_height, y + height + padding),
         )
         region_type, confidence, message = self._classify(binary, bbox, page_width, page_height)
-        if region_type != "molecule" or confidence < 0.55:
+        if region_type != "molecule" or confidence < 0.68:
             return None
         return DocumentRegion(
             document_id=page.document_id,
@@ -214,9 +261,13 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
     ) -> bool:
         if height <= 45 and aspect > 2.2 and len(significant_components) >= 3:
             return True
-        if aspect > 5 and ink_ratio < 0.18 and len(significant_components) >= 5:
+        if height <= 90 and aspect > 1.7 and len(significant_components) >= 2 and ink_ratio < 0.24:
+            return True
+        if aspect > 4.2 and ink_ratio < 0.24 and len(significant_components) >= 4:
             return True
         if width < 140 and height < 60 and len(significant_components) >= 2:
+            return True
+        if len(significant_components) >= 12 and aspect > 1.3 and height < 240 and ink_ratio < 0.22:
             return True
         return False
 

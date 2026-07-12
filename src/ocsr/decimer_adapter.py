@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image
 
 import config
+from src.chem.smiles_validator import validate_smiles
 from .base import BaseOCSRAdapter, OCSRResult
 
 ImageStrategy = Literal["original", "grayscale", "normalized", "binary"]
@@ -71,6 +72,7 @@ class DECIMERAdapter(BaseOCSRAdapter):
         self.predictor: Callable[..., Any] | None = None
         self._load_error: str | None = None
         self.last_inference_time_ms: float | None = None
+        self.max_smiles_length = 1000
 
     @staticmethod
     def _package_installed() -> bool:
@@ -274,6 +276,7 @@ class DECIMERAdapter(BaseOCSRAdapter):
         status: Literal["success", "failed"],
         message: str,
         inference_time_ms: float | None,
+        raw_output: str | None = None,
     ) -> OCSRResult:
         return OCSRResult(
             smiles=smiles,
@@ -286,6 +289,7 @@ class DECIMERAdapter(BaseOCSRAdapter):
             model_version=self.model_version,
             device=self.device,
             package_version=self.package_version,
+            raw_output=raw_output,
         )
 
     def recognize(self, image_path_or_array: Any) -> OCSRResult:
@@ -298,6 +302,28 @@ class DECIMERAdapter(BaseOCSRAdapter):
             smiles, confidence = self._normalize_prediction(prediction)
             elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
             self.last_inference_time_ms = elapsed_ms
+            raw_output = smiles.strip() if isinstance(smiles, str) else None
+            if raw_output:
+                if len(raw_output) > self.max_smiles_length:
+                    return self._result(
+                        None,
+                        confidence,
+                        "failed",
+                        "模型返回的结构字符串异常过长，已拒绝作为有效 SMILES。",
+                        elapsed_ms,
+                        raw_output=raw_output[: self.max_smiles_length],
+                    )
+                validation = validate_smiles(raw_output)
+                if not validation["valid"]:
+                    return self._result(
+                        None,
+                        confidence,
+                        "failed",
+                        "模型返回了无法解析的结构字符串，请调整区域或使用人工修正。",
+                        elapsed_ms,
+                        raw_output=raw_output,
+                    )
+                return self._result(raw_output, confidence, "success", "DECIMER 识别完成。", elapsed_ms, raw_output=raw_output)
             if not smiles:
                 raise DECIMERInferenceError("DECIMER 未返回 SMILES。")
             return self._result(smiles, confidence, "success", "DECIMER 识别完成。", elapsed_ms)
