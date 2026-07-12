@@ -39,6 +39,32 @@ def test_decimer_import_error(monkeypatch, tmp_path: Path) -> None:
     assert "bad import" in result.message
 
 
+def test_decimer_unavailable_when_predictor_import_fails(monkeypatch) -> None:
+    adapter = DECIMERAdapter()
+    monkeypatch.setattr(adapter, "_package_installed", lambda: True)
+    monkeypatch.setattr(
+        adapter,
+        "_tensorflow_status",
+        lambda load=True: {
+            "tensorflow_installed": True,
+            "tensorflow_version": "2.test",
+            "gpu_available": True,
+            "detected_gpus": ["GPU:0"],
+            "tensorflow": None,
+        },
+    )
+    def fail_probe(use_subprocess: bool = False) -> bool:
+        adapter._load_error = "keras mismatch"
+        return False
+
+    monkeypatch.setattr(adapter, "_predictor_import_ready", fail_probe)
+
+    status = adapter.status()
+
+    assert status["available"] is False
+    assert "keras mismatch" in status["message"]
+
+
 def test_decimer_initialization_error(monkeypatch, tmp_path: Path) -> None:
     adapter = DECIMERAdapter()
     monkeypatch.setattr(adapter, "_package_installed", lambda: True)
@@ -49,7 +75,7 @@ def test_decimer_initialization_error(monkeypatch, tmp_path: Path) -> None:
     assert "init boom" in result.message
 
 
-def test_decimer_gpu_unavailable_strict_and_non_strict(monkeypatch) -> None:
+def test_decimer_gpu_unavailable_never_silently_falls_back(monkeypatch) -> None:
     status = {
         "tensorflow_installed": True,
         "tensorflow_version": "2.test",
@@ -57,19 +83,19 @@ def test_decimer_gpu_unavailable_strict_and_non_strict(monkeypatch) -> None:
         "detected_gpus": [],
         "tensorflow": None,
     }
-    strict = DECIMERAdapter(device="gpu", strict_mode=True)
-    monkeypatch.setattr(strict, "_tensorflow_status", lambda: status)
+    strict = DECIMERAdapter(device="gpu", strict_mode=False)
+    monkeypatch.setattr(strict, "_tensorflow_status", lambda load=True: status)
     try:
         strict._resolve_device()
     except DECIMERConfigurationError as exc:
         assert "未检测到可用 GPU" in str(exc)
     else:
-        raise AssertionError("Expected strict GPU configuration failure")
+        raise AssertionError("Expected explicit GPU configuration failure")
 
-    fallback = DECIMERAdapter(device="gpu", strict_mode=False)
-    monkeypatch.setattr(fallback, "_tensorflow_status", lambda: status)
-    fallback._resolve_device()
-    assert fallback.device == "cpu"
+    auto = DECIMERAdapter(device="auto", strict_mode=False)
+    monkeypatch.setattr(auto, "_tensorflow_status", lambda load=True: status)
+    auto._resolve_device()
+    assert auto.device == "cpu"
 
 
 def test_decimer_success_string_result(monkeypatch, tmp_path: Path) -> None:

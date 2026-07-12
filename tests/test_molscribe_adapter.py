@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from src.ocsr.molscribe_adapter import MolScribeAdapter
+from src.ocsr.molscribe_adapter import MolScribeAdapter, MolScribeConfigurationError
 
 
 def test_molscribe_missing_package_fails_helpfully(monkeypatch) -> None:
@@ -71,6 +71,31 @@ def test_molscribe_return_format_compatibility() -> None:
     assert adapter._normalize_prediction({"predicted_smiles": "CCO", "score": 0.7}) == ("CCO", 0.7)
     assert adapter._normalize_prediction(("c1ccccc1", 0.8)) == ("c1ccccc1", 0.8)
     assert adapter._normalize_prediction("CCN") == ("CCN", None)
+
+
+def test_molscribe_explicit_cuda_unavailable_does_not_fallback(monkeypatch) -> None:
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+        @staticmethod
+        def device(name: str) -> str:
+            return name
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch)
+    adapter = MolScribeAdapter(model_path="models/model.pth", device="cuda:0")
+    try:
+        adapter._resolve_device_object()
+    except MolScribeConfigurationError as exc:
+        assert "不会静默回退 CPU" in str(exc)
+    else:
+        raise AssertionError("Expected explicit CUDA failure")
 
 
 def test_molscribe_numpy_input_uses_predict_image(monkeypatch, tmp_path: Path) -> None:

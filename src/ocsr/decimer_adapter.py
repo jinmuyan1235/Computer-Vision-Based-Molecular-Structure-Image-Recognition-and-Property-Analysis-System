@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import importlib.util
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
@@ -15,6 +17,7 @@ from PIL import Image
 
 import config
 from src.chem.smiles_validator import validate_smiles
+from src.runtime.inference_scheduler import GLOBAL_INFERENCE_SCHEDULER
 from .base import BaseOCSRAdapter, OCSRResult
 
 ImageStrategy = Literal["original", "grayscale", "normalized", "binary"]
@@ -71,6 +74,8 @@ class DECIMERAdapter(BaseOCSRAdapter):
         self.detected_gpus: list[str] = []
         self.predictor: Callable[..., Any] | None = None
         self._load_error: str | None = None
+        self._import_probe_done = False
+        self._import_probe_available = False
         self.last_inference_time_ms: float | None = None
         self.max_smiles_length = 1000
 
@@ -87,7 +92,16 @@ class DECIMERAdapter(BaseOCSRAdapter):
                 continue
         return None
 
-    def _tensorflow_status(self) -> dict[str, Any]:
+    def _tensorflow_status(self, load: bool = True) -> dict[str, Any]:
+        if not load:
+            installed = importlib.util.find_spec("tensorflow") is not None
+            return {
+                "tensorflow_installed": installed,
+                "tensorflow_version": importlib.metadata.version("tensorflow") if installed else None,
+                "gpu_available": bool(self.detected_gpus) if self.detected_gpus else None,
+                "detected_gpus": self.detected_gpus,
+                "tensorflow": None,
+            }
         try:
             tensorflow = importlib.import_module("tensorflow")
             gpus = tensorflow.config.list_physical_devices("GPU")
@@ -109,17 +123,20 @@ class DECIMERAdapter(BaseOCSRAdapter):
             }
 
     def _resolve_device(self) -> None:
-        status = self._tensorflow_status()
+        status = self._tensorflow_status(load=True)
         self.tensorflow_version = status.get("tensorflow_version")
         self.detected_gpus = list(status.get("detected_gpus") or [])
         tensorflow = status.get("tensorflow")
         if not status.get("tensorflow_installed"):
+            if self.requested_device == "gpu":
+                raise DECIMERConfigurationError(f"请求 GPU，但 TensorFlow 不可用：{status.get('tensorflow_error')}；不会静默回退 CPU。")
             if self.requested_device == "gpu" and self.strict_mode:
                 raise DECIMERConfigurationError(f"请求 GPU，但 TensorFlow 不可用：{status.get('tensorflow_error')}")
             self.device = "cpu"
             return
         gpu_available = bool(status.get("gpu_available"))
         if self.requested_device == "gpu" and not gpu_available:
+            raise DECIMERConfigurationError("请求 GPU，但 TensorFlow 未检测到可用 GPU；不会静默回退 CPU。")
             if self.strict_mode:
                 raise DECIMERConfigurationError("请求 GPU，但 TensorFlow 未检测到可用 GPU。")
             self.device = "cpu"
@@ -148,6 +165,49 @@ class DECIMERAdapter(BaseOCSRAdapter):
             return getattr(module, "predict_SMILES")
         except (ImportError, AttributeError) as exc:
             raise DECIMERDependencyError(f"DECIMER 包已发现，但无法导入 predict_SMILES：{exc}") from exc
+
+    def _predictor_import_ready(self, use_subprocess: bool = False) -> bool:
+        if self.predictor is not None:
+            return True
+        if use_subprocess:
+            if self._import_probe_done:
+                return self._import_probe_available
+            code = (
+                "import importlib\n"
+                "module = importlib.import_module('DECIMER')\n"
+                "getattr(module, 'predict_SMILES')\n"
+            )
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-c", code],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except subprocess.TimeoutExpired:
+                self._load_error = "DECIMER 入口探测超过 5 秒，已延迟到真实识别或诊断脚本中初始化。"
+                self._import_probe_done = True
+                self._import_probe_available = False
+                return False
+            self._import_probe_done = True
+            self._import_probe_available = completed.returncode == 0
+            if completed.returncode != 0:
+                output = (completed.stderr or completed.stdout or "").strip()
+                last_line = output.splitlines()[-1] if output else "未知导入错误"
+                self._load_error = f"DECIMER 包已发现，但无法导入 predict_SMILES：{last_line}"
+                return False
+            self._load_error = None
+            return True
+        try:
+            self._import_predictor()
+            self._load_error = None
+            return True
+        except DECIMERAdapterError as exc:
+            self._load_error = str(exc)
+            return False
+        except Exception as exc:
+            self._load_error = str(exc)
+            return False
 
     def _load_predictor(self) -> Callable[..., Any]:
         if self.predictor is not None:
@@ -298,7 +358,8 @@ class DECIMERAdapter(BaseOCSRAdapter):
         try:
             predictor = self._load_predictor()
             image_input = self._prepare_input(image_path_or_array)
-            prediction = self._run_with_timeout(lambda: self._predict(predictor, image_input))
+            with GLOBAL_INFERENCE_SCHEDULER.slot_for_device(self.backend_name, self.device):
+                prediction = self._run_with_timeout(lambda: self._predict(predictor, image_input))
             smiles, confidence = self._normalize_prediction(prediction)
             elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
             self.last_inference_time_ms = elapsed_ms
@@ -338,14 +399,20 @@ class DECIMERAdapter(BaseOCSRAdapter):
 
     @property
     def is_available(self) -> bool:
-        tf_status = self._tensorflow_status()
-        return self._package_installed() and bool(tf_status.get("tensorflow_installed")) and self._load_error is None
+        tf_status = self._tensorflow_status(load=False)
+        if not self._package_installed() or not bool(tf_status.get("tensorflow_installed")):
+            return False
+        gpu_available = tf_status.get("gpu_available")
+        if self.requested_device == "gpu" and gpu_available is False:
+            self._load_error = "请求 GPU 运行 DECIMER，但 TensorFlow 没有检测到可用 GPU。"
+            return False
+        return self._predictor_import_ready(use_subprocess=True)
 
     @property
     def availability_message(self) -> str:
         if not self._package_installed():
             return "未安装 DECIMER。demo、MolScribe、手动 SMILES 和 RDKit 分析仍可正常使用。"
-        tf_status = self._tensorflow_status()
+        tf_status = self._tensorflow_status(load=False)
         if not tf_status.get("tensorflow_installed"):
             return f"DECIMER 需要 TensorFlow，但当前不可用：{tf_status.get('tensorflow_error')}"
         if self._load_error:
@@ -355,10 +422,11 @@ class DECIMERAdapter(BaseOCSRAdapter):
         return "DECIMER 预测器已初始化。"
 
     def status(self) -> dict[str, Any]:
-        tf_status = self._tensorflow_status()
+        tf_status = self._tensorflow_status(load=False)
+        available = self.is_available
         return {
             "backend": self.backend_name,
-            "available": self.is_available,
+            "available": available,
             "message": self.availability_message,
             "package_installed": self._package_installed(),
             "package_version": self.package_version,
@@ -375,6 +443,12 @@ class DECIMERAdapter(BaseOCSRAdapter):
             "model_version": self.model_version,
             "model_loaded": self.predictor is not None,
             "last_inference_time_ms": self.last_inference_time_ms,
+            "tensorflow": {
+                "installed": tf_status.get("tensorflow_installed"),
+                "gpu_available": tf_status.get("gpu_available"),
+                "version": tf_status.get("tensorflow_version"),
+                "gpus": tf_status.get("detected_gpus") or [],
+            },
         }
 
     def diagnose(self, load_model: bool = False) -> dict[str, Any]:

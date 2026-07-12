@@ -337,11 +337,13 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
     def is_available(self) -> bool:
         if not self.enabled_backends:
             return False
-        return any(bool(status.get("available")) for status in self._child_statuses())
+        return sum(1 for status in self._child_statuses() if status.get("available")) >= 2
 
     @property
     def availability_message(self) -> str:
         available = [status["backend"] for status in self._child_statuses() if status.get("available")]
+        if len(available) == 1:
+            return f"ensemble 至少需要两个真实 OCSR 后端；当前仅可用：{available[0]}。"
         if available:
             return f"ensemble 可运行；当前可用子后端：{', '.join(available)}。"
         return "ensemble 已配置，但当前没有可用的真实 OCSR 子后端。"
@@ -359,7 +361,7 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
         statuses = self._child_statuses()
         return {
             "backend": self.backend_name,
-            "available": any(bool(status.get("available")) for status in statuses),
+            "available": sum(1 for status in statuses if status.get("available")) >= 2,
             "message": self.availability_message,
             "enabled_backends": self.enabled_backends,
             "backend_priority": self.backend_priority,

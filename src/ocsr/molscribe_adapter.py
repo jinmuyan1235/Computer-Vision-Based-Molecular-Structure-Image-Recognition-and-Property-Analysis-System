@@ -14,6 +14,9 @@ import numpy as np
 from PIL import Image
 
 import config
+from src.chem.smiles_validator import validate_smiles
+from src.runtime.gpu_manager import torch_status
+from src.runtime.inference_scheduler import GLOBAL_INFERENCE_SCHEDULER
 from .base import BaseOCSRAdapter, OCSRResult
 
 ImageStrategy = Literal["original", "grayscale", "normalized", "binary"]
@@ -112,6 +115,8 @@ class MolScribeAdapter(BaseOCSRAdapter):
             self.device = "cpu"
             return torch.device("cpu")
         if requested == "gpu" or requested.startswith("cuda"):
+            raise MolScribeConfigurationError("请求 CUDA 设备，但 torch.cuda.is_available() 为 False；不会静默回退 CPU。")
+        if requested == "gpu" or requested.startswith("cuda"):
             if self.strict_mode:
                 raise MolScribeConfigurationError("请求 CUDA 设备，但 torch.cuda.is_available() 为 False。")
             self.device = "cpu"
@@ -145,6 +150,7 @@ class MolScribeAdapter(BaseOCSRAdapter):
         status: Literal["success", "failed"],
         message: str,
         inference_time_ms: float | None = None,
+        raw_output: str | None = None,
     ) -> OCSRResult:
         return OCSRResult(
             smiles=smiles,
@@ -157,6 +163,7 @@ class MolScribeAdapter(BaseOCSRAdapter):
             model_version=self.model_version,
             device=self.device,
             package_version=self.package_version,
+            raw_output=raw_output,
         )
 
     @staticmethod
@@ -284,10 +291,24 @@ class MolScribeAdapter(BaseOCSRAdapter):
         start = time.perf_counter()
         try:
             model = self._load_model()
-            prediction = self._run_with_timeout(lambda: self._predict_with_model(model, image_path_or_array))
+            with GLOBAL_INFERENCE_SCHEDULER.slot_for_device(self.backend_name, self.device):
+                prediction = self._run_with_timeout(lambda: self._predict_with_model(model, image_path_or_array))
             smiles, confidence = self._normalize_prediction(prediction)
             elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
             self.last_inference_time_ms = elapsed_ms
+            raw_output = smiles.strip() if isinstance(smiles, str) else None
+            if raw_output:
+                validation = validate_smiles(raw_output)
+                if not validation["valid"]:
+                    return self._result(
+                        None,
+                        confidence,
+                        "failed",
+                        "MolScribe 返回了无法解析的结构字符串，请调整区域或使用人工修正。",
+                        elapsed_ms,
+                        raw_output=raw_output,
+                    )
+                return self._result(raw_output, confidence, "success", "MolScribe 识别完成。", elapsed_ms, raw_output=raw_output)
             if not smiles:
                 raise MolScribeInferenceError("MolScribe 未返回 SMILES。")
             return self._result(smiles, confidence, "success", "MolScribe 识别完成。", elapsed_ms)
@@ -336,6 +357,7 @@ class MolScribeAdapter(BaseOCSRAdapter):
             "timeout_seconds": self.timeout_seconds,
             "strict_mode": self.strict_mode,
             "last_inference_time_ms": self.last_inference_time_ms,
+            "torch": torch_status(run_matrix_test=False),
         }
 
     def diagnose(self, load_model: bool = False) -> dict[str, Any]:
