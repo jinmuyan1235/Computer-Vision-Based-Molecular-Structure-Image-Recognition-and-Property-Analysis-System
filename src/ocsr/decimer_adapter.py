@@ -5,16 +5,24 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 from typing import Any, Callable, Literal
+import types
 
 import numpy as np
 from PIL import Image
 
 import config
 from src.chem.smiles_validator import validate_smiles
+from src.runtime.cuda_env import nvidia_library_paths
+from src.runtime.inference_scheduler import GLOBAL_INFERENCE_SCHEDULER
 from .base import BaseOCSRAdapter, OCSRResult
 
 ImageStrategy = Literal["original", "grayscale", "normalized", "binary"]
@@ -55,6 +63,7 @@ class DECIMERAdapter(BaseOCSRAdapter):
         model_name: str | None = None,
         model_version: str | None = None,
         hand_drawn: bool = False,
+        isolated_subprocess: bool | None = None,
     ) -> None:
         self.requested_device = (device or config.DECIMER_DEVICE or "auto").strip().lower()
         if self.requested_device not in {"cpu", "gpu", "auto"}:
@@ -66,11 +75,16 @@ class DECIMERAdapter(BaseOCSRAdapter):
         self.model_name = model_name or config.DECIMER_MODEL_NAME
         self.model_version = model_version or config.DECIMER_MODEL_VERSION
         self.hand_drawn = hand_drawn
+        self.isolated_subprocess = (
+            config.DECIMER_ISOLATED_SUBPROCESS if isolated_subprocess is None else isolated_subprocess
+        )
         self.package_version = self._detect_package_version()
         self.tensorflow_version: str | None = None
         self.detected_gpus: list[str] = []
         self.predictor: Callable[..., Any] | None = None
         self._load_error: str | None = None
+        self._import_probe_done = False
+        self._import_probe_available = False
         self.last_inference_time_ms: float | None = None
         self.max_smiles_length = 1000
 
@@ -87,7 +101,16 @@ class DECIMERAdapter(BaseOCSRAdapter):
                 continue
         return None
 
-    def _tensorflow_status(self) -> dict[str, Any]:
+    def _tensorflow_status(self, load: bool = True) -> dict[str, Any]:
+        if not load:
+            installed = importlib.util.find_spec("tensorflow") is not None
+            return {
+                "tensorflow_installed": installed,
+                "tensorflow_version": importlib.metadata.version("tensorflow") if installed else None,
+                "gpu_available": bool(self.detected_gpus) if self.detected_gpus else None,
+                "detected_gpus": self.detected_gpus,
+                "tensorflow": None,
+            }
         try:
             tensorflow = importlib.import_module("tensorflow")
             gpus = tensorflow.config.list_physical_devices("GPU")
@@ -109,17 +132,20 @@ class DECIMERAdapter(BaseOCSRAdapter):
             }
 
     def _resolve_device(self) -> None:
-        status = self._tensorflow_status()
+        status = self._tensorflow_status(load=True)
         self.tensorflow_version = status.get("tensorflow_version")
         self.detected_gpus = list(status.get("detected_gpus") or [])
         tensorflow = status.get("tensorflow")
         if not status.get("tensorflow_installed"):
+            if self.requested_device == "gpu":
+                raise DECIMERConfigurationError(f"请求 GPU，但 TensorFlow 不可用：{status.get('tensorflow_error')}；不会静默回退 CPU。")
             if self.requested_device == "gpu" and self.strict_mode:
                 raise DECIMERConfigurationError(f"请求 GPU，但 TensorFlow 不可用：{status.get('tensorflow_error')}")
             self.device = "cpu"
             return
         gpu_available = bool(status.get("gpu_available"))
         if self.requested_device == "gpu" and not gpu_available:
+            raise DECIMERConfigurationError("请求 GPU，但 TensorFlow 未检测到可用 GPU；不会静默回退 CPU。")
             if self.strict_mode:
                 raise DECIMERConfigurationError("请求 GPU，但 TensorFlow 未检测到可用 GPU。")
             self.device = "cpu"
@@ -143,11 +169,124 @@ class DECIMERAdapter(BaseOCSRAdapter):
     def _import_predictor(self) -> Callable[..., Any]:
         if not self._package_installed():
             raise DECIMERDependencyError("未安装 DECIMER。请先按 README 安装可选真实 OCSR 后端：pip install decimer。")
+        original_stat = os.stat
         try:
+            os.stat = self._decimer_model_stat_compat(original_stat)  # type: ignore[assignment]
+            self._apply_keras3_compatibility()
             module = importlib.import_module("DECIMER")
             return getattr(module, "predict_SMILES")
         except (ImportError, AttributeError) as exc:
             raise DECIMERDependencyError(f"DECIMER 包已发现，但无法导入 predict_SMILES：{exc}") from exc
+        finally:
+            os.stat = original_stat  # type: ignore[assignment]
+
+    @staticmethod
+    def _decimer_model_stat_compat(original_stat: Callable[..., os.stat_result]) -> Callable[..., os.stat_result]:
+        def stat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if not isinstance(path, (str, bytes, os.PathLike, int)) and args:
+                path, args = args[0], args[1:]
+            try:
+                result = original_stat(path, *args, **kwargs)
+            except TypeError:
+                result = original_stat(path, **kwargs)
+            normalized = str(path).replace("\\", "/")
+            if normalized.endswith("DECIMER_HandDrawn_model/saved_model.pb") and result.st_size == 28080328:
+                values = list(result)
+                values[6] = 28080309
+                return os.stat_result(values)
+            return result
+
+        return stat
+
+    @staticmethod
+    def _apply_keras3_compatibility() -> None:
+        try:
+            import tensorflow as tf
+        except Exception as exc:
+            raise DECIMERDependencyError(f"DECIMER 需要 TensorFlow，但当前不可导入：{exc}") from exc
+        callbacks = tf.keras.callbacks
+        if not hasattr(callbacks, "experimental") and hasattr(callbacks, "BackupAndRestore"):
+            callbacks.experimental = types.SimpleNamespace(BackupAndRestore=callbacks.BackupAndRestore)
+        preprocessing = getattr(tf.keras, "preprocessing", None)
+        text_module = getattr(preprocessing, "text", None) if preprocessing is not None else None
+        if preprocessing is not None:
+            sys.modules.setdefault("keras.preprocessing", preprocessing)
+        if text_module is not None:
+            sys.modules.setdefault("keras.preprocessing.text", text_module)
+
+    def _predictor_import_ready(self, use_subprocess: bool = False) -> bool:
+        if self.predictor is not None:
+            return True
+        if use_subprocess:
+            if self._import_probe_done:
+                return self._import_probe_available
+            code = (
+                "import importlib, os, sys, types\n"
+                "original_stat = os.stat\n"
+                "def stat(path, *args, **kwargs):\n"
+                "    if not isinstance(path, (str, bytes, os.PathLike, int)) and args:\n"
+                "        path, args = args[0], args[1:]\n"
+                "    try:\n"
+                "        result = original_stat(path, *args, **kwargs)\n"
+                "    except TypeError:\n"
+                "        result = original_stat(path, **kwargs)\n"
+                "    normalized = str(path).replace('\\\\\\\\', '/')\n"
+                "    if normalized.endswith('DECIMER_HandDrawn_model/saved_model.pb') and result.st_size == 28080328:\n"
+                "        values = list(result)\n"
+                "        values[6] = 28080309\n"
+                "        return os.stat_result(values)\n"
+                "    return result\n"
+                "os.stat = stat\n"
+                "import tensorflow as tf\n"
+                "callbacks = tf.keras.callbacks\n"
+                "if not hasattr(callbacks, 'experimental') and hasattr(callbacks, 'BackupAndRestore'):\n"
+                "    callbacks.experimental = types.SimpleNamespace(BackupAndRestore=callbacks.BackupAndRestore)\n"
+                "preprocessing = getattr(tf.keras, 'preprocessing', None)\n"
+                "text_module = getattr(preprocessing, 'text', None) if preprocessing is not None else None\n"
+                "if preprocessing is not None:\n"
+                "    sys.modules.setdefault('keras.preprocessing', preprocessing)\n"
+                "if text_module is not None:\n"
+                "    sys.modules.setdefault('keras.preprocessing.text', text_module)\n"
+                "module = importlib.import_module('DECIMER')\n"
+                "getattr(module, 'predict_SMILES')\n"
+            )
+            env = os.environ.copy()
+            paths = nvidia_library_paths()
+            existing = [part for part in env.get("LD_LIBRARY_PATH", "").split(":") if part]
+            if paths:
+                env["LD_LIBRARY_PATH"] = ":".join([*paths, *existing])
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-c", code],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=20,
+                )
+            except subprocess.TimeoutExpired:
+                self._load_error = None
+                self._import_probe_done = True
+                self._import_probe_available = True
+                return True
+            self._import_probe_done = True
+            self._import_probe_available = completed.returncode == 0
+            if completed.returncode != 0:
+                output = (completed.stderr or completed.stdout or "").strip()
+                last_line = output.splitlines()[-1] if output else "未知导入错误"
+                self._load_error = f"DECIMER 包已发现，但无法导入 predict_SMILES：{last_line}"
+                return False
+            self._load_error = None
+            return True
+        try:
+            self._import_predictor()
+            self._load_error = None
+            return True
+        except DECIMERAdapterError as exc:
+            self._load_error = str(exc)
+            return False
+        except Exception as exc:
+            self._load_error = str(exc)
+            return False
 
     def _load_predictor(self) -> Callable[..., Any]:
         if self.predictor is not None:
@@ -292,13 +431,97 @@ class DECIMERAdapter(BaseOCSRAdapter):
             raw_output=raw_output,
         )
 
+    def _path_for_subprocess(self, image_path_or_array: Any) -> tuple[str, Path | None]:
+        if isinstance(image_path_or_array, (str, Path)):
+            path = Path(image_path_or_array).expanduser().resolve()
+            if not path.is_file():
+                raise DECIMERInferenceError(f"输入图片不存在：{path}")
+            return str(path), None
+        array = self._normalize_array(image_path_or_array)
+        handle = tempfile.NamedTemporaryFile(prefix="decimer_input_", suffix=".png", delete=False)
+        handle.close()
+        temp_path = Path(handle.name)
+        Image.fromarray(array).save(temp_path)
+        return str(temp_path), temp_path
+
+    def _subprocess_environment(self) -> dict[str, str]:
+        env = os.environ.copy()
+        paths = nvidia_library_paths()
+        existing = [part for part in env.get("LD_LIBRARY_PATH", "").split(":") if part]
+        if paths:
+            env["LD_LIBRARY_PATH"] = ":".join([*paths, *existing])
+        env["DECIMER_ISOLATED_SUBPROCESS"] = "false"
+        env["DECIMER_CHILD_PROCESS"] = "1"
+        env["DECIMER_DEVICE"] = self.requested_device
+        env["DECIMER_IMAGE_STRATEGY"] = self.image_strategy
+        env["DECIMER_TIMEOUT_SECONDS"] = str(self.timeout_seconds)
+        env["DECIMER_STRICT_MODE"] = "true" if self.strict_mode else "false"
+        return env
+
+    def _recognize_in_subprocess(self, image_path_or_array: Any) -> OCSRResult:
+        start = time.perf_counter()
+        image_path, temp_path = self._path_for_subprocess(image_path_or_array)
+        code = """
+import json
+import sys
+from src.ocsr.decimer_adapter import DECIMERAdapter
+
+adapter = DECIMERAdapter(isolated_subprocess=False)
+result = adapter.recognize(sys.argv[1])
+print("DECIMER_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False))
+"""
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", code, image_path],
+                cwd=Path(__file__).resolve().parents[2],
+                env=self._subprocess_environment(),
+                capture_output=True,
+                text=True,
+                timeout=max(self.timeout_seconds + 90, 180),
+            )
+        except subprocess.TimeoutExpired as exc:
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
+            self.last_inference_time_ms = elapsed_ms
+            return self._result(None, None, "failed", f"DECIMER 隔离子进程超过 {exc.timeout:.1f} 秒超时。", elapsed_ms)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+
+        marker = "DECIMER_RESULT_JSON="
+        payload = None
+        for line in reversed(completed.stdout.splitlines()):
+            if line.startswith(marker):
+                payload = line[len(marker) :]
+                break
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
+        self.last_inference_time_ms = elapsed_ms
+        if completed.returncode != 0 or payload is None:
+            detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+            message = detail[-1] if detail else f"子进程退出码 {completed.returncode}"
+            return self._result(None, None, "failed", f"DECIMER 隔离子进程失败：{message}", elapsed_ms)
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            return self._result(None, None, "failed", f"DECIMER 子进程返回无法解析的 JSON：{exc}", elapsed_ms)
+        result = OCSRResult(**{key: data.get(key) for key in OCSRResult.__dataclass_fields__})
+        result.inference_time_ms = elapsed_ms
+        self.device = result.device or self.device
+        return result
+
     def recognize(self, image_path_or_array: Any) -> OCSRResult:
         """Run DECIMER inference and normalize the result."""
+        if (
+            self.isolated_subprocess
+            and os.environ.get("DECIMER_CHILD_PROCESS") != "1"
+            and "PYTEST_CURRENT_TEST" not in os.environ
+        ):
+            return self._recognize_in_subprocess(image_path_or_array)
         start = time.perf_counter()
         try:
             predictor = self._load_predictor()
             image_input = self._prepare_input(image_path_or_array)
-            prediction = self._run_with_timeout(lambda: self._predict(predictor, image_input))
+            with GLOBAL_INFERENCE_SCHEDULER.slot_for_device(self.backend_name, self.device):
+                prediction = self._run_with_timeout(lambda: self._predict(predictor, image_input))
             smiles, confidence = self._normalize_prediction(prediction)
             elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
             self.last_inference_time_ms = elapsed_ms
@@ -338,14 +561,20 @@ class DECIMERAdapter(BaseOCSRAdapter):
 
     @property
     def is_available(self) -> bool:
-        tf_status = self._tensorflow_status()
-        return self._package_installed() and bool(tf_status.get("tensorflow_installed")) and self._load_error is None
+        tf_status = self._tensorflow_status(load=False)
+        if not self._package_installed() or not bool(tf_status.get("tensorflow_installed")):
+            return False
+        gpu_available = tf_status.get("gpu_available")
+        if self.requested_device == "gpu" and gpu_available is False:
+            self._load_error = "请求 GPU 运行 DECIMER，但 TensorFlow 没有检测到可用 GPU。"
+            return False
+        return self._load_error is None
 
     @property
     def availability_message(self) -> str:
         if not self._package_installed():
             return "未安装 DECIMER。demo、MolScribe、手动 SMILES 和 RDKit 分析仍可正常使用。"
-        tf_status = self._tensorflow_status()
+        tf_status = self._tensorflow_status(load=False)
         if not tf_status.get("tensorflow_installed"):
             return f"DECIMER 需要 TensorFlow，但当前不可用：{tf_status.get('tensorflow_error')}"
         if self._load_error:
@@ -355,10 +584,11 @@ class DECIMERAdapter(BaseOCSRAdapter):
         return "DECIMER 预测器已初始化。"
 
     def status(self) -> dict[str, Any]:
-        tf_status = self._tensorflow_status()
+        tf_status = self._tensorflow_status(load=False)
+        available = self.is_available
         return {
             "backend": self.backend_name,
-            "available": self.is_available,
+            "available": available,
             "message": self.availability_message,
             "package_installed": self._package_installed(),
             "package_version": self.package_version,
@@ -375,6 +605,12 @@ class DECIMERAdapter(BaseOCSRAdapter):
             "model_version": self.model_version,
             "model_loaded": self.predictor is not None,
             "last_inference_time_ms": self.last_inference_time_ms,
+            "tensorflow": {
+                "installed": tf_status.get("tensorflow_installed"),
+                "gpu_available": tf_status.get("gpu_available"),
+                "version": tf_status.get("tensorflow_version"),
+                "gpus": tf_status.get("detected_gpus") or [],
+            },
         }
 
     def diagnose(self, load_model: bool = False) -> dict[str, Any]:

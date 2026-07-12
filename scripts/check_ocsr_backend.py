@@ -14,10 +14,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.runtime.cuda_env import ensure_cuda_library_path
+
+ensure_cuda_library_path(reexec=True)
+
 from src.ocsr.demo_adapter import DemoOCSRAdapter
 from src.ocsr.decimer_adapter import DECIMERAdapter
 from src.ocsr.ensemble import EnsembleOCSRAdapter
 from src.ocsr.molscribe_adapter import MolScribeAdapter
+from src.runtime.gpu_manager import environment_status
 
 
 def _cuda_available() -> tuple[bool, str | None]:
@@ -70,6 +75,7 @@ def main() -> int:
     parser.add_argument("--backend", choices=["molscribe", "demo", "decimer", "ensemble"], default="molscribe")
     args = parser.parse_args()
     status = check_backend(args.backend)
+    status["runtime"] = environment_status(run_matrix_test=False)
     print(json.dumps(status, ensure_ascii=False, indent=2))
     return 0
 

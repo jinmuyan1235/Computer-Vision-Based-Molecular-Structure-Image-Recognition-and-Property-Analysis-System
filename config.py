@@ -31,7 +31,7 @@ _configured_admet_path = Path(os.getenv("ADMET_MODEL_PATH", str(MODEL_DIR / "adm
 ADMET_MODEL_PATH = (
     _configured_admet_path if _configured_admet_path.is_absolute() else PROJECT_ROOT / _configured_admet_path
 ).resolve()
-MOLSCRIBE_MODEL_PATH = _env_path("MOLSCRIBE_MODEL_PATH", MODEL_DIR / "molscribe_model.pth")
+MOLSCRIBE_MODEL_PATH = _env_path("MOLSCRIBE_MODEL_PATH", MODEL_DIR / "molscribe" / "swin_base_char_aux_1m.pth")
 MOLSCRIBE_MODEL_NAME = os.getenv("MOLSCRIBE_MODEL_NAME", MOLSCRIBE_MODEL_PATH.name).strip()
 MOLSCRIBE_MODEL_VERSION = os.getenv("MOLSCRIBE_MODEL_VERSION", "").strip() or None
 MOLSCRIBE_IMAGE_STRATEGY: Literal["original", "grayscale", "normalized", "binary"] = os.getenv(
@@ -55,6 +55,11 @@ DECIMER_STRICT_MODE = os.getenv("DECIMER_STRICT_MODE", os.getenv("OCSR_STRICT_MO
     "true",
     "yes",
 }
+DECIMER_ISOLATED_SUBPROCESS = os.getenv("DECIMER_ISOLATED_SUBPROCESS", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 OCSR_ENSEMBLE_BACKENDS = tuple(
     backend.strip().lower()
     for backend in os.getenv("OCSR_ENSEMBLE_BACKENDS", "molscribe,decimer").split(",")
@@ -73,6 +78,14 @@ OCSR_ENSEMBLE_CONTINUE_ON_ERROR = os.getenv("OCSR_ENSEMBLE_CONTINUE_ON_ERROR", "
 }
 OCSR_ENSEMBLE_TOTAL_TIMEOUT_SECONDS = float(
     os.getenv("OCSR_ENSEMBLE_TOTAL_TIMEOUT_SECONDS", os.getenv("OCSR_TIMEOUT_SECONDS", "240")).strip() or "240"
+)
+OCSR_GPU_REQUIRED = os.getenv("OCSR_GPU_REQUIRED", "false").lower() in {"1", "true", "yes"}
+OCSR_GPU_MAX_CONCURRENT_INFERENCE = max(1, int(os.getenv("OCSR_GPU_MAX_CONCURRENT_INFERENCE", "1").strip() or "1"))
+OCSR_GPU_ALLOW_PARALLEL_MODELS = os.getenv("OCSR_GPU_ALLOW_PARALLEL_MODELS", "false").lower() in {"1", "true", "yes"}
+OCSR_FALLBACK_IMAGE_STRATEGIES = tuple(
+    strategy.strip().lower()
+    for strategy in os.getenv("OCSR_FALLBACK_IMAGE_STRATEGIES", "original,grayscale,normalized").split(",")
+    if strategy.strip()
 )
 
 
