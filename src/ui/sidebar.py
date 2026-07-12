@@ -7,7 +7,6 @@ from typing import Any
 import streamlit as st
 
 import config
-from src.runtime.gpu_manager import environment_status
 from src.ui.labels import (
     BACKEND_DESCRIPTIONS,
     backend_label,
@@ -71,13 +70,7 @@ def render_sidebar() -> tuple[str, bool, bool]:
 
 
 def _render_technical_status(status: dict[str, Any]) -> None:
-    runtime = environment_status(run_matrix_test=False)
-    nvidia = runtime.get("nvidia_smi", {})
-    first_gpu = (nvidia.get("gpus") or [{}])[0]
     rows = {
-        "GPU": first_gpu.get("name") or "未检测到",
-        "PyTorch CUDA": "可用" if (runtime.get("torch") or {}).get("cuda_available") else "不可用",
-        "TensorFlow GPU": "可用" if (runtime.get("tensorflow") or {}).get("gpu_available") else "不可用",
         "内部后端": status.get("backend"),
         "模型": status.get("model_name") or status.get("model_path") or "无",
         "设备": status.get("device") or status.get("requested_device") or "未指定",
