@@ -9,7 +9,6 @@ import streamlit as st
 from PIL import Image
 
 from config import OUTPUT_DIR
-from src.ui.streamlit_compat import image_stretch
 
 UPLOAD_PREVIEW_WIDTH = 600
 STRUCTURE_PREVIEW_WIDTH = 480
@@ -32,7 +31,7 @@ def show_preprocess_thumbnail(image_path: str | Path, caption: str) -> None:
 
 
 def show_document_page(image_path: str | Path, caption: str) -> None:
-    """Show a bounded document preview without passing large PIL objects to Streamlit."""
+    """Show a bounded document thumbnail and avoid eager rendering of large source pages."""
     path = Path(image_path)
     if not path.is_file():
         st.warning(f"预览图片不存在：{path}")
@@ -49,7 +48,8 @@ def show_document_page(image_path: str | Path, caption: str) -> None:
         return
     st.image(str(preview_path), caption=caption, width=DOCUMENT_PREVIEW_WIDTH)
     with st.expander("查看大图"):
-        image_stretch(str(path), caption=caption)
+        st.caption(f"大图文件：{path}")
+        st.caption("为避免大页面图像导致 Streamlit 断联，这里不自动渲染原始大图；可从结果包中查看原始标注页。")
 
 
 def _document_preview_path(path: Path) -> Path:
