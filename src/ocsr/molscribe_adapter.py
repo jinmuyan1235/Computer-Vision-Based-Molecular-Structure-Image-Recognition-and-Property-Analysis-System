@@ -5,6 +5,11 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
@@ -15,6 +20,7 @@ from PIL import Image
 
 import config
 from src.chem.smiles_validator import validate_smiles
+from src.runtime.cuda_env import nvidia_library_paths
 from src.runtime.gpu_manager import torch_status
 from src.runtime.inference_scheduler import GLOBAL_INFERENCE_SCHEDULER
 from .base import BaseOCSRAdapter, OCSRResult
@@ -56,6 +62,7 @@ class MolScribeAdapter(BaseOCSRAdapter):
         strict_mode: bool | None = None,
         model_name: str | None = None,
         model_version: str | None = None,
+        isolated_subprocess: bool | None = None,
     ) -> None:
         self.model_path = self._coerce_model_path(model_path)
         self.device = (device or "cpu").strip().lower()
@@ -64,6 +71,9 @@ class MolScribeAdapter(BaseOCSRAdapter):
         self.strict_mode = config.OCSR_STRICT_MODE if strict_mode is None else strict_mode
         self.model_name = model_name or (self.model_path.name if model_path is not None else config.MOLSCRIBE_MODEL_NAME)
         self.model_version = model_version or config.MOLSCRIBE_MODEL_VERSION
+        self.isolated_subprocess = (
+            config.MOLSCRIBE_ISOLATED_SUBPROCESS if isolated_subprocess is None else isolated_subprocess
+        )
         self.package_version = self._detect_package_version()
         self.model: Any | None = None
         self._load_error: str | None = None
@@ -286,8 +296,97 @@ class MolScribeAdapter(BaseOCSRAdapter):
             if future.done():
                 executor.shutdown(wait=True)
 
+    def _path_for_subprocess(self, image_path_or_array: Any) -> tuple[str, Path | None]:
+        if isinstance(image_path_or_array, (str, Path)):
+            path = Path(image_path_or_array).expanduser().resolve()
+            if not path.is_file():
+                raise MolScribeInferenceError(f"输入图片不存在：{path}")
+            return str(path), None
+        array = self._normalize_array(image_path_or_array)
+        handle = tempfile.NamedTemporaryFile(prefix="molscribe_input_", suffix=".png", delete=False)
+        handle.close()
+        temp_path = Path(handle.name)
+        Image.fromarray(array).save(temp_path)
+        return str(temp_path), temp_path
+
+    def _subprocess_environment(self) -> dict[str, str]:
+        env = os.environ.copy()
+        paths = nvidia_library_paths()
+        existing = [part for part in env.get("LD_LIBRARY_PATH", "").split(":") if part]
+        if paths:
+            env["LD_LIBRARY_PATH"] = ":".join([*paths, *existing])
+        env["MOLSCRIBE_ISOLATED_SUBPROCESS"] = "false"
+        env["MOLSCRIBE_CHILD_PROCESS"] = "1"
+        env["MOLSCRIBE_DEVICE"] = self.device
+        env["OCSR_DEVICE"] = self.device
+        env["MOLSCRIBE_MODEL_PATH"] = str(self.model_path)
+        env["MOLSCRIBE_IMAGE_STRATEGY"] = self.image_strategy
+        env["OCSR_TIMEOUT_SECONDS"] = str(self.timeout_seconds)
+        env["OCSR_STRICT_MODE"] = "true" if self.strict_mode else "false"
+        return env
+
+    def _recognize_in_subprocess(self, image_path_or_array: Any) -> OCSRResult:
+        start = time.perf_counter()
+        image_path, temp_path = self._path_for_subprocess(image_path_or_array)
+        code = """
+import json
+import os
+import sys
+from src.ocsr.molscribe_adapter import MolScribeAdapter
+
+adapter = MolScribeAdapter(
+    device=os.environ.get("MOLSCRIBE_DEVICE") or os.environ.get("OCSR_DEVICE") or "cpu",
+    isolated_subprocess=False,
+)
+result = adapter.recognize(sys.argv[1])
+print("MOLSCRIBE_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False))
+"""
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", code, image_path],
+                cwd=Path(__file__).resolve().parents[2],
+                env=self._subprocess_environment(),
+                capture_output=True,
+                text=True,
+                timeout=max(self.timeout_seconds + 60, 120),
+            )
+        except subprocess.TimeoutExpired as exc:
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
+            self.last_inference_time_ms = elapsed_ms
+            return self._result(None, None, "failed", f"MolScribe 隔离子进程超过 {exc.timeout:.1f} 秒超时。", elapsed_ms)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+
+        marker = "MOLSCRIBE_RESULT_JSON="
+        payload = None
+        for line in reversed(completed.stdout.splitlines()):
+            if line.startswith(marker):
+                payload = line[len(marker) :]
+                break
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
+        self.last_inference_time_ms = elapsed_ms
+        if completed.returncode != 0 or payload is None:
+            detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+            message = detail[-1] if detail else f"子进程退出码 {completed.returncode}"
+            return self._result(None, None, "failed", f"MolScribe 隔离子进程失败：{message}", elapsed_ms)
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            return self._result(None, None, "failed", f"MolScribe 子进程返回无法解析的 JSON：{exc}", elapsed_ms)
+        result = OCSRResult(**{key: data.get(key) for key in OCSRResult.__dataclass_fields__})
+        result.inference_time_ms = elapsed_ms
+        self.device = result.device or self.device
+        return result
+
     def recognize(self, image_path_or_array: Any) -> OCSRResult:
         """Run MolScribe inference and return a diagnostic-rich normalized result."""
+        if (
+            self.isolated_subprocess
+            and os.environ.get("MOLSCRIBE_CHILD_PROCESS") != "1"
+            and "PYTEST_CURRENT_TEST" not in os.environ
+        ):
+            return self._recognize_in_subprocess(image_path_or_array)
         start = time.perf_counter()
         try:
             model = self._load_model()
@@ -356,6 +455,7 @@ class MolScribeAdapter(BaseOCSRAdapter):
             "image_strategy": self.image_strategy,
             "timeout_seconds": self.timeout_seconds,
             "strict_mode": self.strict_mode,
+            "isolated_subprocess": self.isolated_subprocess,
             "last_inference_time_ms": self.last_inference_time_ms,
             "torch": torch_status(run_matrix_test=False),
         }
