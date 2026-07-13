@@ -44,3 +44,10 @@ def test_document_page_uses_chinese_mode_labels() -> None:
     assert "检测并识别分子结构（调用 OCSR，耗时较长）" in source
     assert "Update bbox and rerun" not in source
     assert "Delete region" not in source
+
+
+def test_document_subprocess_json_parser_ignores_trailing_logs() -> None:
+    from src.ui.document_page import _extract_json_object
+
+    parsed = _extract_json_object('native log\n{"status": "success", "result_path": "x.json"}\n[09:46] warning')
+    assert parsed == {"status": "success", "result_path": "x.json"}

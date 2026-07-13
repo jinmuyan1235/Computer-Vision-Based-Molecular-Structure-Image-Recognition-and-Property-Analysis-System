@@ -22,13 +22,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", default=config.OCSR_BACKEND, help="OCSR backend: demo, molscribe, decimer, ensemble.")
     parser.add_argument("--output", default=str(config.DOCUMENT_OUTPUT_DIR), help="Output directory for document runs.")
     parser.add_argument("--detect-only", action="store_true", help="Detect and crop regions without running OCSR.")
+    parser.add_argument("--molscribe-device", default=None, help="Runtime MolScribe device override.")
+    parser.add_argument("--decimer-device", default=None, help="Runtime DECIMER device override.")
+    parser.add_argument("--visible-gpu-index", default=None, help="CUDA_VISIBLE_DEVICES index for TensorFlow/DECIMER.")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        processor = DocumentOCSRProcessor(backend=args.backend, output_dir=args.output)
+        runtime_config = {
+            "molscribe_device": args.molscribe_device,
+            "decimer_device": args.decimer_device,
+            "visible_gpu_index": args.visible_gpu_index,
+        }
+        processor = DocumentOCSRProcessor(backend=args.backend, output_dir=args.output, runtime_config=runtime_config)
         result = processor.process(args.input, run_ocsr=not args.detect_only)
     except OptionalDependencyError as exc:
         print(json.dumps({"status": "unavailable", "message": str(exc)}, ensure_ascii=False, indent=2))
@@ -41,6 +49,7 @@ def main() -> int:
         "document_id": result["document_id"],
         "summary": result["summary"],
         "exports": result["exports"],
+        "result_path": result["exports"].get("json"),
     }, ensure_ascii=False, indent=2))
     return 0
 
