@@ -34,6 +34,11 @@ ADMET_MODEL_PATH = (
 MOLSCRIBE_MODEL_PATH = _env_path("MOLSCRIBE_MODEL_PATH", MODEL_DIR / "molscribe" / "swin_base_char_aux_1m.pth")
 MOLSCRIBE_MODEL_NAME = os.getenv("MOLSCRIBE_MODEL_NAME", MOLSCRIBE_MODEL_PATH.name).strip()
 MOLSCRIBE_MODEL_VERSION = os.getenv("MOLSCRIBE_MODEL_VERSION", "").strip() or None
+MOLSCRIBE_ISOLATED_SUBPROCESS = os.getenv("MOLSCRIBE_ISOLATED_SUBPROCESS", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 MOLSCRIBE_IMAGE_STRATEGY: Literal["original", "grayscale", "normalized", "binary"] = os.getenv(
     "MOLSCRIBE_IMAGE_STRATEGY", "original"
 ).strip().lower()  # type: ignore[assignment]
