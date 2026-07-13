@@ -7,6 +7,8 @@ from typing import Any
 
 import streamlit as st
 
+from src.ui.streamlit_compat import image_stretch
+
 UPLOAD_PREVIEW_WIDTH = 600
 STRUCTURE_PREVIEW_WIDTH = 480
 PREPROCESS_PREVIEW_WIDTH = 260
@@ -29,4 +31,4 @@ def show_preprocess_thumbnail(image_path: str | Path, caption: str) -> None:
 def show_document_page(image_path: str | Path, caption: str) -> None:
     st.image(str(image_path), caption=caption, width=DOCUMENT_PREVIEW_WIDTH)
     with st.expander("查看大图"):
-        st.image(str(image_path), caption=caption, use_container_width=True)
+        image_stretch(str(image_path), caption=caption)

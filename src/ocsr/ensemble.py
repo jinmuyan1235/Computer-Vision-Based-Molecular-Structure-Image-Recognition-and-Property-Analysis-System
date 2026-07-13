@@ -11,7 +11,7 @@ from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem, rdMolDescriptors
 
 import config
-from src.chem.smiles_validator import smiles_to_mol, validate_smiles
+from src.chem.smiles_validator import smiles_to_mol, suppress_rdkit_parse_errors, validate_smiles
 
 from .base import BaseOCSRAdapter, OCSRResult
 from .decimer_adapter import DECIMERAdapter
@@ -25,6 +25,17 @@ DEFAULT_FACTORIES: dict[str, AdapterFactory] = {
     "molscribe": MolScribeAdapter,
     "decimer": DECIMERAdapter,
 }
+
+
+def _default_factories(runtime_config: Mapping[str, Any] | None = None) -> dict[str, AdapterFactory]:
+    runtime = dict(runtime_config or {})
+    return {
+        "molscribe": lambda: MolScribeAdapter(device=runtime.get("molscribe_device")),
+        "decimer": lambda: DECIMERAdapter(
+            device=runtime.get("decimer_device"),
+            visible_gpu_index=runtime.get("visible_gpu_index"),
+        ),
+    }
 
 
 def _normalized_backends(backends: list[str] | tuple[str, ...] | None) -> list[str]:
@@ -56,7 +67,8 @@ def _mol_identity(smiles: str | None) -> dict[str, Any]:
         identity["error"] = "RDKit 无法构建分子对象。"
         return identity
     try:
-        identity["inchikey"] = Chem.MolToInchiKey(mol)
+        with suppress_rdkit_parse_errors():
+            identity["inchikey"] = Chem.MolToInchiKey(mol)
     except Exception as exc:
         identity["inchikey_error"] = str(exc)
     try:
@@ -236,9 +248,11 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
         continue_on_error: bool | None = None,
         total_timeout_seconds: float | None = None,
         adapter_factories: Mapping[str, AdapterFactory] | None = None,
+        runtime_config: Mapping[str, Any] | None = None,
     ) -> None:
-        factories = dict(adapter_factories or DEFAULT_FACTORIES)
+        factories = dict(adapter_factories or _default_factories(runtime_config))
         self.adapter_factories = factories
+        self.runtime_config = dict(runtime_config or {})
         self.enabled_backends = [backend for backend in _normalized_backends(backends) if backend in factories]
         self.backend_priority = list(backend_priority or config.OCSR_ENSEMBLE_BACKEND_PRIORITY)
         self.reliability_weights = dict(reliability_weights or config.OCSR_ENSEMBLE_RELIABILITY_WEIGHTS)

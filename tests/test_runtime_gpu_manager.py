@@ -1,6 +1,6 @@
 """Runtime GPU diagnostics should report real status without faking success."""
 
-from src.runtime.gpu_manager import environment_status, nvidia_smi_status, tensorflow_status, torch_status
+from src.runtime.gpu_manager import environment_status, gpu_selection_options, nvidia_smi_status, tensorflow_status, torch_status
 from src.runtime.inference_scheduler import InferenceScheduler
 
 
@@ -10,6 +10,30 @@ def test_runtime_status_shapes_are_stable() -> None:
     assert "cuda_available" in torch_status(run_matrix_test=False)
     assert "gpu_available" in tensorflow_status(run_matrix_test=False)
     assert "gpus" in nvidia_smi_status()
+
+
+def test_gpu_selection_options_include_cpu_auto_and_detected_gpus(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.runtime.gpu_manager.nvidia_smi_status",
+        lambda: {
+            "available": True,
+            "gpus": [{
+                "index": 1,
+                "name": "RTX Test",
+                "driver_version": "999.99",
+                "memory_total_mb": 16000,
+                "memory_used_mb": 512,
+            }],
+        },
+    )
+
+    options = gpu_selection_options()
+    by_value = {option["value"]: option for option in options}
+
+    assert {"auto", "cpu", "cuda:1"}.issubset(by_value)
+    assert by_value["cuda:1"]["molscribe_device"] == "cuda:1"
+    assert by_value["cuda:1"]["decimer_device"] == "gpu"
+    assert by_value["cuda:1"]["visible_gpu_index"] == "1"
 
 
 def test_inference_scheduler_limits_gpu_slots() -> None:

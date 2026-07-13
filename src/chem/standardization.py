@@ -10,7 +10,7 @@ from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
 import config
-from src.chem.smiles_validator import suppress_rdkit_parse_errors
+from src.chem.smiles_validator import suppress_rdkit_parse_errors, unsupported_structure_reason
 
 
 STANDARDIZATION_PROFILES: dict[str, list[str]] = {
@@ -112,6 +112,10 @@ def _parse_mol(smiles: str | None) -> tuple[Chem.Mol | None, list[dict[str, Any]
         with suppress_rdkit_parse_errors():
             mol = Chem.MolFromSmiles(smiles.strip())
         if mol is not None:
+            unsupported = unsupported_structure_reason(mol)
+            if unsupported:
+                warnings.append({"code": "unsupported_structure", "message": unsupported, "severity": "error"})
+                return None, warnings, unsupported
             return mol, warnings, None
     except Exception as exc:
         warnings.append({"code": "parse_exception", "message": str(exc), "severity": "error"})
@@ -273,11 +277,13 @@ def _identity(raw_smiles: str | None, raw_mol: Chem.Mol, standardized_mol: Chem.
         "stereocenter_count": None,
     }
     try:
-        identity["inchi"] = Chem.MolToInchi(standardized_mol)
+        with suppress_rdkit_parse_errors():
+            identity["inchi"] = Chem.MolToInchi(standardized_mol)
     except Exception as exc:
         warnings.append({"code": "inchi_unavailable", "message": str(exc), "severity": "warning"})
     try:
-        identity["inchikey"] = Chem.MolToInchiKey(standardized_mol)
+        with suppress_rdkit_parse_errors():
+            identity["inchikey"] = Chem.MolToInchiKey(standardized_mol)
     except Exception as exc:
         warnings.append({"code": "inchikey_unavailable", "message": str(exc), "severity": "warning"})
     try:

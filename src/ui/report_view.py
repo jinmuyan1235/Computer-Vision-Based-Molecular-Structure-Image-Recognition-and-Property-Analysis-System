@@ -19,6 +19,7 @@ from src.export.json_exporter import to_json_text
 from src.export.pdf_exporter import save_pdf
 from src.ui.image_viewer import show_preprocess_thumbnail, show_structure
 from src.ui.labels import backend_label, status_label
+from src.ui.streamlit_compat import dataframe_stretch
 
 
 def show_ensemble_details(ocsr: dict[str, Any]) -> None:
@@ -47,7 +48,7 @@ def show_ensemble_details(ocsr: dict[str, Any]) -> None:
                     "耗时(ms)": candidate.get("inference_time_ms"),
                     "错误": candidate.get("error"),
                 })
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            dataframe_stretch(pd.DataFrame(rows), hide_index=True)
 
 
 def show_chemical_identity(report: dict[str, Any]) -> None:
@@ -68,7 +69,7 @@ def show_chemical_identity(report: dict[str, Any]) -> None:
             f"是否改变：{'是' if standardization.get('changed') else '否'}。"
         )
         if warnings:
-            st.dataframe(pd.DataFrame(warnings), hide_index=True, use_container_width=True)
+            dataframe_stretch(pd.DataFrame(warnings), hide_index=True)
 
 
 def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bool, key_prefix: str) -> None:

@@ -7,6 +7,7 @@ from typing import Any
 import streamlit as st
 
 import config
+from src.runtime.gpu_manager import gpu_selection_options
 from src.ui.labels import (
     BACKEND_DESCRIPTIONS,
     backend_label,
@@ -21,6 +22,22 @@ def render_sidebar() -> tuple[str, bool, bool]:
     """Render sidebar controls and return selected backend and display switches."""
     with st.sidebar:
         st.header("运行设置")
+        gpu_options = gpu_selection_options()
+        gpu_values = [option["value"] for option in gpu_options]
+        gpu_labels = {option["value"]: option["label"] for option in gpu_options}
+        current_gpu = st.session_state.get("gpu_device_selection", "auto")
+        if current_gpu not in gpu_values:
+            current_gpu = "auto"
+        st.selectbox(
+            "本机推理设备",
+            gpu_values,
+            index=gpu_values.index(current_gpu),
+            format_func=lambda value: gpu_labels.get(value, value),
+            key="gpu_device_selection",
+        )
+        if st.session_state.get("gpu_device_selection") not in {"auto", "cpu"}:
+            st.caption("DECIMER/TensorFlow 已加载后再切换 GPU，建议重启 Streamlit 以确保显存绑定生效。")
+
         statuses = get_backend_statuses()
         if "selected_backend" not in st.session_state:
             st.session_state["selected_backend"] = default_backend(statuses, config.OCSR_BACKEND)
@@ -64,6 +81,7 @@ def render_sidebar() -> tuple[str, bool, bool]:
                     st.caption(f"{backend_label(backend)}：{item.get('message') or '未配置'}")
 
         with st.expander("技术信息", expanded=False):
+            st.write(f"**当前设备选择：** {gpu_labels.get(st.session_state.get('gpu_device_selection', 'auto'), '自动')}")
             _render_technical_status(status)
 
     return selected, show_preprocessing, export_pdf

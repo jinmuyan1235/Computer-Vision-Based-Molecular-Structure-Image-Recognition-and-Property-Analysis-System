@@ -64,6 +64,7 @@ class DECIMERAdapter(BaseOCSRAdapter):
         model_version: str | None = None,
         hand_drawn: bool = False,
         isolated_subprocess: bool | None = None,
+        visible_gpu_index: str | int | None = None,
     ) -> None:
         self.requested_device = (device or config.DECIMER_DEVICE or "auto").strip().lower()
         if self.requested_device not in {"cpu", "gpu", "auto"}:
@@ -78,6 +79,7 @@ class DECIMERAdapter(BaseOCSRAdapter):
         self.isolated_subprocess = (
             config.DECIMER_ISOLATED_SUBPROCESS if isolated_subprocess is None else isolated_subprocess
         )
+        self.visible_gpu_index = str(visible_gpu_index) if visible_gpu_index is not None else None
         self.package_version = self._detect_package_version()
         self.tensorflow_version: str | None = None
         self.detected_gpus: list[str] = []
@@ -102,6 +104,8 @@ class DECIMERAdapter(BaseOCSRAdapter):
         return None
 
     def _tensorflow_status(self, load: bool = True) -> dict[str, Any]:
+        if self.visible_gpu_index is not None and self.requested_device in {"gpu", "auto"}:
+            os.environ["CUDA_VISIBLE_DEVICES"] = self.visible_gpu_index
         if not load:
             installed = importlib.util.find_spec("tensorflow") is not None
             return {
@@ -453,6 +457,8 @@ class DECIMERAdapter(BaseOCSRAdapter):
         env["DECIMER_ISOLATED_SUBPROCESS"] = "false"
         env["DECIMER_CHILD_PROCESS"] = "1"
         env["DECIMER_DEVICE"] = self.requested_device
+        if self.visible_gpu_index is not None and self.requested_device in {"gpu", "auto"}:
+            env["CUDA_VISIBLE_DEVICES"] = self.visible_gpu_index
         env["DECIMER_IMAGE_STRATEGY"] = self.image_strategy
         env["DECIMER_TIMEOUT_SECONDS"] = str(self.timeout_seconds)
         env["DECIMER_STRICT_MODE"] = "true" if self.strict_mode else "false"
@@ -597,6 +603,7 @@ print("DECIMER_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False))
             "gpu_available": tf_status.get("gpu_available"),
             "detected_gpus": self.detected_gpus or tf_status.get("detected_gpus") or [],
             "requested_device": self.requested_device,
+            "visible_gpu_index": self.visible_gpu_index,
             "device": self.device,
             "image_strategy": self.image_strategy,
             "timeout_seconds": self.timeout_seconds,
