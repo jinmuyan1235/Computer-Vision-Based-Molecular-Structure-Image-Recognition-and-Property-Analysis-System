@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+from PIL import Image
 
 from src.ui.streamlit_compat import image_stretch
 
@@ -29,6 +30,16 @@ def show_preprocess_thumbnail(image_path: str | Path, caption: str) -> None:
 
 
 def show_document_page(image_path: str | Path, caption: str) -> None:
-    st.image(str(image_path), caption=caption, width=DOCUMENT_PREVIEW_WIDTH)
+    path = Path(image_path)
+    if not path.is_file():
+        st.warning(f"预览图片不存在：{path}")
+        return
+    try:
+        with Image.open(path) as image:
+            preview = image.convert("RGB").copy()
+    except Exception as exc:
+        st.warning(f"预览图片无法读取：{exc}")
+        return
+    st.image(preview, caption=caption, width=DOCUMENT_PREVIEW_WIDTH)
     with st.expander("查看大图"):
-        image_stretch(str(image_path), caption=caption)
+        image_stretch(preview, caption=caption)

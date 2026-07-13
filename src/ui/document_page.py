@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -12,13 +16,14 @@ from src.documents.input_loader import DocumentInputError, OptionalDependencyErr
 from src.documents.processor import DocumentOCSRProcessor
 from src.ui.image_viewer import show_document_page
 from src.ui.labels import REGION_TYPE_LABELS, localize_region_rows
-from src.ui.state import get_document_processor, remember_backend_status
+from src.ui.state import current_runtime_key, get_document_processor, remember_backend_status, runtime_config_from_key
 from src.ui.streamlit_compat import dataframe_stretch
 from src.ui.styles import page_intro
 
 
 PROCESS_MODE_DETECT = "仅检测分子区域（速度快，不执行结构识别）"
 PROCESS_MODE_FULL = "检测并识别分子结构（调用 OCSR，耗时较长）"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def render_document_page(backend: str) -> None:
@@ -45,22 +50,89 @@ def render_document_page(backend: str) -> None:
                 progress_bar.progress(current / max(total, 1))
 
             with st.spinner("正在渲染页面并检测区域……"):
-                st.session_state["document_result"] = get_document_processor(backend).process(
-                    temporary_path,
-                    run_ocsr=run_ocsr,
-                    progress_callback=progress_callback if run_ocsr else None,
-                )
+                if run_ocsr and backend != "demo":
+                    st.session_state["document_result"] = _process_document_subprocess(temporary_path, backend, run_ocsr)
+                else:
+                    st.session_state["document_result"] = get_document_processor(backend).process(
+                        temporary_path,
+                        run_ocsr=run_ocsr,
+                        progress_callback=progress_callback if run_ocsr else None,
+                    )
                 remember_backend_status(backend)
             progress_text.empty()
             progress_bar.empty()
         except OptionalDependencyError as exc:
             st.error(str(exc))
-        except (DocumentInputError, FileNotFoundError, ValueError) as exc:
+        except (DocumentInputError, FileNotFoundError, RuntimeError, ValueError) as exc:
             st.error(str(exc))
         finally:
             temporary_path.unlink(missing_ok=True)
     if "document_result" in st.session_state:
         st.session_state["document_result"] = show_document_result(st.session_state["document_result"], backend)
+
+
+def _process_document_subprocess(input_path: Path, backend: str, run_ocsr: bool) -> dict:
+    """Run document OCSR outside Streamlit so native model crashes cannot kill the UI server."""
+    runtime = runtime_config_from_key(current_runtime_key())
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / "process_document.py"),
+        "--input",
+        str(input_path),
+        "--backend",
+        backend,
+    ]
+    if not run_ocsr:
+        command.append("--detect-only")
+    if runtime.get("molscribe_device"):
+        command.extend(["--molscribe-device", str(runtime["molscribe_device"])])
+    if runtime.get("decimer_device"):
+        command.extend(["--decimer-device", str(runtime["decimer_device"])])
+    if runtime.get("visible_gpu_index") is not None:
+        command.extend(["--visible-gpu-index", str(runtime["visible_gpu_index"])])
+
+    env = os.environ.copy()
+    env.setdefault("MOLSCRIBE_ISOLATED_SUBPROCESS", "true")
+    env.setdefault("DECIMER_ISOLATED_SUBPROCESS", "true")
+    completed = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    payload = _extract_json_object(completed.stdout)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+        message = detail[-1] if detail else f"文档处理子进程退出码 {completed.returncode}"
+        if payload and payload.get("message"):
+            message = str(payload["message"])
+        raise RuntimeError(message)
+    if not payload or not payload.get("result_path"):
+        raise RuntimeError("文档处理子进程未返回结果文件路径。")
+    result_path = Path(str(payload["result_path"]))
+    if not result_path.is_file():
+        raise RuntimeError(f"文档处理结果文件不存在：{result_path}")
+    return json.loads(result_path.read_text(encoding="utf-8"))
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Extract a JSON object from stdout that may also contain native-library logs."""
+    stripped = text.strip()
+    if not stripped:
+        return None
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(stripped):
+        if char != "{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(stripped[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
 
 
 def show_document_result(document_result: dict, backend: str) -> dict:
