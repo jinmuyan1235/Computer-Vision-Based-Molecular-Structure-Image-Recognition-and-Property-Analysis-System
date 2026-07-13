@@ -8,12 +8,14 @@ from typing import Any
 import streamlit as st
 from PIL import Image
 
+from config import OUTPUT_DIR
 from src.ui.streamlit_compat import image_stretch
 
 UPLOAD_PREVIEW_WIDTH = 600
 STRUCTURE_PREVIEW_WIDTH = 480
 PREPROCESS_PREVIEW_WIDTH = 260
 DOCUMENT_PREVIEW_WIDTH = 900
+DOCUMENT_PREVIEW_MAX_HEIGHT = 1400
 
 
 def show_upload_preview(image: Any, caption: str | None = None) -> None:
@@ -30,16 +32,27 @@ def show_preprocess_thumbnail(image_path: str | Path, caption: str) -> None:
 
 
 def show_document_page(image_path: str | Path, caption: str) -> None:
+    """Show a bounded document preview without passing large PIL objects to Streamlit."""
     path = Path(image_path)
     if not path.is_file():
         st.warning(f"预览图片不存在：{path}")
         return
+    preview_path = _document_preview_path(path)
     try:
-        with Image.open(path) as image:
-            preview = image.convert("RGB").copy()
+        if not preview_path.is_file() or preview_path.stat().st_mtime < path.stat().st_mtime:
+            with Image.open(path) as image:
+                preview = image.convert("RGB")
+                preview.thumbnail((DOCUMENT_PREVIEW_WIDTH, DOCUMENT_PREVIEW_MAX_HEIGHT))
+                preview.save(preview_path, format="PNG")
     except Exception as exc:
         st.warning(f"预览图片无法读取：{exc}")
         return
-    st.image(preview, caption=caption, width=DOCUMENT_PREVIEW_WIDTH)
+    st.image(str(preview_path), caption=caption, width=DOCUMENT_PREVIEW_WIDTH)
     with st.expander("查看大图"):
-        image_stretch(preview, caption=caption)
+        image_stretch(str(path), caption=caption)
+
+
+def _document_preview_path(path: Path) -> Path:
+    preview_dir = OUTPUT_DIR / "ui_previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    return preview_dir / f"{path.stem}_{path.stat().st_mtime_ns}_preview.png"

@@ -50,7 +50,7 @@ def render_document_page(backend: str) -> None:
                 progress_bar.progress(current / max(total, 1))
 
             with st.spinner("正在渲染页面并检测区域……"):
-                if run_ocsr and backend != "demo":
+                if backend != "demo":
                     st.session_state["document_result"] = _process_document_subprocess(temporary_path, backend, run_ocsr)
                 else:
                     st.session_state["document_result"] = get_document_processor(backend).process(
@@ -115,6 +115,70 @@ def _process_document_subprocess(input_path: Path, backend: str, run_ocsr: bool)
     if not result_path.is_file():
         raise RuntimeError(f"文档处理结果文件不存在：{result_path}")
     return json.loads(result_path.read_text(encoding="utf-8"))
+
+
+def _apply_document_edits_subprocess(
+    document_result: dict,
+    backend: str,
+    edits: list[dict],
+    rerun_ocsr: bool,
+) -> dict:
+    """Apply document edits outside Streamlit when a real backend may be involved."""
+    runtime = runtime_config_from_key(current_runtime_key())
+    output_dir = Path(document_result.get("output_dir") or tempfile.gettempdir()).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    current_path = output_dir / "document_result_for_edit.json"
+    current_path.write_text(json.dumps(document_result, ensure_ascii=False, indent=2), encoding="utf-8")
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / "process_document_edit.py"),
+        "--document-result",
+        str(current_path),
+        "--edits-json",
+        json.dumps(edits, ensure_ascii=False),
+        "--backend",
+        backend,
+    ]
+    if rerun_ocsr:
+        command.append("--rerun-ocsr")
+    if runtime.get("molscribe_device"):
+        command.extend(["--molscribe-device", str(runtime["molscribe_device"])])
+    if runtime.get("decimer_device"):
+        command.extend(["--decimer-device", str(runtime["decimer_device"])])
+    if runtime.get("visible_gpu_index") is not None:
+        command.extend(["--visible-gpu-index", str(runtime["visible_gpu_index"])])
+
+    env = os.environ.copy()
+    env.setdefault("MOLSCRIBE_ISOLATED_SUBPROCESS", "true")
+    env.setdefault("DECIMER_ISOLATED_SUBPROCESS", "true")
+    completed = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    payload = _extract_json_object(completed.stdout)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+        message = detail[-1] if detail else f"文档编辑子进程退出码 {completed.returncode}"
+        if payload and payload.get("message"):
+            message = str(payload["message"])
+        raise RuntimeError(message)
+    if not payload or not payload.get("result_path"):
+        raise RuntimeError("文档编辑子进程未返回结果文件路径。")
+    result_path = Path(str(payload["result_path"]))
+    if not result_path.is_file():
+        raise RuntimeError(f"文档编辑结果文件不存在：{result_path}")
+    return json.loads(result_path.read_text(encoding="utf-8"))
+
+
+def _apply_document_edits(document_result: dict, backend: str, edits: list[dict], rerun_ocsr: bool) -> dict:
+    if backend == "demo":
+        processor = get_document_processor(backend)
+        return processor.apply_edits(document_result, edits, rerun_ocsr=rerun_ocsr)
+    return _apply_document_edits_subprocess(document_result, backend, edits, rerun_ocsr)
 
 
 def _extract_json_object(text: str) -> dict | None:
@@ -187,7 +251,6 @@ def show_document_result(document_result: dict, backend: str) -> dict:
 
 def _region_editor(document_result: dict, backend: str) -> dict:
     active = [region for region in document_result.get("regions", []) if region.get("status") != "deleted"]
-    processor = get_document_processor(backend)
     if active:
         st.subheader("编辑检测区域")
         region_ids = [region["region_id"] for region in active]
@@ -211,29 +274,41 @@ def _region_editor(document_result: dict, backend: str) -> dict:
         )
         actions = st.columns(3)
         if actions[0].button("更新区域并重新识别", key=f"update_region_{selected_id}"):
-            document_result = processor.apply_edits(
-                document_result,
-                [{"action": "update", "region_id": selected_id, "bbox": [x1, y1, x2, y2], "region_type": region_type}],
-                rerun_ocsr=True,
-            )
-            st.session_state["document_result"] = document_result
-            st.success("区域已更新并重新处理。")
+            try:
+                document_result = _apply_document_edits(
+                    document_result,
+                    backend,
+                    [{"action": "update", "region_id": selected_id, "bbox": [x1, y1, x2, y2], "region_type": region_type}],
+                    rerun_ocsr=True,
+                )
+                st.session_state["document_result"] = document_result
+                st.success("区域已更新并重新处理。")
+            except RuntimeError as exc:
+                st.error(f"区域更新失败：{exc}")
         if actions[1].button("删除区域", key=f"delete_region_{selected_id}"):
-            document_result = processor.apply_edits(
-                document_result,
-                [{"action": "delete", "region_id": selected_id, "note": "用户在界面删除区域。"}],
-                rerun_ocsr=False,
-            )
-            st.session_state["document_result"] = document_result
-            st.warning("区域已删除。")
+            try:
+                document_result = _apply_document_edits(
+                    document_result,
+                    backend,
+                    [{"action": "delete", "region_id": selected_id, "note": "用户在界面删除区域。"}],
+                    rerun_ocsr=False,
+                )
+                st.session_state["document_result"] = document_result
+                st.warning("区域已删除。")
+            except RuntimeError as exc:
+                st.error(f"区域删除失败：{exc}")
         if actions[2].button("标记为非分子", key=f"mark_region_{selected_id}"):
-            document_result = processor.apply_edits(
-                document_result,
-                [{"action": "mark", "region_id": selected_id, "region_type": "non_molecule"}],
-                rerun_ocsr=False,
-            )
-            st.session_state["document_result"] = document_result
-            st.success("区域已标记为非分子。")
+            try:
+                document_result = _apply_document_edits(
+                    document_result,
+                    backend,
+                    [{"action": "mark", "region_id": selected_id, "region_type": "non_molecule"}],
+                    rerun_ocsr=False,
+                )
+                st.session_state["document_result"] = document_result
+                st.success("区域已标记为非分子。")
+            except RuntimeError as exc:
+                st.error(f"区域标记失败：{exc}")
 
     st.subheader("添加遗漏区域")
     page_numbers = [int(page["page_number"]) for page in document_result.get("pages", [])]
@@ -252,22 +327,37 @@ def _region_editor(document_result: dict, backend: str) -> dict:
             key="add_type",
         )
         if st.button("添加区域并识别", key="add_region"):
-            document_result = processor.apply_edits(
-                document_result,
-                [{"action": "add", "page_number": page_number, "bbox": [add_x1, add_y1, add_x2, add_y2], "region_type": add_type}],
-                rerun_ocsr=True,
-            )
-            st.session_state["document_result"] = document_result
-            st.success("区域已添加。")
+            try:
+                document_result = _apply_document_edits(
+                    document_result,
+                    backend,
+                    [{"action": "add", "page_number": page_number, "bbox": [add_x1, add_y1, add_x2, add_y2], "region_type": add_type}],
+                    rerun_ocsr=True,
+                )
+                st.session_state["document_result"] = document_result
+                st.success("区域已添加。")
+            except RuntimeError as exc:
+                st.error(f"区域添加失败：{exc}")
     return document_result
-
 
 def _download_panel(document_result: dict) -> None:
     exports = document_result.get("exports") or {}
-    with st.expander("结果导出", expanded=True):
-        if exports.get("json") and Path(exports["json"]).is_file():
-            st.download_button("下载文档分析结果", Path(exports["json"]).read_bytes(), "document_result.json", "application/json")
-        if exports.get("regions_csv") and Path(exports["regions_csv"]).is_file():
-            st.download_button("下载区域结果表", Path(exports["regions_csv"]).read_bytes(), "regions.csv", "text/csv")
-        if exports.get("zip") and Path(exports["zip"]).is_file():
-            st.download_button("下载完整结果包", Path(exports["zip"]).read_bytes(), "document_results.zip", "application/zip")
+    with st.expander("结果导出", expanded=False):
+        json_path = Path(exports.get("json") or "")
+        csv_path = Path(exports.get("regions_csv") or "")
+        zip_path = Path(exports.get("zip") or "")
+        if json_path.is_file():
+            st.download_button("下载文档分析结果", json_path.read_bytes(), "document_result.json", "application/json")
+        if csv_path.is_file():
+            st.download_button("下载区域结果表", csv_path.read_bytes(), "regions.csv", "text/csv")
+        if zip_path.is_file():
+            st.caption(f"完整结果包已生成：{zip_path.name}（{zip_path.stat().st_size / 1024 / 1024:.2f} MB）")
+            if st.button("准备完整结果包下载", key="prepare_document_zip_download"):
+                st.session_state["document_zip_download_bytes"] = zip_path.read_bytes()
+            if st.session_state.get("document_zip_download_bytes") is not None:
+                st.download_button(
+                    "下载完整结果包",
+                    st.session_state["document_zip_download_bytes"],
+                    "document_results.zip",
+                    "application/zip",
+                )
