@@ -302,9 +302,18 @@ def show_document_result(document_result: dict, backend: str) -> dict:
             "screening_reason",
         ]
         display_rows = [{key: row.get(key) for key in important} for row in rows]
-        render_records(localize_region_rows(display_rows), title_keys=("区域 ID", "页码"))
+        render_records(
+            localize_region_rows(display_rows),
+            title_keys=("区域 ID",),
+            summary_keys=("页码", "区域类型", "状态", "最终 SMILES", "推理耗时(ms)"),
+        )
         if st.checkbox("显示完整字段", value=False, key="show_document_full_table"):
-            render_records(localize_region_rows(rows), title_keys=("区域 ID", "页码"), max_records=100)
+            render_records(
+                localize_region_rows(rows),
+                title_keys=("区域 ID",),
+                summary_keys=("页码", "区域类型", "状态", "说明", "最终 SMILES"),
+                max_records=100,
+            )
 
     if st.checkbox("显示区域编辑工具", value=False, key="show_document_region_editor"):
         document_result = _region_editor(document_result, backend)

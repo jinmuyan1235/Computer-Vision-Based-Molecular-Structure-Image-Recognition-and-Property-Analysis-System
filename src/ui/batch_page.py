@@ -73,9 +73,19 @@ def render_batch_page(backend: str) -> None:
 
     rows = batch_result["rows"]
     default_rows = [{key: row.get(key) for key in DEFAULT_COLUMNS} for row in rows]
-    render_records(localize_batch_rows(default_rows), title_keys=("文件名",), max_records=50)
+    render_records(
+        localize_batch_rows(default_rows),
+        title_keys=("文件名",),
+        summary_keys=("状态", "识别后端", "最终 SMILES", "是否有效", "推理耗时(ms)"),
+        max_records=50,
+    )
     if st.checkbox("查看完整字段", value=False, key="show_batch_full_fields"):
-        render_records(localize_batch_rows(rows), title_keys=("文件名",), max_records=100)
+        render_records(
+            localize_batch_rows(rows),
+            title_keys=("文件名",),
+            summary_keys=("状态", "识别后端", "最终 SMILES", "失败原因"),
+            max_records=100,
+        )
 
     chart = batch_result["exports"]["summary_chart"]
     if Path(chart).is_file():
