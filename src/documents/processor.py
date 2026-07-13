@@ -35,12 +35,17 @@ class DocumentOCSRProcessor:
         output_dir: str | Path = config.DOCUMENT_OUTPUT_DIR,
         detector: BaseMoleculeRegionDetector | None = None,
         loader: DocumentInputLoader | None = None,
+        runtime_config: dict[str, Any] | None = None,
     ) -> None:
         self.output_dir = ensure_directory(output_dir)
         self.backend = backend
         self.detector = detector or HeuristicMoleculeRegionDetector()
         self.loader = loader or DocumentInputLoader(self.output_dir)
-        self.report_generator = MoleculeReportGenerator(backend=backend, output_dir=self.output_dir)
+        self.report_generator = MoleculeReportGenerator(
+            backend=backend,
+            output_dir=self.output_dir,
+            runtime_config=runtime_config,
+        )
 
     def process(
         self,
@@ -238,10 +243,15 @@ class DocumentOCSRProcessor:
         binary = self.detector._foreground_binary(crop) if isinstance(self.detector, HeuristicMoleculeRegionDetector) else None
         component_count = 0
         significant_components = 0
+        small_component_ratio = 0.0
+        text_line_count = 0
         if binary is not None:
             count, _, stats, _ = cv2.connectedComponentsWithStats((binary > 0).astype(np.uint8), 8)
             component_count = max(count - 1, 0)
-            significant_components = sum(1 for index in range(1, count) if int(stats[index, cv2.CC_STAT_AREA]) >= 6)
+            component_areas = [int(stats[index, cv2.CC_STAT_AREA]) for index in range(1, count)]
+            significant_components = sum(1 for area in component_areas if area >= 6)
+            small_component_ratio = HeuristicMoleculeRegionDetector._small_component_ratio(component_areas)
+            text_line_count = HeuristicMoleculeRegionDetector._text_line_count(binary)
         base = {
             "passed": True,
             "width": width,
@@ -250,6 +260,8 @@ class DocumentOCSRProcessor:
             "ink_ratio": round(ink_ratio, 5),
             "component_count": component_count,
             "significant_component_count": significant_components,
+            "small_component_ratio": round(small_component_ratio, 3),
+            "text_line_count": text_line_count,
         }
         if ink_ratio < 0.006:
             base.update({"passed": False, "reason": "区域前景过少，疑似空白，已跳过识别。"})
@@ -259,6 +271,15 @@ class DocumentOCSRProcessor:
             return False, base
         if (height < 90 and aspect > 1.8 and significant_components >= 2) or (aspect > 4.5 and height < 150):
             base.update({"passed": False, "reason": "区域形态像单行文字标签，已跳过识别。"})
+            return False, base
+        if text_line_count >= 5 and significant_components >= 22 and ink_ratio < 0.30:
+            base.update({"passed": False, "reason": "区域疑似多行正文，已跳过识别。"})
+            return False, base
+        if text_line_count >= 4 and significant_components >= 18 and aspect > 0.75 and ink_ratio < 0.30:
+            base.update({"passed": False, "reason": "区域文字密度较高，已跳过识别。"})
+            return False, base
+        if significant_components >= 35 and small_component_ratio > 0.72 and ink_ratio < 0.26:
+            base.update({"passed": False, "reason": "区域由大量小字符连通组件组成，已跳过识别。"})
             return False, base
         if significant_components >= 12 and aspect > 1.4 and height < 240 and ink_ratio < 0.22:
             base.update({"passed": False, "reason": "区域疑似正文文本，已跳过识别。"})

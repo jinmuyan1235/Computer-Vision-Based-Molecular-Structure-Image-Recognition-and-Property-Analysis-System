@@ -86,9 +86,14 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
 class BatchAnalyzer:
     """Analyze all supported images in a folder without stopping on bad files."""
 
-    def __init__(self, backend: str | None = None, output_dir: str | Path = OUTPUT_DIR) -> None:
+    def __init__(
+        self,
+        backend: str | None = None,
+        output_dir: str | Path = OUTPUT_DIR,
+        runtime_config: dict[str, Any] | None = None,
+    ) -> None:
         self.output_dir = ensure_directory(output_dir)
-        self.generator = MoleculeReportGenerator(backend=backend, output_dir=self.output_dir)
+        self.generator = MoleculeReportGenerator(backend=backend, output_dir=self.output_dir, runtime_config=runtime_config)
 
     def analyze_folder(self, input_dir: str | Path) -> dict[str, Any]:
         """Process a folder, export CSV/JSON, and return results plus statistics."""

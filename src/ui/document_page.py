@@ -13,6 +13,7 @@ from src.documents.processor import DocumentOCSRProcessor
 from src.ui.image_viewer import show_document_page
 from src.ui.labels import REGION_TYPE_LABELS, localize_region_rows
 from src.ui.state import get_document_processor, remember_backend_status
+from src.ui.streamlit_compat import dataframe_stretch
 from src.ui.styles import page_intro
 
 
@@ -101,9 +102,9 @@ def show_document_result(document_result: dict, backend: str) -> dict:
             "screening_reason",
         ]
         display_rows = [{key: row.get(key) for key in important} for row in rows]
-        st.dataframe(pd.DataFrame(localize_region_rows(display_rows)), hide_index=True, use_container_width=True)
+        dataframe_stretch(pd.DataFrame(localize_region_rows(display_rows)), hide_index=True)
         with st.expander("查看完整字段", expanded=False):
-            st.dataframe(pd.DataFrame(localize_region_rows(rows)), hide_index=True, use_container_width=True)
+            dataframe_stretch(pd.DataFrame(localize_region_rows(rows)), hide_index=True)
     else:
         st.info("未检测到分子候选区域。可以在下方手动添加区域。")
 

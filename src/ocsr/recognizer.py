@@ -23,18 +23,32 @@ class MoleculeRecognizer:
         "ensemble": EnsembleOCSRAdapter,
     }
 
-    def __init__(self, backend: str | None = None) -> None:
+    def __init__(self, backend: str | None = None, runtime_config: dict[str, Any] | None = None) -> None:
         self.backend = (backend or config.OCSR_BACKEND).strip().lower()
         if self.backend not in self.ADAPTERS:
-            raise ValueError(f"不支持的 OCSR 后端：{self.backend}。可选值：demo/molscribe/decimer/ensemble。")
-        self.adapter = self.ADAPTERS[self.backend]()
+            raise ValueError(f"Unsupported OCSR backend: {self.backend}. Choose demo/molscribe/decimer/ensemble.")
+        self.runtime_config = runtime_config or {}
+        self.adapter = self._build_adapter()
+
+    def _build_adapter(self) -> BaseOCSRAdapter:
+        adapter_class = self.ADAPTERS[self.backend]
+        if self.backend == "molscribe" and adapter_class is MolScribeAdapter:
+            return MolScribeAdapter(device=self.runtime_config.get("molscribe_device"))
+        if self.backend == "decimer" and adapter_class is DECIMERAdapter:
+            return DECIMERAdapter(
+                device=self.runtime_config.get("decimer_device"),
+                visible_gpu_index=self.runtime_config.get("visible_gpu_index"),
+            )
+        if self.backend == "ensemble" and adapter_class is EnsembleOCSRAdapter:
+            return EnsembleOCSRAdapter(runtime_config=self.runtime_config)
+        return adapter_class()
 
     def recognize(self, image_path_or_array: Any) -> OCSRResult:
         """Recognize an image and convert unexpected exceptions to failed results."""
         try:
             return self.adapter.recognize(image_path_or_array)
         except Exception as exc:
-            return OCSRResult(None, None, self.backend, "failed", f"OCSR 识别发生未预期错误：{exc}")
+            return OCSRResult(None, None, self.backend, "failed", f"OCSR 未预期错误：{exc}")
 
     def status(self) -> dict[str, Any]:
         """Return readiness information for the selected adapter."""
