@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-import pandas as pd
 import streamlit as st
 
 import config
@@ -20,6 +19,7 @@ from src.documents.input_loader import DocumentInputError, OptionalDependencyErr
 from src.documents.processor import DocumentOCSRProcessor
 from src.ui.image_viewer import show_document_page
 from src.ui.labels import REGION_TYPE_LABELS, localize_region_rows
+from src.ui.records import render_records
 from src.ui.state import current_runtime_key, get_document_processor, remember_backend_status, runtime_config_from_key
 from src.ui.styles import page_intro
 
@@ -302,9 +302,9 @@ def show_document_result(document_result: dict, backend: str) -> dict:
             "screening_reason",
         ]
         display_rows = [{key: row.get(key) for key in important} for row in rows]
-        st.table(pd.DataFrame(localize_region_rows(display_rows)))
+        render_records(localize_region_rows(display_rows), title_keys=("区域 ID", "页码"))
         if st.checkbox("显示完整字段", value=False, key="show_document_full_table"):
-            st.table(pd.DataFrame(localize_region_rows(rows)))
+            render_records(localize_region_rows(rows), title_keys=("区域 ID", "页码"), max_records=100)
 
     if st.checkbox("显示区域编辑工具", value=False, key="show_document_region_editor"):
         document_result = _region_editor(document_result, backend)
