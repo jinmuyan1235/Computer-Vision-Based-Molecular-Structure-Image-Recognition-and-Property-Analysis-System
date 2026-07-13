@@ -28,6 +28,7 @@ def render_records(
     records: list[dict[str, Any]],
     *,
     title_keys: Iterable[str] = (),
+    summary_keys: Iterable[str] = (),
     max_records: int = 50,
 ) -> None:
     """Render a list of records without pandas, pyarrow, st.table or st.dataframe."""
@@ -36,11 +37,15 @@ def render_records(
 
     visible_records = records[:max_records]
     for index, record in enumerate(visible_records, start=1):
-        st.markdown(f"**{_record_title(record, title_keys, index)}**")
-        for key, value in record.items():
-            st.text(f"{key}: {_format_value(value)}")
-        if index != len(visible_records):
-            st.markdown("---")
+        title = _record_title(record, title_keys, index)
+        keys = [key for key in summary_keys if key in record]
+        if not keys:
+            keys = [key for key in record if key not in set(title_keys)][:4]
+        summary = " ｜ ".join(f"**{key}**：{_format_value(record.get(key))}" for key in keys)
+        st.markdown(f"**{title}**  \n{summary}")
+        with st.expander("查看详情", expanded=False):
+            for key, value in record.items():
+                st.text(f"{key}: {_format_value(value)}")
 
     remaining = len(records) - len(visible_records)
     if remaining > 0:

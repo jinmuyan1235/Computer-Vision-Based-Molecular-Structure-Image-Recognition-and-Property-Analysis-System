@@ -245,6 +245,9 @@ class DocumentOCSRProcessor:
         significant_components = 0
         small_component_ratio = 0.0
         text_line_count = 0
+        long_line_count = 0
+        horizontal_projection = 0.0
+        vertical_projection = 0.0
         if binary is not None:
             count, _, stats, _ = cv2.connectedComponentsWithStats((binary > 0).astype(np.uint8), 8)
             component_count = max(count - 1, 0)
@@ -252,6 +255,17 @@ class DocumentOCSRProcessor:
             significant_components = sum(1 for area in component_areas if area >= 6)
             small_component_ratio = HeuristicMoleculeRegionDetector._small_component_ratio(component_areas)
             text_line_count = HeuristicMoleculeRegionDetector._text_line_count(binary)
+            _, long_line_count = HeuristicMoleculeRegionDetector._line_segment_counts(binary)
+            horizontal_projection = float(np.max(np.sum(binary > 0, axis=1)) / max(width, 1))
+            vertical_projection = float(np.max(np.sum(binary > 0, axis=0)) / max(height, 1))
+        skeletal_linework = (
+            long_line_count >= 8
+            and significant_components <= 55
+            and ink_ratio < 0.12
+            and small_component_ratio < 0.35
+            and horizontal_projection < 0.55
+            and vertical_projection < 0.55
+        )
         base = {
             "passed": True,
             "width": width,
@@ -262,6 +276,8 @@ class DocumentOCSRProcessor:
             "significant_component_count": significant_components,
             "small_component_ratio": round(small_component_ratio, 3),
             "text_line_count": text_line_count,
+            "long_line_count": long_line_count,
+            "skeletal_linework": skeletal_linework,
         }
         if ink_ratio < 0.006:
             base.update({"passed": False, "reason": "区域前景过少，疑似空白，已跳过识别。"})
@@ -272,10 +288,10 @@ class DocumentOCSRProcessor:
         if (height < 90 and aspect > 1.8 and significant_components >= 2) or (aspect > 4.5 and height < 150):
             base.update({"passed": False, "reason": "区域形态像单行文字标签，已跳过识别。"})
             return False, base
-        if text_line_count >= 5 and significant_components >= 22 and ink_ratio < 0.30:
+        if not skeletal_linework and text_line_count >= 5 and significant_components >= 22 and ink_ratio < 0.30:
             base.update({"passed": False, "reason": "区域疑似多行正文，已跳过识别。"})
             return False, base
-        if text_line_count >= 4 and significant_components >= 18 and aspect > 0.75 and ink_ratio < 0.30:
+        if not skeletal_linework and text_line_count >= 4 and significant_components >= 18 and aspect > 0.75 and ink_ratio < 0.30:
             base.update({"passed": False, "reason": "区域文字密度较高，已跳过识别。"})
             return False, base
         if significant_components >= 35 and small_component_ratio > 0.72 and ink_ratio < 0.26:

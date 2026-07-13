@@ -189,6 +189,15 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         horizontal_projection = np.max(np.sum(crop > 0, axis=1)) / max(width, 1)
         vertical_projection = np.max(np.sum(crop > 0, axis=0)) / max(height, 1)
         page_area_ratio = area / max(page_width * page_height, 1)
+        _, long_line_count = self._line_segment_counts(crop)
+        skeletal_linework = (
+            long_line_count >= 8
+            and len(significant_components) <= 55
+            and ink_ratio < 0.12
+            and small_component_ratio < 0.35
+            and horizontal_projection < 0.55
+            and vertical_projection < 0.55
+        )
 
         if ink_ratio < 0.006:
             return "unknown", 0.05, "Sparse or blank region; not treated as a molecule."
@@ -207,6 +216,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             text_line_count,
             page_area_ratio,
             small_component_ratio,
+            skeletal_linework,
         ):
             return "text", 0.68, "Text-like compact components; not treated as a molecule."
 
@@ -217,6 +227,8 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             confidence += 0.15
         if len(significant_components) >= 3:
             confidence += 0.15
+        if skeletal_linework:
+            confidence += 0.16
         if 0.25 <= aspect <= 4.5:
             confidence += 0.12
         if 0.003 <= page_area_ratio <= 0.55:
@@ -272,7 +284,10 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         text_line_count: int = 0,
         page_area_ratio: float = 0.0,
         small_component_ratio: float = 0.0,
+        skeletal_linework: bool = False,
     ) -> bool:
+        if skeletal_linework:
+            return False
         if text_line_count >= 5 and len(significant_components) >= 22 and ink_ratio < 0.30:
             return True
         if page_area_ratio > 0.035 and text_line_count >= 4 and len(significant_components) >= 18 and aspect > 0.75:
@@ -318,6 +333,32 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             return 0.0
         small = sum(1 for area in component_areas if 6 <= area <= 80)
         return small / max(len(component_areas), 1)
+
+    @staticmethod
+    def _line_segment_counts(crop: np.ndarray) -> tuple[int, int]:
+        """Estimate structural linework without treating text strokes as molecule evidence."""
+        if crop.size == 0:
+            return 0, 0
+        height, width = crop.shape[:2]
+        lines = cv2.HoughLinesP(
+            crop,
+            1,
+            np.pi / 180,
+            threshold=25,
+            minLineLength=max(22, min(width, height) // 12),
+            maxLineGap=5,
+        )
+        if lines is None:
+            return 0, 0
+        total = 0
+        long_segments = 0
+        for line in lines.reshape(-1, 4):
+            x1, y1, x2, y2 = [int(value) for value in line]
+            length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+            total += 1
+            if length >= max(32, min(width, height) * 0.10):
+                long_segments += 1
+        return total, long_segments
 
     @staticmethod
     def _looks_like_table(crop: np.ndarray, aspect: float, horizontal_projection: float, vertical_projection: float) -> bool:

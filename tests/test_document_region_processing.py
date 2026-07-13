@@ -238,6 +238,51 @@ def test_multi_molecule_page_and_text_not_molecule(tmp_path: Path) -> None:
     assert text_regions
 
 
+def test_complex_linework_is_not_filtered_as_text() -> None:
+    assert HeuristicMoleculeRegionDetector._looks_like_text(
+        width=480,
+        height=300,
+        aspect=1.6,
+        ink_ratio=0.055,
+        significant_components=[20] * 22,
+        text_line_count=5,
+        page_area_ratio=0.08,
+        small_component_ratio=0.06,
+        skeletal_linework=True,
+    ) is False
+    assert HeuristicMoleculeRegionDetector._looks_like_text(
+        width=480,
+        height=300,
+        aspect=1.6,
+        ink_ratio=0.055,
+        significant_components=[20] * 22,
+        text_line_count=5,
+        page_area_ratio=0.08,
+        small_component_ratio=0.06,
+        skeletal_linework=False,
+    ) is True
+
+
+def test_complex_molecule_page_keeps_text_and_structure_separate(tmp_path: Path) -> None:
+    page_image = Image.new("RGB", (1000, 850), "white")
+    draw = ImageDraw.Draw(page_image)
+    lines = [
+        "Rivaroxaban prevents thromboembolism during surgical operations.",
+        "The methods are simple and accurate and do not require equipment.",
+    ]
+    for index, line in enumerate(lines * 6):
+        draw.text((40, 20 + index * 28), line, fill="black")
+    caffeine = Image.open(PROJECT_ROOT / "data" / "samples" / "caffeine.png").convert("RGB").resize((420, 300))
+    page_image.paste(caffeine, (460, 430))
+    page_path = tmp_path / "complex_molecule_with_text.png"
+    page_image.save(page_path)
+
+    regions = HeuristicMoleculeRegionDetector().detect(DocumentPage("doc", 1, str(page_path), 1000, 850))
+
+    assert any(region.region_type == "text" for region in regions)
+    assert any(region.region_type == "molecule" and region.bbox[0] > 400 for region in regions)
+
+
 def test_no_molecule_page_does_not_emit_molecule_regions(tmp_path: Path) -> None:
     page_path = _make_page(tmp_path / "text_only.png", [], text="This page contains text but no structure")
     page = DocumentPage("doc", 1, str(page_path), 900, 600)
