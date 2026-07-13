@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -83,6 +84,21 @@ def gpu_selection_options() -> list[dict[str, Any]]:
             "visible_gpu_index": str(index),
         })
     return options
+
+
+def default_gpu_selection(options: list[dict[str, Any]] | None = None) -> str:
+    """Return the UI default from environment variables and detected GPU options."""
+    choices = options or gpu_selection_options()
+    values = {str(option["value"]) for option in choices}
+    requested = (os.getenv("OCSR_DEVICE") or "").strip().lower()
+    decimer_requested = (os.getenv("DECIMER_DEVICE") or "").strip().lower()
+    if requested in values:
+        return requested
+    if requested == "cuda" and "cuda:0" in values:
+        return "cuda:0"
+    if decimer_requested == "gpu" and "cuda:0" in values:
+        return "cuda:0"
+    return "auto" if "auto" in values else next(iter(values), "auto")
 
 
 def torch_status(run_matrix_test: bool = False) -> dict[str, Any]:

@@ -21,7 +21,6 @@ from PIL import Image
 import config
 from src.chem.smiles_validator import validate_smiles
 from src.runtime.cuda_env import nvidia_library_paths
-from src.runtime.gpu_manager import torch_status
 from src.runtime.inference_scheduler import GLOBAL_INFERENCE_SCHEDULER
 from .base import BaseOCSRAdapter, OCSRResult
 
@@ -457,15 +456,21 @@ print("MOLSCRIBE_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
             "strict_mode": self.strict_mode,
             "isolated_subprocess": self.isolated_subprocess,
             "last_inference_time_ms": self.last_inference_time_ms,
-            "torch": torch_status(run_matrix_test=False),
+            "torch": {
+                "installed": importlib.util.find_spec("torch") is not None,
+                "cuda_available": None,
+                "note": "UI 状态页不导入 PyTorch；请用 scripts/verify_gpu_environment.py 验证 CUDA。",
+            },
         }
 
     def diagnose(self, load_model: bool = False) -> dict[str, Any]:
         """Return detailed diagnostics, optionally attempting model construction."""
         diagnostics = self.status()
         try:
+            from src.runtime.gpu_manager import torch_status
             import torch
 
+            diagnostics["torch"] = torch_status(run_matrix_test=False)
             diagnostics["cuda_available"] = bool(torch.cuda.is_available())
         except Exception as exc:
             diagnostics["cuda_available"] = False

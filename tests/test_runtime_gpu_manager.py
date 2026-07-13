@@ -1,6 +1,13 @@
 """Runtime GPU diagnostics should report real status without faking success."""
 
-from src.runtime.gpu_manager import environment_status, gpu_selection_options, nvidia_smi_status, tensorflow_status, torch_status
+from src.runtime.gpu_manager import (
+    default_gpu_selection,
+    environment_status,
+    gpu_selection_options,
+    nvidia_smi_status,
+    tensorflow_status,
+    torch_status,
+)
 from src.runtime.inference_scheduler import InferenceScheduler
 
 
@@ -34,6 +41,17 @@ def test_gpu_selection_options_include_cpu_auto_and_detected_gpus(monkeypatch) -
     assert by_value["cuda:1"]["molscribe_device"] == "cuda:1"
     assert by_value["cuda:1"]["decimer_device"] == "gpu"
     assert by_value["cuda:1"]["visible_gpu_index"] == "1"
+
+
+def test_default_gpu_selection_prefers_env_cuda(monkeypatch) -> None:
+    options = [
+        {"value": "auto"},
+        {"value": "cpu"},
+        {"value": "cuda:0"},
+    ]
+    monkeypatch.setenv("OCSR_DEVICE", "cuda:0")
+    monkeypatch.setenv("DECIMER_DEVICE", "gpu")
+    assert default_gpu_selection(options) == "cuda:0"
 
 
 def test_inference_scheduler_limits_gpu_slots() -> None:

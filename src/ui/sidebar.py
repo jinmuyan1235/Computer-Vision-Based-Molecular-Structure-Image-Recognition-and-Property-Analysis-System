@@ -7,7 +7,7 @@ from typing import Any
 import streamlit as st
 
 import config
-from src.runtime.gpu_manager import gpu_selection_options
+from src.runtime.gpu_manager import default_gpu_selection, gpu_selection_options
 from src.ui.labels import (
     BACKEND_DESCRIPTIONS,
     backend_label,
@@ -15,7 +15,17 @@ from src.ui.labels import (
     runnable_backends,
     unavailable_backends,
 )
-from src.ui.state import get_backend_statuses, merged_backend_status
+from src.ui.state import current_runtime_key, get_backend_statuses, merged_backend_status, runtime_config_from_key
+
+
+def _query_gpu_selection() -> str | None:
+    try:
+        value = st.query_params.get("gpu_device")
+    except Exception:
+        return None
+    if isinstance(value, list):
+        return str(value[0]) if value else None
+    return str(value) if value else None
 
 
 def render_sidebar() -> tuple[str, bool, bool]:
@@ -25,15 +35,26 @@ def render_sidebar() -> tuple[str, bool, bool]:
         gpu_options = gpu_selection_options()
         gpu_values = [option["value"] for option in gpu_options]
         gpu_labels = {option["value"]: option["label"] for option in gpu_options}
-        current_gpu = st.session_state.get("gpu_device_selection", "auto")
+        current_gpu = st.session_state.get("gpu_device_selection") or _query_gpu_selection() or default_gpu_selection(gpu_options)
         if current_gpu not in gpu_values:
-            current_gpu = "auto"
-        st.selectbox(
+            current_gpu = default_gpu_selection(gpu_options)
+        selected_gpu = st.selectbox(
             "本机推理设备",
             gpu_values,
             index=gpu_values.index(current_gpu),
             format_func=lambda value: gpu_labels.get(value, value),
             key="gpu_device_selection",
+        )
+        try:
+            st.query_params["gpu_device"] = selected_gpu
+        except Exception:
+            pass
+        runtime = runtime_config_from_key(current_runtime_key())
+        st.caption(
+            "实际传入："
+            f"MolScribe={runtime.get('molscribe_device')}，"
+            f"DECIMER={runtime.get('decimer_device')}，"
+            f"GPU索引={runtime.get('visible_gpu_index') or '自动/未指定'}"
         )
         if st.session_state.get("gpu_device_selection") not in {"auto", "cpu"}:
             st.caption("DECIMER/TensorFlow 已加载后再切换 GPU，建议重启 Streamlit 以确保显存绑定生效。")
