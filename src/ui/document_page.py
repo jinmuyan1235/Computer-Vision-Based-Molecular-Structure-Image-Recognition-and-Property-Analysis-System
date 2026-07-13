@@ -21,7 +21,6 @@ from src.documents.processor import DocumentOCSRProcessor
 from src.ui.image_viewer import show_document_page
 from src.ui.labels import REGION_TYPE_LABELS, localize_region_rows
 from src.ui.state import current_runtime_key, get_document_processor, remember_backend_status, runtime_config_from_key
-from src.ui.streamlit_compat import dataframe_stretch
 from src.ui.styles import page_intro
 
 PROCESS_MODE_DETECT = "仅检测分子区域（速度快，不执行结构识别）"
@@ -151,6 +150,7 @@ def _render_document_job_status() -> None:
     return_code = process.poll()
     if return_code is None:
         st.info(f"文档处理正在后台运行，已耗时 {elapsed:.1f} 秒。页面会自动刷新，期间不会阻塞 Streamlit。")
+        st.caption(f"后台日志：{job.get('stdout_path')} / {job.get('stderr_path')}")
         st.progress(min(elapsed / 120.0, 0.95))
         time.sleep(2)
         st.rerun()
@@ -180,7 +180,10 @@ def _render_document_job_status() -> None:
         st.error(f"文档处理结果文件不存在：{result_path}")
         return
     st.session_state["document_result"] = json.loads(result_path.read_text(encoding="utf-8"))
-    remember_backend_status(str(job.get("backend") or ""))
+    st.session_state["document_job_logs"] = {
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+    }
     st.success("文档处理完成。")
     st.rerun()
 
@@ -274,7 +277,7 @@ def show_document_result(document_result: dict, backend: str) -> dict:
             st.json(document_result.get("detection_errors"))
 
     annotated = [item for item in (document_result.get("exports", {}).get("annotated_pages") or "").split(",") if item]
-    if annotated:
+    if annotated and st.checkbox("显示区域标注预览", value=False, key="show_document_annotation_preview"):
         st.subheader("区域标注预览")
         page_names = [Path(path).name for path in annotated]
         selected_name = st.selectbox("选择页码", page_names, key="annotated_page_select")
@@ -282,7 +285,9 @@ def show_document_result(document_result: dict, backend: str) -> dict:
         show_document_page(selected_path, selected_name)
 
     rows = DocumentOCSRProcessor.region_rows(document_result)
-    if rows:
+    if not rows:
+        st.info("未检测到分子候选区域。可以在下方手动添加区域。")
+    elif st.checkbox("显示区域结果表", value=False, key="show_document_region_table"):
         important = [
             "page_number",
             "region_id",
@@ -297,14 +302,19 @@ def show_document_result(document_result: dict, backend: str) -> dict:
             "screening_reason",
         ]
         display_rows = [{key: row.get(key) for key in important} for row in rows]
-        dataframe_stretch(pd.DataFrame(localize_region_rows(display_rows)), hide_index=True)
-        with st.expander("查看完整字段", expanded=False):
-            dataframe_stretch(pd.DataFrame(localize_region_rows(rows)), hide_index=True)
-    else:
-        st.info("未检测到分子候选区域。可以在下方手动添加区域。")
+        st.table(pd.DataFrame(localize_region_rows(display_rows)))
+        if st.checkbox("显示完整字段", value=False, key="show_document_full_table"):
+            st.table(pd.DataFrame(localize_region_rows(rows)))
 
-    document_result = _region_editor(document_result, backend)
-    _download_panel(document_result)
+    if st.checkbox("显示区域编辑工具", value=False, key="show_document_region_editor"):
+        document_result = _region_editor(document_result, backend)
+
+    logs = st.session_state.get("document_job_logs") or {}
+    if logs:
+        st.caption(f"最近一次后台日志：{logs.get('stdout_path')} / {logs.get('stderr_path')}")
+
+    if st.checkbox("显示结果导出", value=False, key="show_document_downloads"):
+        _download_panel(document_result)
     return document_result
 
 
@@ -402,22 +412,22 @@ def _region_editor(document_result: dict, backend: str) -> dict:
 
 def _download_panel(document_result: dict) -> None:
     exports = document_result.get("exports") or {}
-    with st.expander("结果导出", expanded=False):
-        json_path = Path(exports.get("json") or "")
-        csv_path = Path(exports.get("regions_csv") or "")
-        zip_path = Path(exports.get("zip") or "")
-        if json_path.is_file():
-            st.download_button("下载文档分析结果", json_path.read_bytes(), "document_result.json", "application/json")
-        if csv_path.is_file():
-            st.download_button("下载区域结果表", csv_path.read_bytes(), "regions.csv", "text/csv")
-        if zip_path.is_file():
-            st.caption(f"完整结果包已生成：{zip_path.name}（{zip_path.stat().st_size / 1024 / 1024:.2f} MB）")
-            if st.button("准备完整结果包下载", key="prepare_document_zip_download"):
-                st.session_state["document_zip_download_bytes"] = zip_path.read_bytes()
-            if st.session_state.get("document_zip_download_bytes") is not None:
-                st.download_button(
-                    "下载完整结果包",
-                    st.session_state["document_zip_download_bytes"],
-                    "document_results.zip",
-                    "application/zip",
-                )
+    st.subheader("结果导出")
+    json_path = Path(exports.get("json") or "")
+    csv_path = Path(exports.get("regions_csv") or "")
+    zip_path = Path(exports.get("zip") or "")
+    if json_path.is_file():
+        st.download_button("下载文档分析结果", json_path.read_bytes(), "document_result.json", "application/json")
+    if csv_path.is_file():
+        st.download_button("下载区域结果表", csv_path.read_bytes(), "regions.csv", "text/csv")
+    if zip_path.is_file():
+        st.caption(f"完整结果包已生成：{zip_path.name}（{zip_path.stat().st_size / 1024 / 1024:.2f} MB）")
+        if st.button("准备完整结果包下载", key="prepare_document_zip_download"):
+            st.session_state["document_zip_download_bytes"] = zip_path.read_bytes()
+        if st.session_state.get("document_zip_download_bytes") is not None:
+            st.download_button(
+                "下载完整结果包",
+                st.session_state["document_zip_download_bytes"],
+                "document_results.zip",
+                "application/zip",
+            )
