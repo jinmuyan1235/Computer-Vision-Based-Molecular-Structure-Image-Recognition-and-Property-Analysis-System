@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import streamlit as st
 
 from config import OUTPUT_DIR
@@ -19,7 +18,7 @@ from src.export.json_exporter import to_json_text
 from src.export.pdf_exporter import save_pdf
 from src.ui.image_viewer import show_preprocess_thumbnail, show_structure
 from src.ui.labels import backend_label, status_label
-from src.ui.streamlit_compat import dataframe_stretch
+from src.ui.records import render_records
 
 
 def show_ensemble_details(ocsr: dict[str, Any]) -> None:
@@ -48,7 +47,7 @@ def show_ensemble_details(ocsr: dict[str, Any]) -> None:
                     "耗时(ms)": candidate.get("inference_time_ms"),
                     "错误": candidate.get("error"),
                 })
-            dataframe_stretch(pd.DataFrame(rows), hide_index=True)
+            render_records(rows, title_keys=("后端",))
 
 
 def show_chemical_identity(report: dict[str, Any]) -> None:
@@ -69,7 +68,8 @@ def show_chemical_identity(report: dict[str, Any]) -> None:
             f"是否改变：{'是' if standardization.get('changed') else '否'}。"
         )
         if warnings:
-            dataframe_stretch(pd.DataFrame(warnings), hide_index=True)
+            normalized_warnings = [item if isinstance(item, dict) else {"提示": item} for item in warnings]
+            render_records(normalized_warnings, title_keys=("type", "提示"))
 
 
 def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bool, key_prefix: str) -> None:

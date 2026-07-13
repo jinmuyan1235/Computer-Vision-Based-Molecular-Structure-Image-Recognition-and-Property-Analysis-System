@@ -9,18 +9,17 @@ import sys
 import tempfile
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 
 from src.export.json_exporter import to_json_text
 from src.ui.labels import BATCH_COLUMN_LABELS, localize_batch_rows
+from src.ui.records import render_records
 from src.ui.state import (
     current_runtime_key,
     get_batch_analyzer,
     remember_backend_status,
     runtime_config_from_key,
 )
-from src.ui.streamlit_compat import dataframe_stretch
 from src.ui.styles import page_intro
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -74,9 +73,9 @@ def render_batch_page(backend: str) -> None:
 
     rows = batch_result["rows"]
     default_rows = [{key: row.get(key) for key in DEFAULT_COLUMNS} for row in rows]
-    dataframe_stretch(pd.DataFrame(localize_batch_rows(default_rows)), hide_index=True)
-    with st.expander("查看完整字段", expanded=False):
-        dataframe_stretch(pd.DataFrame(localize_batch_rows(rows)), hide_index=True)
+    render_records(localize_batch_rows(default_rows), title_keys=("文件名",), max_records=50)
+    if st.checkbox("查看完整字段", value=False, key="show_batch_full_fields"):
+        render_records(localize_batch_rows(rows), title_keys=("文件名",), max_records=100)
 
     chart = batch_result["exports"]["summary_chart"]
     if Path(chart).is_file():
