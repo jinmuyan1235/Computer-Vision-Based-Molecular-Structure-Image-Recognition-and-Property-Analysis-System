@@ -24,5 +24,12 @@ def test_expected_parse_failure_does_not_spam_stderr(capfd) -> None:
     assert "SMILES Parse Error" not in captured.err
 
 
+def test_wildcard_smiles_is_rejected_before_analysis() -> None:
+    result = validate_smiles("*")
+    assert result["valid"] is False
+    assert result["canonical_smiles"] is None
+    assert "通配符" in result["error"] or "查询原子" in result["error"]
+
+
 def test_canonicalize_aspirin() -> None:
     assert canonicalize_smiles("CC(=O)OC1=CC=CC=C1C(=O)O") == "CC(=O)Oc1ccccc1C(=O)O"

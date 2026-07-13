@@ -29,9 +29,14 @@ from src.utils.file_utils import ensure_directory, safe_stem
 class MoleculeReportGenerator:
     """Coordinate preprocessing, OCSR, validation, descriptors and rendering."""
 
-    def __init__(self, backend: str | None = None, output_dir: str | Path = OUTPUT_DIR) -> None:
+    def __init__(
+        self,
+        backend: str | None = None,
+        output_dir: str | Path = OUTPUT_DIR,
+        runtime_config: dict[str, Any] | None = None,
+    ) -> None:
         self.output_dir = ensure_directory(output_dir)
-        self.recognizer = MoleculeRecognizer(backend)
+        self.recognizer = MoleculeRecognizer(backend, runtime_config=runtime_config)
         self.preprocessor = ImagePreprocessor()
         self.admet_predictor = ConfiguredADMETPredictor()
 

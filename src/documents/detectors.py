@@ -181,6 +181,8 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         component_count, labels, stats, _ = cv2.connectedComponentsWithStats((crop > 0).astype(np.uint8), 8)
         component_areas = [int(stats[index, cv2.CC_STAT_AREA]) for index in range(1, component_count)]
         significant_components = [value for value in component_areas if value >= 6]
+        small_component_ratio = self._small_component_ratio(component_areas)
+        text_line_count = self._text_line_count(crop)
         edges = cv2.Canny(crop, 60, 180)
         edge_ratio = float(np.count_nonzero(edges) / area)
         aspect = width / max(height, 1)
@@ -196,7 +198,16 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             return "table", 0.55, "Grid-like line structure; not sent to single-molecule OCSR by default."
         if self._looks_like_reaction(crop, aspect, width, height):
             return "reaction_like", 0.62, "Wide arrow/plus-like region; reaction parsing is not supported yet."
-        if self._looks_like_text(width, height, aspect, ink_ratio, significant_components):
+        if self._looks_like_text(
+            width,
+            height,
+            aspect,
+            ink_ratio,
+            significant_components,
+            text_line_count,
+            page_area_ratio,
+            small_component_ratio,
+        ):
             return "text", 0.68, "Text-like compact components; not treated as a molecule."
 
         confidence = 0.25
@@ -258,7 +269,16 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         aspect: float,
         ink_ratio: float,
         significant_components: list[int],
+        text_line_count: int = 0,
+        page_area_ratio: float = 0.0,
+        small_component_ratio: float = 0.0,
     ) -> bool:
+        if text_line_count >= 5 and len(significant_components) >= 22 and ink_ratio < 0.30:
+            return True
+        if page_area_ratio > 0.035 and text_line_count >= 4 and len(significant_components) >= 18 and aspect > 0.75:
+            return True
+        if len(significant_components) >= 35 and small_component_ratio > 0.72 and ink_ratio < 0.26:
+            return True
         if height <= 45 and aspect > 2.2 and len(significant_components) >= 3:
             return True
         if height <= 90 and aspect > 1.7 and len(significant_components) >= 2 and ink_ratio < 0.24:
@@ -270,6 +290,34 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         if len(significant_components) >= 12 and aspect > 1.3 and height < 240 and ink_ratio < 0.22:
             return True
         return False
+
+    @staticmethod
+    def _text_line_count(crop: np.ndarray) -> int:
+        """Estimate text rows from horizontal ink runs."""
+        if crop.size == 0:
+            return 0
+        height, width = crop.shape[:2]
+        row_ink = np.sum(crop > 0, axis=1) / max(width, 1)
+        active = row_ink > 0.012
+        line_count = 0
+        run_length = 0
+        for value in active:
+            if value:
+                run_length += 1
+            else:
+                if run_length >= max(2, int(height * 0.006)):
+                    line_count += 1
+                run_length = 0
+        if run_length >= max(2, int(height * 0.006)):
+            line_count += 1
+        return line_count
+
+    @staticmethod
+    def _small_component_ratio(component_areas: list[int]) -> float:
+        if not component_areas:
+            return 0.0
+        small = sum(1 for area in component_areas if 6 <= area <= 80)
+        return small / max(len(component_areas), 1)
 
     @staticmethod
     def _looks_like_table(crop: np.ndarray, aspect: float, horizontal_projection: float, vertical_projection: float) -> bool:

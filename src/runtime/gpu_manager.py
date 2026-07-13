@@ -29,7 +29,7 @@ def nvidia_smi_status() -> dict[str, Any]:
     """Return nvidia-smi GPU info without treating it as proof of framework GPU use."""
     command = [
         "nvidia-smi",
-        "--query-gpu=name,driver_version,memory.total,memory.used",
+        "--query-gpu=index,name,driver_version,memory.total,memory.used",
         "--format=csv,noheader,nounits",
     ]
     try:
@@ -39,14 +39,50 @@ def nvidia_smi_status() -> dict[str, Any]:
     gpus: list[dict[str, Any]] = []
     for line in completed.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) >= 4:
+        if len(parts) >= 5:
             gpus.append({
-                "name": parts[0],
-                "driver_version": parts[1],
-                "memory_total_mb": int(float(parts[2])),
-                "memory_used_mb": int(float(parts[3])),
+                "index": int(float(parts[0])),
+                "name": parts[1],
+                "driver_version": parts[2],
+                "memory_total_mb": int(float(parts[3])),
+                "memory_used_mb": int(float(parts[4])),
             })
     return {"available": bool(gpus), "gpus": gpus}
+
+
+def gpu_selection_options() -> list[dict[str, Any]]:
+    """Return user-facing GPU choices for Streamlit without importing ML frameworks."""
+    status = nvidia_smi_status()
+    options: list[dict[str, Any]] = [
+        {
+            "value": "auto",
+            "label": "自动选择可用设备",
+            "molscribe_device": "auto",
+            "decimer_device": "auto",
+            "visible_gpu_index": None,
+        },
+        {
+            "value": "cpu",
+            "label": "CPU（不使用 GPU）",
+            "molscribe_device": "cpu",
+            "decimer_device": "cpu",
+            "visible_gpu_index": None,
+        },
+    ]
+    for gpu in status.get("gpus", []):
+        index = int(gpu.get("index", len(options) - 2))
+        label = (
+            f"GPU {index}: {gpu.get('name')} "
+            f"({gpu.get('memory_used_mb')}/{gpu.get('memory_total_mb')} MB)"
+        )
+        options.append({
+            "value": f"cuda:{index}",
+            "label": label,
+            "molscribe_device": f"cuda:{index}",
+            "decimer_device": "gpu",
+            "visible_gpu_index": str(index),
+        })
+    return options
 
 
 def torch_status(run_matrix_test: bool = False) -> dict[str, Any]:

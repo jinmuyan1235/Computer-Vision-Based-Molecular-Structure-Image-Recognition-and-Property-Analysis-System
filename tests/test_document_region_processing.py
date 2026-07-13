@@ -245,6 +245,36 @@ def test_no_molecule_page_does_not_emit_molecule_regions(tmp_path: Path) -> None
     assert not [region for region in regions if region.region_type == "molecule"]
 
 
+def test_multiline_text_block_is_filtered_before_ocsr(tmp_path: Path) -> None:
+    page_image = Image.new("RGB", (900, 600), "white")
+    draw = ImageDraw.Draw(page_image)
+    lines = [
+        "This paragraph describes aspirin and rivaroxaban in an article.",
+        "It contains many compact character components but no molecule.",
+        "The detector should avoid sending this text block to OCSR.",
+        "A single bad region must not waste DECIMER inference time.",
+        "Only real chemical structure crops should be recognized.",
+        "Figure captions and labels are not molecular structures.",
+    ]
+    for index, line in enumerate(lines):
+        draw.text((80, 80 + index * 32), line, fill="black")
+    page_path = tmp_path / "text_block.png"
+    page_image.save(page_path)
+
+    page = DocumentPage("doc", 1, str(page_path), 900, 600)
+    region = DocumentRegion("doc", 1, "p001_r001", (50, 50, 820, 310), "molecule", 0.9)
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out")
+    fake_generator = FakeReportGenerator()
+    processor.report_generator = fake_generator
+
+    processor.recognize_region(region, [page], tmp_path / "out")
+
+    assert region.status == "skipped"
+    assert fake_generator.calls == []
+    assert region.screening["passed"] is False
+    assert region.screening["text_line_count"] >= 4
+
+
 def test_reaction_like_region_is_not_ocrd_as_single_molecule(tmp_path: Path) -> None:
     page = Image.new("RGB", (700, 260), "white")
     draw = ImageDraw.Draw(page)

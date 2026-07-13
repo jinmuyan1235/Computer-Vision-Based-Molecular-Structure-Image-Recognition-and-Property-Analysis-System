@@ -11,6 +11,7 @@ import streamlit as st
 from src.export.json_exporter import to_json_text
 from src.ui.labels import BATCH_COLUMN_LABELS, localize_batch_rows
 from src.ui.state import get_batch_analyzer, remember_backend_status
+from src.ui.streamlit_compat import dataframe_stretch
 from src.ui.styles import page_intro
 
 
@@ -63,9 +64,9 @@ def render_batch_page(backend: str) -> None:
 
     rows = batch_result["rows"]
     default_rows = [{key: row.get(key) for key in DEFAULT_COLUMNS} for row in rows]
-    st.dataframe(pd.DataFrame(localize_batch_rows(default_rows)), use_container_width=True, hide_index=True)
+    dataframe_stretch(pd.DataFrame(localize_batch_rows(default_rows)), hide_index=True)
     with st.expander("查看完整字段", expanded=False):
-        st.dataframe(pd.DataFrame(localize_batch_rows(rows)), use_container_width=True, hide_index=True)
+        dataframe_stretch(pd.DataFrame(localize_batch_rows(rows)), hide_index=True)
 
     chart = batch_result["exports"]["summary_chart"]
     if Path(chart).is_file():

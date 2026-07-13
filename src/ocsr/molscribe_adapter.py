@@ -58,7 +58,7 @@ class MolScribeAdapter(BaseOCSRAdapter):
         model_version: str | None = None,
     ) -> None:
         self.model_path = self._coerce_model_path(model_path)
-        self.device = (device or config.OCSR_DEVICE or "cpu").strip().lower()
+        self.device = (device or "cpu").strip().lower()
         self.timeout_seconds = float(timeout_seconds or config.OCSR_TIMEOUT_SECONDS)
         self.image_strategy: ImageStrategy = image_strategy or config.MOLSCRIBE_IMAGE_STRATEGY
         self.strict_mode = config.OCSR_STRICT_MODE if strict_mode is None else strict_mode
