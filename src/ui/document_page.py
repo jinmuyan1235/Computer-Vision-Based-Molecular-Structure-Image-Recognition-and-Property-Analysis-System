@@ -24,23 +24,22 @@ from src.ui.state import current_runtime_key, get_document_processor, remember_b
 from src.ui.streamlit_compat import dataframe_stretch
 from src.ui.styles import page_intro
 
-
 PROCESS_MODE_DETECT = "仅检测分子区域（速度快，不执行结构识别）"
 PROCESS_MODE_FULL = "检测并识别分子结构（调用 OCSR，耗时较长）"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def render_document_page(backend: str) -> None:
-    page_intro("PDF/?????", "?? PDF?????? ZIP ?????????????????? OCSR?")
+    page_intro("PDF/多分子文档", "上传 PDF、页面图片或 ZIP 图片集合，先检测分子区域，再按需执行 OCSR。")
     upload = st.file_uploader(
-        "?? PDF / ???? / ZIP",
+        "上传 PDF / 页面图片 / ZIP",
         type=["pdf", "png", "jpg", "jpeg", "zip"],
         key="document_upload",
     )
-    mode = st.radio("????", [PROCESS_MODE_DETECT, PROCESS_MODE_FULL], index=0, horizontal=False)
+    mode = st.radio("处理模式", [PROCESS_MODE_DETECT, PROCESS_MODE_FULL], index=0, horizontal=False)
     run_ocsr = mode == PROCESS_MODE_FULL
 
-    if upload is not None and st.button("??????", type="primary", key="process_document"):
+    if upload is not None and st.button("开始处理文档", type="primary", key="process_document"):
         try:
             if backend != "demo":
                 input_path = _persist_uploaded_document(upload)
@@ -48,30 +47,7 @@ def render_document_page(backend: str) -> None:
                 st.session_state.pop("document_result", None)
                 st.rerun()
             else:
-                suffix = Path(upload.name).suffix.lower()
-                prefix = Path(upload.name).stem + "_"
-                with tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False) as temporary:
-                    temporary.write(upload.getvalue())
-                    temporary_path = Path(temporary.name)
-                try:
-                    progress_text = st.empty()
-                    progress_bar = st.progress(0.0)
-
-                    def progress_callback(current: int, total: int, region_id: str) -> None:
-                        progress_text.info(f"????? {current}/{total} ??????{region_id}")
-                        progress_bar.progress(current / max(total, 1))
-
-                    with st.spinner("?????????????"):
-                        st.session_state["document_result"] = get_document_processor(backend).process(
-                            temporary_path,
-                            run_ocsr=run_ocsr,
-                            progress_callback=progress_callback if run_ocsr else None,
-                        )
-                        remember_backend_status(backend)
-                    progress_text.empty()
-                    progress_bar.empty()
-                finally:
-                    temporary_path.unlink(missing_ok=True)
+                _run_demo_document(upload, backend, run_ocsr)
         except OptionalDependencyError as exc:
             st.error(str(exc))
         except (DocumentInputError, FileNotFoundError, RuntimeError, ValueError) as exc:
@@ -80,6 +56,33 @@ def render_document_page(backend: str) -> None:
     _render_document_job_status()
     if "document_result" in st.session_state:
         st.session_state["document_result"] = show_document_result(st.session_state["document_result"], backend)
+
+
+def _run_demo_document(upload: Any, backend: str, run_ocsr: bool) -> None:
+    suffix = Path(upload.name).suffix.lower()
+    prefix = Path(upload.name).stem + "_"
+    with tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False) as temporary:
+        temporary.write(upload.getvalue())
+        temporary_path = Path(temporary.name)
+    try:
+        progress_text = st.empty()
+        progress_bar = st.progress(0.0)
+
+        def progress_callback(current: int, total: int, region_id: str) -> None:
+            progress_text.info(f"正在识别第 {current}/{total} 个候选区域：{region_id}")
+            progress_bar.progress(current / max(total, 1))
+
+        with st.spinner("正在渲染页面并检测区域……"):
+            st.session_state["document_result"] = get_document_processor(backend).process(
+                temporary_path,
+                run_ocsr=run_ocsr,
+                progress_callback=progress_callback if run_ocsr else None,
+            )
+            remember_backend_status(backend)
+        progress_text.empty()
+        progress_bar.empty()
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _persist_uploaded_document(upload: Any) -> Path:
@@ -147,7 +150,7 @@ def _render_document_job_status() -> None:
     elapsed = time.time() - float(job.get("started_at", time.time()))
     return_code = process.poll()
     if return_code is None:
-        st.info(f"?????????????? {elapsed:.1f} ???????????????? Streamlit?")
+        st.info(f"文档处理正在后台运行，已耗时 {elapsed:.1f} 秒。页面会自动刷新，期间不会阻塞 Streamlit。")
         st.progress(min(elapsed / 120.0, 0.95))
         time.sleep(2)
         st.rerun()
@@ -164,67 +167,22 @@ def _render_document_job_status() -> None:
 
     if return_code != 0:
         detail = (stderr or stdout or "").strip().splitlines()
-        message = detail[-1] if detail else f"?????????? {return_code}"
+        message = detail[-1] if detail else f"文档处理子进程退出码 {return_code}"
         if payload and payload.get("message"):
             message = str(payload["message"])
-        st.error(f"???????{message}")
+        st.error(f"文档处理失败：{message}")
         return
     if not payload or not payload.get("result_path"):
-        st.error("???????????????????")
+        st.error("文档处理完成，但没有返回结果文件路径。")
         return
     result_path = Path(str(payload["result_path"]))
     if not result_path.is_file():
-        st.error(f"????????????{result_path}")
+        st.error(f"文档处理结果文件不存在：{result_path}")
         return
     st.session_state["document_result"] = json.loads(result_path.read_text(encoding="utf-8"))
     remember_backend_status(str(job.get("backend") or ""))
-    st.success("???????")
+    st.success("文档处理完成。")
     st.rerun()
-
-def _process_document_subprocess(input_path: Path, backend: str, run_ocsr: bool) -> dict:
-    """Run document OCSR outside Streamlit so native model crashes cannot kill the UI server."""
-    runtime = runtime_config_from_key(current_runtime_key())
-    command = [
-        sys.executable,
-        str(PROJECT_ROOT / "scripts" / "process_document.py"),
-        "--input",
-        str(input_path),
-        "--backend",
-        backend,
-    ]
-    if not run_ocsr:
-        command.append("--detect-only")
-    if runtime.get("molscribe_device"):
-        command.extend(["--molscribe-device", str(runtime["molscribe_device"])])
-    if runtime.get("decimer_device"):
-        command.extend(["--decimer-device", str(runtime["decimer_device"])])
-    if runtime.get("visible_gpu_index") is not None:
-        command.extend(["--visible-gpu-index", str(runtime["visible_gpu_index"])])
-
-    env = os.environ.copy()
-    env.setdefault("MOLSCRIBE_ISOLATED_SUBPROCESS", "true")
-    env.setdefault("DECIMER_ISOLATED_SUBPROCESS", "true")
-    completed = subprocess.run(
-        command,
-        cwd=PROJECT_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-    payload = _extract_json_object(completed.stdout)
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
-        message = detail[-1] if detail else f"文档处理子进程退出码 {completed.returncode}"
-        if payload and payload.get("message"):
-            message = str(payload["message"])
-        raise RuntimeError(message)
-    if not payload or not payload.get("result_path"):
-        raise RuntimeError("文档处理子进程未返回结果文件路径。")
-    result_path = Path(str(payload["result_path"]))
-    if not result_path.is_file():
-        raise RuntimeError(f"文档处理结果文件不存在：{result_path}")
-    return json.loads(result_path.read_text(encoding="utf-8"))
 
 
 def _apply_document_edits_subprocess(
@@ -233,7 +191,6 @@ def _apply_document_edits_subprocess(
     edits: list[dict],
     rerun_ocsr: bool,
 ) -> dict:
-    """Apply document edits outside Streamlit when a real backend may be involved."""
     runtime = runtime_config_from_key(current_runtime_key())
     output_dir = Path(document_result.get("output_dir") or tempfile.gettempdir()).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -261,14 +218,7 @@ def _apply_document_edits_subprocess(
     env = os.environ.copy()
     env.setdefault("MOLSCRIBE_ISOLATED_SUBPROCESS", "true")
     env.setdefault("DECIMER_ISOLATED_SUBPROCESS", "true")
-    completed = subprocess.run(
-        command,
-        cwd=PROJECT_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
+    completed = subprocess.run(command, cwd=PROJECT_ROOT, env=env, capture_output=True, text=True, timeout=900)
     payload = _extract_json_object(completed.stdout)
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip().splitlines()
@@ -292,7 +242,6 @@ def _apply_document_edits(document_result: dict, backend: str, edits: list[dict]
 
 
 def _extract_json_object(text: str) -> dict | None:
-    """Extract a JSON object from stdout that may also contain native-library logs."""
     stripped = text.strip()
     if not stripped:
         return None
@@ -449,6 +398,7 @@ def _region_editor(document_result: dict, backend: str) -> dict:
             except RuntimeError as exc:
                 st.error(f"区域添加失败：{exc}")
     return document_result
+
 
 def _download_panel(document_result: dict) -> None:
     exports = document_result.get("exports") or {}
