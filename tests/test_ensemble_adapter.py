@@ -61,6 +61,7 @@ def test_ensemble_agreement_for_same_canonical_smiles() -> None:
     assert result.status == "success"
     assert result.smiles == "CCO"
     assert result.consensus["status"] == "agreement"
+    assert result.consensus["decision"] == "accepted"
     assert result.consensus["recommended_backend"] == "consensus"
     assert {candidate["backend"] for candidate in result.candidates} == {"molscribe", "decimer"}
     assert result.similarity_analysis[0]["canonical_smiles_equal"] is True
@@ -74,6 +75,8 @@ def test_ensemble_prefers_only_valid_candidate() -> None:
     result = adapter.recognize("image.png")
     assert result.status == "success"
     assert result.consensus["status"] == "single_valid"
+    assert result.consensus["decision"] == "accepted"
+    assert result.consensus["decision_note"] == "accepted_with_single_backend"
     assert result.consensus["recommended_backend"] == "decimer"
     assert result.smiles == "CCO"
 
@@ -88,8 +91,12 @@ def test_ensemble_disagreement_uses_priority_not_cross_model_confidence() -> Non
         },
     )
     result = adapter.recognize("image.png")
+    assert result.status == "failed"
+    assert result.smiles is None
     assert result.consensus["status"] == "disagreement"
-    assert result.consensus["recommended_backend"] == "decimer"
+    assert result.consensus["decision"] == "review_needed"
+    assert result.consensus["recommended_backend"] is None
+    assert result.consensus["review_candidates"][0]["backend"] == "decimer"
     assert "未比较" in result.consensus["confidence_policy"]
     assert result.similarity_analysis[0]["canonical_smiles_equal"] is False
 
@@ -104,6 +111,7 @@ def test_ensemble_all_failed_and_serialization() -> None:
     assert result.status == "failed"
     assert payload["candidates"][0]["raw_smiles"] is None
     assert payload["consensus"]["status"] == "all_failed"
+    assert payload["consensus"]["decision"] == "rejected"
 
 
 def test_ensemble_parallel_timeout_records_backend_failure() -> None:
@@ -126,12 +134,13 @@ def test_ensemble_parallel_timeout_records_backend_failure() -> None:
     assert "超时" in result.candidates[0]["message"]
 
 
-def test_rank_candidates_can_use_reliability_weight() -> None:
+def test_rank_candidates_marks_disagreement_for_review() -> None:
     low = candidate_from_result(OCSRResult("CCO", 0.99, "low", "success", "ok"))
     high = candidate_from_result(OCSRResult("c1ccccc1", 0.1, "high", "success", "ok"))
     consensus = rank_candidates([low, high], backend_priority=["low", "high"], reliability_weights={"high": 2.0})
     assert consensus["status"] == "disagreement"
-    assert consensus["recommended_backend"] == "high"
+    assert consensus["decision"] == "review_needed"
+    assert consensus["recommended_backend"] is None
 
 
 def test_human_correction_overrides_ensemble_recommendation(tmp_path: Path) -> None:
@@ -178,18 +187,19 @@ class FakeBenchmarkEnsemble(BaseOCSRAdapter):
             candidate_from_result(OCSRResult("c1ccccc1", None, "decimer", "success", "ok", inference_time_ms=2.0)),
         ]
         return OCSRResult(
-            smiles="CCO",
+            smiles=None,
             confidence=None,
             backend="ensemble",
-            status="success",
-            message="ranked",
+            status="failed",
+            message="needs review",
             inference_time_ms=3.0,
             candidates=candidates,
             consensus={
                 "status": "disagreement",
-                "recommended_smiles": "CCO",
-                "recommended_backend": "molscribe",
-                "reason": "priority",
+                "decision": "review_needed",
+                "recommended_smiles": None,
+                "recommended_backend": None,
+                "reason": "needs review",
             },
             similarity_analysis=[],
         )
@@ -213,7 +223,10 @@ def test_benchmark_integrates_ensemble_candidate_metrics(monkeypatch, tmp_path: 
     result = OCSREvaluator("ensemble").run([sample])
     row = result["rows"][0]
     assert row["consensus_status"] == "disagreement"
+    assert row["consensus_decision"] == "review_needed"
+    assert row["ensemble_review_needed"] is True
     assert row["candidate_molscribe_canonical_exact_match"] is True
     assert row["candidate_decimer_canonical_exact_match"] is False
     assert result["metrics"]["ensemble"]["disagreement_count"] == 1
+    assert result["metrics"]["ensemble"]["review_needed_count"] == 1
     assert result["metrics"]["ensemble"]["candidate_backend_metrics"]["molscribe"]["canonical_exact_match_count"] == 1

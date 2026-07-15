@@ -5,9 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import importlib.util
-import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -23,6 +21,8 @@ import config
 from src.chem.smiles_validator import validate_smiles
 from src.runtime.cuda_env import nvidia_library_paths
 from src.runtime.inference_scheduler import GLOBAL_INFERENCE_SCHEDULER
+from src.runtime.job_manager import MODEL_WORKER_RESULT_MARKER, run_json_command, run_process
+from src.runtime.metadata import dependency_versions, git_commit
 from .base import BaseOCSRAdapter, OCSRResult
 
 ImageStrategy = Literal["original", "grayscale", "normalized", "binary"]
@@ -143,17 +143,16 @@ class DECIMERAdapter(BaseOCSRAdapter):
         if not status.get("tensorflow_installed"):
             if self.requested_device == "gpu":
                 raise DECIMERConfigurationError(f"请求 GPU，但 TensorFlow 不可用：{status.get('tensorflow_error')}；不会静默回退 CPU。")
-            if self.requested_device == "gpu" and self.strict_mode:
-                raise DECIMERConfigurationError(f"请求 GPU，但 TensorFlow 不可用：{status.get('tensorflow_error')}")
+            if self.requested_device == "auto" and (self.strict_mode or config.OCSR_GPU_REQUIRED):
+                raise DECIMERConfigurationError(f"自动选择设备时 TensorFlow 不可用，且当前配置不允许回退 CPU：{status.get('tensorflow_error')}")
             self.device = "cpu"
             return
         gpu_available = bool(status.get("gpu_available"))
         if self.requested_device == "gpu" and not gpu_available:
             raise DECIMERConfigurationError("请求 GPU，但 TensorFlow 未检测到可用 GPU；不会静默回退 CPU。")
-            if self.strict_mode:
-                raise DECIMERConfigurationError("请求 GPU，但 TensorFlow 未检测到可用 GPU。")
-            self.device = "cpu"
         elif self.requested_device == "auto":
+            if not gpu_available and (self.strict_mode or config.OCSR_GPU_REQUIRED):
+                raise DECIMERConfigurationError("自动选择设备时 TensorFlow 未检测到可用 GPU，且当前配置不允许回退 CPU。")
             self.device = "gpu" if gpu_available else "cpu"
         else:
             self.device = self.requested_device
@@ -259,15 +258,8 @@ class DECIMERAdapter(BaseOCSRAdapter):
             existing = [part for part in env.get("LD_LIBRARY_PATH", "").split(":") if part]
             if paths:
                 env["LD_LIBRARY_PATH"] = ":".join([*paths, *existing])
-            try:
-                completed = subprocess.run(
-                    [sys.executable, "-c", code],
-                    capture_output=True,
-                    text=True,
-                    env=env,
-                    timeout=20,
-                )
-            except subprocess.TimeoutExpired:
+            completed = run_process([sys.executable, "-c", code], env=env, timeout=20)
+            if completed.timed_out:
                 self._load_error = None
                 self._import_probe_done = True
                 self._import_probe_available = True
@@ -432,6 +424,9 @@ class DECIMERAdapter(BaseOCSRAdapter):
             model_version=self.model_version,
             device=self.device,
             package_version=self.package_version,
+            git_commit=git_commit(),
+            dependency_versions=dependency_versions(),
+            result_origin="real_model",
             raw_output=raw_output,
         )
 
@@ -467,48 +462,39 @@ class DECIMERAdapter(BaseOCSRAdapter):
     def _recognize_in_subprocess(self, image_path_or_array: Any) -> OCSRResult:
         start = time.perf_counter()
         image_path, temp_path = self._path_for_subprocess(image_path_or_array)
-        code = """
-import json
-import sys
-from src.ocsr.decimer_adapter import DECIMERAdapter
-
-adapter = DECIMERAdapter(isolated_subprocess=False)
-result = adapter.recognize(sys.argv[1])
-print("DECIMER_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False))
-"""
         try:
-            completed = subprocess.run(
-                [sys.executable, "-c", code, image_path],
+            command = [
+                sys.executable,
+                "-m",
+                "src.runtime.model_worker",
+                "--backend",
+                "decimer",
+                "--input",
+                image_path,
+                "--device",
+                self.requested_device,
+            ]
+            if self.visible_gpu_index is not None:
+                command.extend(["--visible-gpu-index", self.visible_gpu_index])
+            completed = run_json_command(
+                command,
                 cwd=Path(__file__).resolve().parents[2],
                 env=self._subprocess_environment(),
-                capture_output=True,
-                text=True,
                 timeout=max(self.timeout_seconds + 90, 180),
+                marker=MODEL_WORKER_RESULT_MARKER,
             )
-        except subprocess.TimeoutExpired as exc:
-            elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
-            self.last_inference_time_ms = elapsed_ms
-            return self._result(None, None, "failed", f"DECIMER 隔离子进程超过 {exc.timeout:.1f} 秒超时。", elapsed_ms)
         finally:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
 
-        marker = "DECIMER_RESULT_JSON="
-        payload = None
-        for line in reversed(completed.stdout.splitlines()):
-            if line.startswith(marker):
-                payload = line[len(marker) :]
-                break
         elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
         self.last_inference_time_ms = elapsed_ms
-        if completed.returncode != 0 or payload is None:
-            detail = (completed.stderr or completed.stdout or "").strip().splitlines()
-            message = detail[-1] if detail else f"子进程退出码 {completed.returncode}"
+        if completed.timed_out:
+            return self._result(None, None, "failed", f"DECIMER 隔离子进程超过 {max(self.timeout_seconds + 90, 180):.1f} 秒超时。", elapsed_ms)
+        if completed.returncode != 0 or completed.payload is None:
+            message = completed.last_output_line() or f"子进程退出码 {completed.returncode}"
             return self._result(None, None, "failed", f"DECIMER 隔离子进程失败：{message}", elapsed_ms)
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            return self._result(None, None, "failed", f"DECIMER 子进程返回无法解析的 JSON：{exc}", elapsed_ms)
+        data = completed.payload
         result = OCSRResult(**{key: data.get(key) for key in OCSRResult.__dataclass_fields__})
         result.inference_time_ms = elapsed_ms
         self.device = result.device or self.device

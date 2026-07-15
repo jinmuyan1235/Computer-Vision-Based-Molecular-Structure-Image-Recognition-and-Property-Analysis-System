@@ -47,6 +47,32 @@ def molecule_identity(smiles: str | None, mode: str = "raw", profile: str | None
     return canonical, inchikey
 
 
+def _mol_profile(smiles: str | None) -> dict[str, Any]:
+    mol = smiles_to_mol(smiles or "")
+    if mol is None:
+        return {
+            "valid": False,
+            "atom_count": None,
+            "formal_charge": None,
+            "bond_type_counts": {},
+            "has_stereo": False,
+            "canonical_no_stereo": None,
+            "canonical_isomeric": None,
+        }
+    bond_counts = Counter(str(bond.GetBondType()) for bond in mol.GetBonds())
+    has_chiral_atoms = bool(Chem.FindMolChiralCenters(mol, includeUnassigned=True))
+    has_stereo_bonds = any(str(bond.GetStereo()) != "STEREONONE" for bond in mol.GetBonds())
+    return {
+        "valid": True,
+        "atom_count": int(mol.GetNumAtoms()),
+        "formal_charge": int(Chem.GetFormalCharge(mol)),
+        "bond_type_counts": dict(bond_counts),
+        "has_stereo": bool(has_chiral_atoms or has_stereo_bonds),
+        "canonical_no_stereo": Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False),
+        "canonical_isomeric": Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True),
+    }
+
+
 def tanimoto_similarity(ground_truth_smiles: str | None, predicted_smiles: str | None) -> float | None:
     """Compute Morgan fingerprint Tanimoto similarity, returning None for invalid molecules."""
     truth_mol = smiles_to_mol(ground_truth_smiles or "")
@@ -85,6 +111,8 @@ def enrich_prediction(
         predicted_canonical = predicted_raw_canonical
         predicted_inchikey = predicted_raw_inchikey
     predicted_standardization = standardize_smiles(predicted_smiles, profile) if predicted_smiles else None
+    truth_profile = _mol_profile(row.get("ground_truth_smiles"))
+    predicted_profile = _mol_profile(predicted_smiles)
     rdkit_valid = predicted_raw_canonical is not None
     comparison_valid = predicted_canonical is not None
     canonical_exact = bool(comparison_valid and predicted_canonical == truth_canonical)
@@ -108,10 +136,33 @@ def enrich_prediction(
                 bool(predicted_standardization["standardization"]["changed"]) if predicted_standardization else False
             ),
             "rdkit_valid": rdkit_valid,
+            "valid_smiles": rdkit_valid,
             "canonical_exact_match": canonical_exact,
+            "exact_match": canonical_exact,
             "molecule_equivalent": equivalent,
             "tanimoto_similarity": similarity,
             "similarity_above_threshold": similarity is not None and similarity >= similarity_threshold,
+            "rejection_success": (
+                str(row.get("expected_action") or "").lower() == "reject"
+                and not bool(row.get("recognition_success"))
+            ),
+            "ground_truth_has_stereo": truth_profile["has_stereo"],
+            "stereochemistry_exact_match": (
+                bool(
+                    truth_profile["has_stereo"]
+                    and predicted_profile["valid"]
+                    and truth_profile["canonical_isomeric"] == predicted_profile["canonical_isomeric"]
+                )
+            ),
+            "atom_count_match": (
+                bool(predicted_profile["valid"] and truth_profile["atom_count"] == predicted_profile["atom_count"])
+            ),
+            "formal_charge_match": (
+                bool(predicted_profile["valid"] and truth_profile["formal_charge"] == predicted_profile["formal_charge"])
+            ),
+            "bond_type_profile_match": (
+                bool(predicted_profile["valid"] and truth_profile["bond_type_counts"] == predicted_profile["bond_type_counts"])
+            ),
         }
     )
     if not enriched.get("failure_reason"):
@@ -137,6 +188,56 @@ def _latency_metrics(rows: list[dict[str, Any]]) -> dict[str, float | None]:
     }
 
 
+def _confidence_calibration(rows: list[dict[str, Any]], bins: int = 10) -> dict[str, Any]:
+    points: list[tuple[float, bool]] = []
+    for row in rows:
+        confidence = row.get("confidence")
+        if confidence in {None, ""}:
+            continue
+        try:
+            value = float(confidence)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= value <= 1.0:
+            points.append((value, bool(row.get("canonical_exact_match"))))
+    if not points:
+        return {"confidence_sample_count": 0, "expected_calibration_error": None}
+    total = len(points)
+    ece = 0.0
+    for index in range(bins):
+        lower = index / bins
+        upper = (index + 1) / bins
+        if index == bins - 1:
+            bucket = [point for point in points if lower <= point[0] <= upper]
+        else:
+            bucket = [point for point in points if lower <= point[0] < upper]
+        if not bucket:
+            continue
+        accuracy = sum(correct for _, correct in bucket) / len(bucket)
+        mean_confidence = sum(confidence for confidence, _ in bucket) / len(bucket)
+        ece += (len(bucket) / total) * abs(mean_confidence - accuracy)
+    return {"confidence_sample_count": total, "expected_calibration_error": round(float(ece), 6)}
+
+
+def _rejection_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    negative_markers = ("distractor", "non_molecule", "reaction", "text", "table")
+    negatives = [
+        row for row in rows
+        if str(row.get("expected_action") or "").lower() == "reject"
+        or any(
+            marker in str(row.get(field) or "").lower()
+            for field in ("category", "source", "structure_features", "notes")
+            for marker in negative_markers
+        )
+    ]
+    rejected = sum(not bool(row.get("recognition_success")) for row in negatives)
+    return {
+        "rejection_target_count": len(negatives),
+        "rejection_count": rejected,
+        "rejection_coverage": _rate(rejected, len(negatives)),
+    }
+
+
 def summarize_rows(rows: list[dict[str, Any]], similarity_threshold: float) -> dict[str, Any]:
     """Summarize benchmark rows into denominator-explicit metrics."""
     total = len(rows)
@@ -145,6 +246,15 @@ def summarize_rows(rows: list[dict[str, Any]], similarity_threshold: float) -> d
     canonical_exact = sum(bool(row.get("canonical_exact_match")) for row in rows)
     equivalent = sum(bool(row.get("molecule_equivalent")) for row in rows)
     failed = total - recognition_success
+    stereo_required = sum(bool(row.get("ground_truth_has_stereo")) for row in rows)
+    stereo_exact = sum(
+        bool(row.get("ground_truth_has_stereo")) and bool(row.get("stereochemistry_exact_match"))
+        for row in rows
+    )
+    valid_comparisons = sum(bool(row.get("rdkit_valid")) for row in rows)
+    atom_count_errors = sum(bool(row.get("rdkit_valid")) and not bool(row.get("atom_count_match")) for row in rows)
+    charge_errors = sum(bool(row.get("rdkit_valid")) and not bool(row.get("formal_charge_match")) for row in rows)
+    bond_type_errors = sum(bool(row.get("rdkit_valid")) and not bool(row.get("bond_type_profile_match")) for row in rows)
     similarities = [float(row["tanimoto_similarity"]) for row in rows if row.get("tanimoto_similarity") is not None]
     above_threshold = sum(bool(row.get("similarity_above_threshold")) for row in rows)
     failure_reasons = Counter(str(row.get("failure_reason") or "none") for row in rows if row.get("failure_reason"))
@@ -154,10 +264,20 @@ def summarize_rows(rows: list[dict[str, Any]], similarity_threshold: float) -> d
         "recognition_success_rate": _rate(recognition_success, total),
         "rdkit_valid_count": rdkit_valid,
         "rdkit_valid_rate": _rate(rdkit_valid, total),
+        "valid_smiles_count": rdkit_valid,
+        "valid_smiles_rate": _rate(rdkit_valid, total),
         "canonical_exact_match_count": canonical_exact,
         "canonical_exact_match_rate": _rate(canonical_exact, total),
+        "exact_match_count": canonical_exact,
+        "exact_match_rate": _rate(canonical_exact, total),
         "molecule_equivalent_count": equivalent,
         "molecule_equivalent_rate": _rate(equivalent, total),
+        "stereo_required_count": stereo_required,
+        "stereochemistry_exact_count": stereo_exact,
+        "stereochemistry_exact_rate": _rate(stereo_exact, stereo_required),
+        "atom_count_error_rate": _rate(atom_count_errors, valid_comparisons),
+        "formal_charge_error_rate": _rate(charge_errors, valid_comparisons),
+        "bond_type_error_rate": _rate(bond_type_errors, valid_comparisons),
         "failed_count": failed,
         "failed_rate": _rate(failed, total),
         "failure_reason_distribution": dict(failure_reasons),
@@ -171,18 +291,31 @@ def summarize_rows(rows: list[dict[str, Any]], similarity_threshold: float) -> d
             "all_rates": total,
             "similarity_rates": total,
             "latency_metrics": "samples with inference_time_ms",
+            "structure_error_rates": "predictions with RDKit-valid SMILES",
+            "stereochemistry_exact_rate": "ground-truth samples containing stereochemistry",
         },
     }
     metrics.update(_latency_metrics(rows))
+    metrics.update(_confidence_calibration(rows))
+    metrics.update(_rejection_metrics(rows))
     return metrics
 
 
 def group_metrics(rows: list[dict[str, Any]], similarity_threshold: float) -> dict[str, dict[str, Any]]:
     """Compute category/backend/preprocessing_strategy grouped metrics."""
     grouped: dict[str, dict[str, list[dict[str, Any]]]] = {
-        "category": defaultdict(list),
-        "backend": defaultdict(list),
-        "preprocessing_strategy": defaultdict(list),
+        field: defaultdict(list)
+        for field in (
+            "category",
+            "source",
+            "image_quality",
+            "complexity",
+            "perturbation",
+            "structure_features",
+            "split",
+            "backend",
+            "preprocessing_strategy",
+        )
     }
     for row in rows:
         for field in grouped:
@@ -219,6 +352,9 @@ def ensemble_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(ensemble_rows)
     agreement = sum(bool(row.get("ensemble_agreement")) for row in ensemble_rows)
     disagreement = sum(bool(row.get("ensemble_disagreement")) for row in ensemble_rows)
+    accepted = sum(bool(row.get("ensemble_accepted")) for row in ensemble_rows)
+    review_needed = sum(bool(row.get("ensemble_review_needed")) for row in ensemble_rows)
+    rejected = sum(bool(row.get("ensemble_rejected")) for row in ensemble_rows)
     candidate_backend_metrics: dict[str, Any] = {}
     candidate_backends = _candidate_backends(ensemble_rows)
     for backend in candidate_backends:
@@ -268,6 +404,12 @@ def ensemble_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "agreement_rate": _rate(agreement, total),
         "disagreement_count": disagreement,
         "disagreement_rate": _rate(disagreement, total),
+        "accepted_count": accepted,
+        "accepted_rate": _rate(accepted, total),
+        "review_needed_count": review_needed,
+        "review_needed_rate": _rate(review_needed, total),
+        "rejected_count": rejected,
+        "rejected_rate": _rate(rejected, total),
         "candidate_backend_metrics": candidate_backend_metrics,
         "single_model_correct_distribution": pairwise,
         "ensemble_only_correct_count": ensemble_only_correct,

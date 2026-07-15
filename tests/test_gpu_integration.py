@@ -15,7 +15,8 @@ def test_pytorch_cuda_real_matrix_multiply() -> None:
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("PyTorch CUDA is not available in this environment.")
-    assert "4080" in torch.cuda.get_device_name(0)
+    assert torch.cuda.device_count() >= 1
+    assert torch.cuda.get_device_name(0)
     tensor = torch.randn((512, 512), device="cuda:0")
     product = tensor @ tensor
     torch.cuda.synchronize()

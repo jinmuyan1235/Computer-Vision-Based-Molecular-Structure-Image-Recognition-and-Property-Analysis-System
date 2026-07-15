@@ -32,6 +32,14 @@ def render_sidebar() -> tuple[str, bool, bool]:
     """Render sidebar controls and return selected backend and display switches."""
     with st.sidebar:
         st.header("运行设置")
+        production_mode = config.APP_MODE == "production"
+        if production_mode:
+            st.success("当前运行模式：生产")
+            st.caption("生产模式禁止使用演示图片识别；真实后端不可用时会阻止识别。")
+        else:
+            st.info("当前运行模式：演示")
+            st.caption("演示模式可显示内置 demo 后端；demo 结果不代表真实 OCSR。")
+
         gpu_options = gpu_selection_options()
         gpu_values = [option["value"] for option in gpu_options]
         gpu_labels = {option["value"]: option["label"] for option in gpu_options}
@@ -56,17 +64,37 @@ def render_sidebar() -> tuple[str, bool, bool]:
             f"DECIMER={runtime.get('decimer_device')}，"
             f"GPU索引={runtime.get('visible_gpu_index') or '自动/未指定'}"
         )
+        st.caption("设备语义：自动选择会优先 GPU、不可用时回退 CPU；CPU 为强制 CPU；指定 GPU 不可用会直接失败。")
         if st.session_state.get("gpu_device_selection") not in {"auto", "cpu"}:
             st.caption("DECIMER/TensorFlow 已加载后再切换 GPU，建议重启 Streamlit 以确保显存绑定生效。")
 
         statuses = get_backend_statuses()
         if "selected_backend" not in st.session_state:
-            st.session_state["selected_backend"] = default_backend(statuses, config.OCSR_BACKEND)
+            st.session_state["selected_backend"] = default_backend(
+                statuses,
+                config.OCSR_BACKEND,
+                allow_demo_fallback=not production_mode,
+            )
 
-        show_demo = st.session_state.get("show_demo_backend", False)
-        options = runnable_backends(statuses, include_demo=show_demo)
+        show_demo = False if production_mode else st.session_state.get("show_demo_backend", False)
+        options = runnable_backends(
+            statuses,
+            include_demo=show_demo,
+            allow_demo_fallback=not production_mode,
+        )
+        if not options:
+            st.error("生产模式下没有可用的真实 OCSR 后端。请配置 MolScribe/DECIMER，或切换 APP_MODE=demo。")
+            with st.expander("后端诊断", expanded=True):
+                for backend in ("molscribe", "decimer", "ensemble"):
+                    item = statuses.get(backend, {})
+                    st.caption(f"{backend_label(backend)}：{item.get('message') or '未配置'}")
+            st.stop()
         if st.session_state["selected_backend"] not in options:
-            st.session_state["selected_backend"] = default_backend(statuses, config.OCSR_BACKEND)
+            st.session_state["selected_backend"] = default_backend(
+                statuses,
+                config.OCSR_BACKEND,
+                allow_demo_fallback=not production_mode,
+            )
 
         selected = st.selectbox(
             "当前识别后端",
@@ -87,7 +115,9 @@ def render_sidebar() -> tuple[str, bool, bool]:
         export_pdf = st.checkbox("启用 PDF 报告", value=False)
 
         with st.expander("高级设置", expanded=False):
-            st.checkbox("显示演示模式", value=show_demo, key="show_demo_backend")
+            st.checkbox("显示演示模式", value=show_demo, key="show_demo_backend", disabled=production_mode)
+            if production_mode:
+                st.caption("生产模式已禁用演示图片识别。")
             st.caption("SMILES 分析页不调用图片识别模型；该设置只影响图片、文档和批处理。")
 
         with st.expander("识别后端说明", expanded=False):
@@ -112,6 +142,7 @@ def _render_technical_status(status: dict[str, Any]) -> None:
     rows = {
         "内部后端": status.get("backend"),
         "模型": status.get("model_name") or status.get("model_path") or "无",
+        "模型 SHA-256": status.get("model_sha256") or "未提供",
         "设备": status.get("device") or status.get("requested_device") or "未指定",
         "包版本": status.get("package_version") or "未安装/未提供",
         "输入策略": status.get("image_strategy") or "默认",

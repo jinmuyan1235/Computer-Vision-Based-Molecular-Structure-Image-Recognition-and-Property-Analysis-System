@@ -46,6 +46,116 @@ def test_manifest_loads_valid_rows(tmp_path: Path) -> None:
     samples = load_manifest(manifest, tmp_path)
     assert len(samples) == 1
     assert samples[0].ground_truth_canonical_smiles
+    assert samples[0].image_quality == "unspecified"
+
+
+def test_manifest_loads_recommended_acceptance_metadata(tmp_path: Path) -> None:
+    _image(tmp_path / "aspirin.png")
+    manifest = tmp_path / "manifest.csv"
+    with manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "sample_id",
+                "image_path",
+                "ground_truth_smiles",
+                "category",
+                "source",
+                "split",
+                "scaffold_key",
+                "source_document",
+                "image_quality",
+                "complexity",
+                "perturbation",
+                "structure_features",
+                "notes",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow({
+            "sample_id": "aspirin_scan",
+            "image_path": "aspirin.png",
+            "ground_truth_smiles": "CC(=O)Oc1ccccc1C(=O)O",
+            "category": "literature_scan",
+            "source": "paper",
+            "split": "test",
+            "scaffold_key": "benzene_carboxylate",
+            "source_document": "paper-1",
+            "image_quality": "scanned",
+            "complexity": "medium",
+            "perturbation": "jpeg_compression",
+            "structure_features": "ester;acid;aromatic",
+            "notes": "metadata test",
+        })
+    sample = load_manifest(manifest, tmp_path)[0]
+    assert sample.image_quality == "scanned"
+    assert sample.scaffold_key == "benzene_carboxylate"
+
+
+def test_manifest_allows_reject_rows_without_ground_truth_smiles(tmp_path: Path) -> None:
+    _image(tmp_path / "table.png")
+    manifest = tmp_path / "manifest.csv"
+    with manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "sample_id",
+                "image_path",
+                "ground_truth_smiles",
+                "expected_action",
+                "category",
+                "source",
+                "notes",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow({
+            "sample_id": "reject_table",
+            "image_path": "table.png",
+            "ground_truth_smiles": "",
+            "expected_action": "reject",
+            "category": "table_distractor",
+            "source": "unit",
+            "notes": "negative control",
+        })
+    sample = load_manifest(manifest, tmp_path)[0]
+    assert sample.expected_action == "reject"
+    assert sample.ground_truth_canonical_smiles is None
+
+
+def test_acceptance_builder_outputs_valid_manifest(tmp_path: Path) -> None:
+    from scripts.build_ocsr_acceptance_set import build_acceptance_set
+
+    seed = tmp_path / "seed.csv"
+    with seed.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["sample_id", "smiles", "category", "source", "split", "scaffold_key", "source_document", "complexity", "structure_features", "notes"],
+        )
+        writer.writeheader()
+        writer.writerow({
+            "sample_id": "ethanol",
+            "smiles": "CCO",
+            "category": "clean_generated",
+            "source": "unit",
+            "split": "test",
+            "scaffold_key": "alcohol",
+            "source_document": "unit",
+            "complexity": "low",
+            "structure_features": "alcohol",
+            "notes": "builder test",
+        })
+    manifest = build_acceptance_set(
+        seed_path=seed,
+        output_root=tmp_path / "acceptance",
+        variants=["clean", "low_res"],
+        size=(256, 256),
+        include_distractors=True,
+        random_seed=1,
+    )
+    samples = load_manifest(manifest, tmp_path / "acceptance")
+    assert len(samples) == 5
+    assert {sample.expected_action for sample in samples} == {"recognize", "reject"}
 
 
 def test_manifest_detects_missing_image_invalid_smiles_and_duplicate_ids(tmp_path: Path) -> None:
@@ -205,6 +315,7 @@ def test_metrics_grouping_and_latency_statistics() -> None:
         enrich_prediction({
             "ground_truth_smiles": "CCO",
             "predicted_smiles": None,
+            "expected_action": "reject",
             "recognition_success": False,
             "category": "noisy",
             "backend": "fake",
@@ -216,8 +327,12 @@ def test_metrics_grouping_and_latency_statistics() -> None:
     metrics = compute_metrics(rows)
     assert metrics["overall"]["total_samples"] == 2
     assert metrics["overall"]["recognition_success_count"] == 1
+    assert metrics["overall"]["valid_smiles_count"] == 1
+    assert metrics["overall"]["atom_count_error_rate"] == 0.0
+    assert metrics["overall"]["rejection_coverage"] == 1.0
     assert metrics["overall"]["median_latency_ms"] == 20.0
     assert "clean" in metrics["groups"]["category"]
+    assert "unknown" in metrics["groups"]["image_quality"]
 
 
 def test_run_directories_do_not_overwrite_and_report_bundle(tmp_path: Path) -> None:

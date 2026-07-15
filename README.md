@@ -49,7 +49,7 @@ flowchart LR
 
 ## 环境要求
 
-- Python 3.10 或 3.11；
+- Python 3.10（推荐；真实 OCSR 依赖的 TensorFlow/DECIMER/Keras 组合以 3.10 环境验证）；
 - CPU 即可运行 demo、OpenCV 和 RDKit 主流程；
 - GPU 仅作为真实 OCSR 后端的可选加速设备。
 
@@ -75,7 +75,7 @@ pip install -r requirements.txt
 
 ### pip 安装
 
-在支持 RDKit wheel 的 Python 3.10/3.11 平台上：
+在支持 RDKit wheel 的 Python 3.10 平台上：
 
 ```bash
 python -m venv .venv
@@ -152,6 +152,21 @@ $env:OCSR_BACKEND="demo"
 export OCSR_BACKEND=demo
 ```
 
+运行模式由 `APP_MODE` 控制：
+
+```bash
+APP_MODE=demo         # 允许演示后端，用于教学或本地功能演示
+APP_MODE=production   # 禁止 demo 图片识别；真实后端不可用时阻止识别
+```
+
+生产模式启动前建议先执行一次真实后端自检。该命令会检查后端可用性、RDKit、模型加载和一次 warm-up 推理，失败时返回非 0：
+
+```bash
+python scripts/check_ocsr_backend.py --backend molscribe --production --warmup
+```
+
+`start_gpu_app.sh` 默认使用 `APP_MODE=production`、`OCSR_BACKEND=molscribe` 并自动运行上述生产自检；需要演示模式时请直接使用普通 Streamlit 启动命令，或显式设置 `APP_MODE=demo`。
+
 ### demo
 
 默认模式不加载机器学习模型，而是根据文件名匹配四个内置样例：
@@ -193,8 +208,12 @@ python scripts/train_admet.py \
   --smiles-column smiles \
   --target-column ames \
   --task classification \
+  --split-strategy scaffold \
+  --min-samples 20 \
   --output models/admet_baseline.joblib
 ```
+
+训练脚本会执行 holdout 验证，默认优先使用 scaffold split；如果 scaffold 分组无法覆盖分类类别，会回退到分层随机拆分。分类任务会输出 ROC-AUC、PR-AUC、F1、MCC 和类别计数，回归任务会输出 MAE、RMSE、R²。模型 artifact 会记录验证指标、质量门槛和基于最近训练集 Tanimoto 相似度的 applicability domain；未通过质量门槛或超出适用域时，预测状态不会标记为 `success`。
 
 训练完成后启用模型：
 
@@ -205,7 +224,7 @@ $env:ADMET_MODEL_PATH="models/admet_baseline.joblib"
 python -m streamlit run app.py
 ```
 
-模型文件使用 joblib 序列化，只应加载自己训练或可信来源的本地文件。未启用、文件缺失或预测失败时，系统会继续完成 RDKit 描述符与 Lipinski 规则分析。ADMET 输出仅是教学 baseline，不替代实验或专业结论。
+模型文件使用 joblib 序列化，只应加载自己训练或可信来源的本地文件。未启用、文件缺失、预测失败、验证指标不达标或超出适用域时，系统会继续完成 RDKit 描述符与 Lipinski 规则分析。ADMET 输出仅是教学 baseline，不替代实验或专业结论。
 
 ## 测试
 
@@ -214,6 +233,23 @@ pytest -q
 ```
 
 测试覆盖合法/非法 SMILES、canonical SMILES、描述符字段、规则超限、图像预处理、OCSR 兼容层、单图/手动 SMILES 端到端流程、批处理导出、PDF 报告以及可选 ADMET baseline。
+
+## OCSR 真实测试集
+
+项目提供了测试集构建和人工标注导入工具：
+
+```bash
+python scripts/build_ocsr_acceptance_set.py
+python scripts/ingest_ocsr_labeled_images.py --labels data/raw_ocsr_real/labels.csv --image-root data/raw_ocsr_real
+```
+
+完整流程见 `docs/ocsr_dataset_curation.md`。真实验收集应记录来源、授权、scaffold/source split、图像质量、结构复杂度和拒识样本；不要把无授权论文截图或专有数据提交到公开仓库。
+
+人工纠错也可以回流为数据集：单图识别页点击“仅保存纠错”会写入 `data/feedback/annotations` 和 `data/feedback/manifest.csv`；点击“确认进入训练集”会标记为已核验并可导出：
+
+```bash
+python scripts/export_feedback_manifest.py --feedback-root data/feedback --output data/feedback/verified_manifest.csv
+```
 
 ## 项目目录
 
@@ -286,11 +322,16 @@ pip install -r requirements.txt
 pip install MolScribe
 ```
 
-模型权重请从可信来源下载到本机，例如：
+模型权重请从可信来源下载到本机。推荐使用下载脚本，它会执行 SHA-256 计算、可选期望 SHA 校验、原子替换、DECIMER ZIP 路径穿越检查和大小限制，并在 `models/manifest.json` 中记录来源、版本、许可证提示和摘要：
 
-```text
-models/molscribe_model.pth
+```bash
+python scripts/download_ocsr_models.py \
+  --molscribe-revision main \
+  --molscribe-sha256 <trusted_sha256_if_available> \
+  --skip-decimer
 ```
+
+如果没有官方或你自己维护的可信 SHA-256，可省略 `--molscribe-sha256`，脚本仍会记录本地实际摘要，但这只能用于后续复现，不能证明下载源未被替换。
 
 不要把模型权重、大型数据集、虚拟环境或缓存文件提交到 Git。本仓库 `.gitignore` 已忽略 `models/*`、`*.pt`、`*.pth` 和 `*.onnx`。
 
@@ -332,11 +373,13 @@ python -m streamlit run app.py
 | `MOLSCRIBE_MODEL_PATH` | `models/molscribe_model.pth` | MolScribe 权重文件路径，支持相对路径和绝对路径 |
 | `MOLSCRIBE_MODEL_NAME` | 权重文件名 | 侧边栏和结果中显示的模型名 |
 | `MOLSCRIBE_MODEL_VERSION` | 空 | 可选模型版本或标识 |
-| `OCSR_DEVICE` | `auto` | `auto`、`cpu`、`cuda` 或 `cuda:0`；`auto` 会在 PyTorch CUDA 可用时使用 GPU |
+| `OCSR_DEVICE` | `auto` | `auto`、`cpu`、`cuda` 或 `cuda:0`；`auto` 优先 GPU、不可用时回退 CPU；显式 `cuda*` 不可用会失败 |
 | `OCSR_TIMEOUT_SECONDS` | `120` | 单次推理超时时间 |
-| `OCSR_STRICT_MODE` | `false` | 为 `true` 时 CUDA 不可用会直接报错；默认可回退 CPU |
+| `OCSR_STRICT_MODE` | `false` | 兼容旧配置；仅用于控制 `auto` 在 CUDA 不可用时是否允许回退 CPU |
+| `OCSR_GPU_REQUIRED` | `false` | 为 `true` 时，`auto` 设备在 GPU 不可用时也会报错；显式 `cpu` 仍强制 CPU |
 | `OCSR_USE_PREPROCESSED_IMAGE` | `false` | 兼容旧流程；默认 MolScribe 使用原图 |
 | `MOLSCRIBE_IMAGE_STRATEGY` | `original` | `original`、`grayscale`、`normalized`、`binary` |
+| `MOLSCRIBE_ISOLATED_SUBPROCESS` | `true` | 在独立子进程中执行真实模型推理，超时或取消时可终止进程树 |
 
 默认 `original` 更贴近 MolScribe 官方模型输入预期；不要默认假设二值化图片一定更好。只有在实验需要时再切换 `grayscale`、`normalized` 或 `binary`。
 
@@ -421,27 +464,27 @@ $env:DECIMER_DEVICE="auto"   # auto 会在 TensorFlow 检测到 GPU 时使用 GP
 python -m streamlit run app.py
 ```
 
-严格 GPU 模式：
+显式 GPU 模式：
 
 ```powershell
 $env:OCSR_BACKEND="decimer"
 $env:DECIMER_DEVICE="gpu"
-$env:DECIMER_STRICT_MODE="true"
 python -m streamlit run app.py
 ```
 
-如果 strict 模式下 TensorFlow 未检测到 GPU，DECIMER 会返回清晰错误；非 strict 模式会安全回退 CPU，并在状态中显示实际设备。
+`DECIMER_DEVICE=gpu` 表示必须使用 GPU；如果 TensorFlow 未检测到 GPU，DECIMER 会返回清晰错误，不会静默回退 CPU。`DECIMER_DEVICE=auto` 会优先 GPU，不可用时回退 CPU；只有在 `DECIMER_STRICT_MODE=true` 或 `OCSR_GPU_REQUIRED=true` 时才禁止 `auto` 回退。
 
 ### DECIMER 配置项
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `DECIMER_DEVICE` | `auto` | `cpu`、`gpu` 或 `auto` |
+| `DECIMER_DEVICE` | `auto` | `auto` 优先 GPU、不可用时回退 CPU；`cpu` 强制 CPU；`gpu` 不可用会失败 |
 | `DECIMER_TIMEOUT_SECONDS` | `120` | 单次初始化/推理超时时间 |
 | `DECIMER_IMAGE_STRATEGY` | `original` | `original`、`grayscale`、`normalized`、`binary` |
 | `DECIMER_MODEL_NAME` | `DECIMER Image Transformer` | 报告和界面显示用模型名 |
 | `DECIMER_MODEL_VERSION` | 空 | 可选模型/包版本备注 |
-| `DECIMER_STRICT_MODE` | `false` | 为 `true` 时 GPU 不可用会报错，不回退 CPU |
+| `DECIMER_STRICT_MODE` | `false` | 兼容旧配置；仅用于控制 `auto` 在 GPU 不可用时是否允许回退 CPU |
+| `DECIMER_ISOLATED_SUBPROCESS` | `true` | 在独立子进程中执行真实模型推理，超时或取消时可终止进程树 |
 
 当前官方 `decimer` 包通常自行管理模型资源；本项目不新增伪造的 DECIMER checkpoint 路径配置。如你使用的发行版本需要外部模型目录，应先按该版本官方说明安装配置，再用诊断脚本确认。
 
@@ -483,7 +526,7 @@ python scripts/evaluate_ocsr.py --manifest benchmark/example_manifest.csv --back
 python scripts/check_ocsr_backend.py --backend ensemble
 ```
 
-默认 `OCSR_ENSEMBLE_PARALLEL=false`，采用串行安全模式，避免在同一张 4080S 上同时加载多个大型模型导致显存压力。确认显存、CUDA/PyTorch/TensorFlow 配置稳定后，可以显式启用并行：
+默认 `OCSR_ENSEMBLE_PARALLEL=false`，采用串行安全模式，避免在同一张 GPU 上同时加载多个大型模型导致显存压力。确认显存、CUDA/PyTorch/TensorFlow 配置稳定后，可以显式启用并行：
 
 ```powershell
 $env:OCSR_ENSEMBLE_PARALLEL="true"
@@ -526,7 +569,7 @@ $env:OCSR_ENSEMBLE_TOTAL_TIMEOUT_SECONDS="240"
 
 ### 本机 GPU 说明
 
-本项目现在默认让 MolScribe 使用 `OCSR_DEVICE=auto`，当 PyTorch 能检测到 CUDA 时会使用本机 GPU；你也可以显式设置 `$env:OCSR_DEVICE="cuda"`。DECIMER 使用 TensorFlow，需 TensorFlow 能检测到 GPU 才会用 4080S；当前本机诊断显示 `tensorflow==2.20.0` 未检测到 GPU，因此 DECIMER 会安全回退 CPU。后续若要让 DECIMER 使用 4080S，建议先解决 TensorFlow GPU 运行时，再用：
+本项目现在默认让 MolScribe 使用 `OCSR_DEVICE=auto`，当 PyTorch 能检测到 CUDA 时会使用本机 GPU；你也可以显式设置 `$env:OCSR_DEVICE="cuda"`。DECIMER 使用 TensorFlow，需 TensorFlow 能检测到 GPU 才会使用目标 GPU；如果诊断显示 TensorFlow 未检测到 GPU，DECIMER 会在 `auto` 模式下安全回退 CPU。后续若要强制 DECIMER 使用 GPU，建议先解决 TensorFlow GPU 运行时，再用：
 
 ```bash
 python scripts/check_ocsr_backend.py --backend decimer
@@ -688,7 +731,7 @@ Each region is exported with:
 }
 ```
 
-The fallback detector distinguishes `molecule`, `text`, `table`, `reaction_like`, and `unknown`. `reaction_like`, `text`, `table`, and manually marked `non_molecule` regions are not sent to single-molecule OCSR by default. Reaction parsing is not implemented in this task, so reaction-like graphics are recorded as unsupported rather than treated as ordinary molecules.
+The document detector is pluggable: `HybridMoleculeRegionDetector` can combine a future trainable layout model with the OpenCV fallback. The fallback distinguishes `molecule`, `reaction_arrow`, `reaction_condition`, `reaction_like`, `text`, `table`, `figure`, and `unknown`. Reaction regions, text, tables, figures, and manually marked `non_molecule` regions are not sent to single-molecule OCSR by default. Reaction parsing is not implemented in this task, so reaction graphics are recorded as unsupported rather than treated as ordinary molecules.
 
 Streamlit provides a `PDF/多分子文档` tab for page review, detected boxes, deletion of false positives, manual bbox addition, coordinate adjustment, region type changes, single-region reprocessing, and result downloads. User edits are recorded in each region's `audit` list with before/after bbox/type metadata and timestamp.
 
@@ -702,4 +745,4 @@ Each document run writes an isolated output directory containing:
 - `annotated_pages/`
 - `document_results.zip`
 
-The heuristic detector is intentionally conservative and is not a trained layout model. It can miss low-resolution structures, split dense diagrams, or mark complex reaction schemes as `reaction_like`. Use the manual region editor for review before treating document-level outputs as curated data.
+The heuristic detector is intentionally conservative and is not a trained layout model. It can miss low-resolution structures, split dense diagrams, merge nearby structures, or mark complex reaction schemes as `reaction_like`. Use the manual region editor for review before treating document-level outputs as curated data.

@@ -29,9 +29,12 @@ BACKEND_DESCRIPTIONS = {
 
 REGION_TYPE_LABELS = {
     "molecule": "分子结构",
+    "reaction_arrow": "反应箭头",
+    "reaction_condition": "反应条件",
+    "reaction_like": "疑似反应式",
     "text": "文本",
     "table": "表格",
-    "reaction_like": "疑似反应式或图注",
+    "figure": "普通图像/插图",
     "unknown": "未知区域",
     "non_molecule": "非分子区域",
 }
@@ -135,7 +138,11 @@ def real_backend_count(statuses: dict[str, dict[str, Any]]) -> int:
     return sum(1 for backend in ("molscribe", "decimer") if statuses.get(backend, {}).get("available"))
 
 
-def runnable_backends(statuses: dict[str, dict[str, Any]], include_demo: bool = False) -> list[str]:
+def runnable_backends(
+    statuses: dict[str, dict[str, Any]],
+    include_demo: bool = False,
+    allow_demo_fallback: bool = True,
+) -> list[str]:
     """Return backends that users may run from the main selector."""
     options: list[str] = []
     if statuses.get("decimer", {}).get("available"):
@@ -144,14 +151,18 @@ def runnable_backends(statuses: dict[str, dict[str, Any]], include_demo: bool = 
         options.append("molscribe")
     if real_backend_count(statuses) >= 2:
         options.append("ensemble")
-    if include_demo or not options:
+    if include_demo or (allow_demo_fallback and not options):
         options.append("demo")
     return options
 
 
-def default_backend(statuses: dict[str, dict[str, Any]], configured: str | None = None) -> str:
+def default_backend(
+    statuses: dict[str, dict[str, Any]],
+    configured: str | None = None,
+    allow_demo_fallback: bool = True,
+) -> str:
     """Prefer real OCSR backends over demo, with DECIMER first when available."""
-    options = runnable_backends(statuses)
+    options = runnable_backends(statuses, allow_demo_fallback=allow_demo_fallback)
     if "decimer" in options:
         return "decimer"
     if configured in options and configured != "demo":
@@ -160,7 +171,7 @@ def default_backend(statuses: dict[str, dict[str, Any]], configured: str | None 
         return "molscribe"
     if "ensemble" in options:
         return "ensemble"
-    return "demo"
+    return "demo" if allow_demo_fallback else ""
 
 
 def unavailable_backends(statuses: dict[str, dict[str, Any]]) -> list[str]:

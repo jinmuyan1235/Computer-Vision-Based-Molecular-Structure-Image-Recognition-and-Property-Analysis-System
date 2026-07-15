@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -22,6 +21,12 @@ from src.ui.labels import REGION_TYPE_LABELS, localize_region_rows
 from src.ui.records import render_records
 from src.ui.state import current_runtime_key, get_document_processor, remember_backend_status, runtime_config_from_key
 from src.ui.styles import page_intro
+from src.runtime.job_manager import (
+    extract_json_object,
+    run_json_command,
+    start_logged_process,
+    terminate_process_tree,
+)
 
 PROCESS_MODE_DETECT = "仅检测分子区域（速度快，不执行结构识别）"
 PROCESS_MODE_FULL = "检测并识别分子结构（调用 OCSR，耗时较长）"
@@ -122,15 +127,13 @@ def _start_document_job(input_path: Path, backend: str, run_ocsr: bool) -> None:
     env = os.environ.copy()
     env.setdefault("MOLSCRIBE_ISOLATED_SUBPROCESS", "true")
     env.setdefault("DECIMER_ISOLATED_SUBPROCESS", "true")
-    with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
-        process = subprocess.Popen(
-            _document_command(input_path, backend, run_ocsr),
-            cwd=PROJECT_ROOT,
-            env=env,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            text=True,
-        )
+    process = start_logged_process(
+        _document_command(input_path, backend, run_ocsr),
+        cwd=PROJECT_ROOT,
+        env=env,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
     st.session_state["document_job"] = {
         "process": process,
         "backend": backend,
@@ -145,13 +148,21 @@ def _render_document_job_status() -> None:
     job = st.session_state.get("document_job")
     if not job:
         return
-    process: subprocess.Popen = job["process"]
+    process = job["process"]
     elapsed = time.time() - float(job.get("started_at", time.time()))
     return_code = process.poll()
     if return_code is None:
         st.info(f"文档处理正在后台运行，已耗时 {elapsed:.1f} 秒。页面会自动刷新，期间不会阻塞 Streamlit。")
         st.caption(f"后台日志：{job.get('stdout_path')} / {job.get('stderr_path')}")
         st.progress(min(elapsed / 120.0, 0.95))
+        if st.button("取消文档后台任务", key="cancel_document_job"):
+            terminate_process_tree(process)
+            input_path = Path(str(job.get("input_path") or ""))
+            if input_path.exists():
+                input_path.unlink(missing_ok=True)
+            st.session_state.pop("document_job", None)
+            st.warning("已取消文档处理任务并终止后台进程。")
+            return
         time.sleep(2)
         st.rerun()
 
@@ -221,11 +232,12 @@ def _apply_document_edits_subprocess(
     env = os.environ.copy()
     env.setdefault("MOLSCRIBE_ISOLATED_SUBPROCESS", "true")
     env.setdefault("DECIMER_ISOLATED_SUBPROCESS", "true")
-    completed = subprocess.run(command, cwd=PROJECT_ROOT, env=env, capture_output=True, text=True, timeout=900)
-    payload = _extract_json_object(completed.stdout)
+    completed = run_json_command(command, cwd=PROJECT_ROOT, env=env, timeout=900)
+    payload = completed.payload
+    if completed.timed_out:
+        raise RuntimeError("文档编辑子进程超时，已终止后台进程。")
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
-        message = detail[-1] if detail else f"文档编辑子进程退出码 {completed.returncode}"
+        message = completed.last_output_line() or f"文档编辑子进程退出码 {completed.returncode}"
         if payload and payload.get("message"):
             message = str(payload["message"])
         raise RuntimeError(message)
@@ -245,20 +257,7 @@ def _apply_document_edits(document_result: dict, backend: str, edits: list[dict]
 
 
 def _extract_json_object(text: str) -> dict | None:
-    stripped = text.strip()
-    if not stripped:
-        return None
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(stripped):
-        if char != "{":
-            continue
-        try:
-            value, _end = decoder.raw_decode(stripped[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    return None
+    return extract_json_object(text)
 
 
 def show_document_result(document_result: dict, backend: str) -> dict:
@@ -351,7 +350,7 @@ def _region_editor(document_result: dict, backend: str) -> dict:
             key=f"edit_type_{selected_id}",
         )
         actions = st.columns(3)
-        if actions[0].button("更新区域并重新识别", key=f"update_region_{selected_id}"):
+        if actions[0].button("更新区域并重新处理", key=f"update_region_{selected_id}"):
             try:
                 document_result = _apply_document_edits(
                     document_result,
@@ -400,11 +399,11 @@ def _region_editor(document_result: dict, backend: str) -> dict:
         add_y2 = row2[1].number_input("新区域 y2", min_value=1, value=200, key="add_y2")
         add_type = st.selectbox(
             "新区域类型",
-            ["molecule", "text", "table", "reaction_like", "unknown"],
+            ["molecule", "reaction_arrow", "reaction_condition", "reaction_like", "text", "table", "figure", "unknown"],
             format_func=lambda value: REGION_TYPE_LABELS[value],
             key="add_type",
         )
-        if st.button("添加区域并识别", key="add_region"):
+        if st.button("添加区域并处理", key="add_region"):
             try:
                 document_result = _apply_document_edits(
                     document_result,

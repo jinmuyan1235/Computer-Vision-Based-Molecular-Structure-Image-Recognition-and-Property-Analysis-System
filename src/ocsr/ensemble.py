@@ -12,6 +12,7 @@ from rdkit.Chem import AllChem, rdMolDescriptors
 
 import config
 from src.chem.smiles_validator import smiles_to_mol, suppress_rdkit_parse_errors, validate_smiles
+from src.runtime.metadata import dependency_versions, git_commit
 
 from .base import BaseOCSRAdapter, OCSRResult
 from .decimer_adapter import DECIMERAdapter
@@ -97,6 +98,7 @@ def candidate_from_result(result: OCSRResult) -> dict[str, Any]:
         "inference_time_ms": result.inference_time_ms,
         "model_name": result.model_name,
         "model_version": result.model_version,
+        "model_sha256": result.model_sha256,
         "device": result.device,
         "package_version": result.package_version,
         "status": result.status,
@@ -158,14 +160,14 @@ def rank_candidates(
     backend_priority: list[str] | None = None,
     reliability_weights: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
-    """Rank candidates without comparing uncalibrated cross-backend confidence."""
+    """Decide whether ensemble candidates can be accepted automatically."""
     priority = backend_priority or list(config.OCSR_ENSEMBLE_BACKEND_PRIORITY)
-    weights = dict(reliability_weights or config.OCSR_ENSEMBLE_RELIABILITY_WEIGHTS)
     successful = [candidate for candidate in candidates if candidate.get("status") == "success" and candidate.get("raw_smiles")]
     valid = [candidate for candidate in successful if candidate.get("valid")]
     if not successful:
         return {
             "status": "all_failed",
+            "decision": "rejected",
             "recommended_smiles": None,
             "recommended_backend": None,
             "reason": "所有启用的 OCSR 后端均未返回 SMILES。",
@@ -174,6 +176,7 @@ def rank_candidates(
     if not valid:
         return {
             "status": "invalid_candidates",
+            "decision": "rejected",
             "recommended_smiles": None,
             "recommended_backend": None,
             "reason": "至少一个后端返回了 SMILES，但均无法被 RDKit 解析。",
@@ -195,6 +198,7 @@ def rank_candidates(
         representative = sorted(group, key=lambda candidate: _priority_index(str(candidate.get("backend")), priority))[0]
         return {
             "status": "agreement",
+            "decision": "accepted",
             "recommended_smiles": representative.get("canonical_smiles"),
             "recommended_backend": "consensus",
             "supporting_backends": [candidate.get("backend") for candidate in group],
@@ -205,28 +209,39 @@ def rank_candidates(
         candidate = valid[0]
         return {
             "status": "single_valid",
+            "decision": "accepted",
+            "decision_note": "accepted_with_single_backend",
             "recommended_smiles": candidate.get("canonical_smiles"),
             "recommended_backend": candidate.get("backend"),
             "supporting_backends": [candidate.get("backend")],
-            "reason": "只有一个后端返回 RDKit 可解析的 SMILES。",
+            "reason": "只有一个后端返回 RDKit 可解析的 SMILES；自动采用，但建议人工抽查。",
+            "warning": "仅一个真实后端给出有效结构，可信度低于多模型一致结果。",
             "confidence_policy": "未比较跨模型 confidence。",
         }
-    ranked = sorted(
+    ranked_for_review = sorted(
         valid,
         key=lambda candidate: (
-            -float(weights.get(str(candidate.get("backend")), 1.0)),
             _priority_index(str(candidate.get("backend")), priority),
         ),
     )
-    selected = ranked[0]
     return {
         "status": "disagreement",
-        "recommended_smiles": selected.get("canonical_smiles"),
-        "recommended_backend": selected.get("backend"),
-        "supporting_backends": [selected.get("backend")],
+        "decision": "review_needed",
+        "recommended_smiles": None,
+        "recommended_backend": None,
+        "review_candidates": [
+            {
+                "backend": candidate.get("backend"),
+                "canonical_smiles": candidate.get("canonical_smiles"),
+                "raw_smiles": candidate.get("raw_smiles"),
+                "confidence": candidate.get("confidence"),
+                "model_name": candidate.get("model_name"),
+            }
+            for candidate in ranked_for_review
+        ],
+        "supporting_backends": [],
         "reason": (
-            "多个后端返回了不同的有效分子；推荐值仅按可配置优先级/可靠性权重暂选，"
-            "不代表已确认与原图一致。"
+            "多个后端返回了不同的有效分子；系统不会自动选择最终结构，请人工确认。"
         ),
         "warning": "模型分歧未被自动解决，请人工确认。",
         "confidence_policy": "未比较未经校准的跨模型 confidence。",
@@ -329,7 +344,8 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
         elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
         self.last_inference_time_ms = elapsed_ms
         recommended = consensus.get("recommended_smiles")
-        status = "success" if recommended else "failed"
+        decision = str(consensus.get("decision") or ("accepted" if recommended else "rejected"))
+        status = "success" if decision == "accepted" and recommended else "failed"
         message = str(consensus.get("reason") or "ensemble 推理完成。")
         return OCSRResult(
             smiles=str(recommended) if recommended else None,
@@ -342,6 +358,9 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
             model_version=None,
             device="mixed",
             package_version=None,
+            git_commit=git_commit(),
+            dependency_versions=dependency_versions(),
+            result_origin="real_model_ensemble",
             candidates=candidates,
             consensus=consensus,
             similarity_analysis=similarity,

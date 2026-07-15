@@ -109,6 +109,14 @@ def _write_charts(run_dir: Path, rows: list[dict[str, Any]], metrics: dict[str, 
                 for category, group in metrics.get("groups", {}).get("category", {}).items()
             },
         ),
+        "image_quality_accuracy.png": lambda path: _bar_chart(
+            path,
+            "Canonical exact match rate by image quality",
+            {
+                quality: group["canonical_exact_match_rate"]
+                for quality, group in metrics.get("groups", {}).get("image_quality", {}).items()
+            },
+        ),
         "similarity_distribution.png": lambda path: _histogram(
             path,
             "Tanimoto similarity distribution",
@@ -182,8 +190,15 @@ def _write_report(run_dir: Path, metadata: dict[str, Any], metrics: dict[str, An
             "recognition_success_rate",
             "rdkit_valid_count",
             "rdkit_valid_rate",
+            "valid_smiles_rate",
             "canonical_exact_match_count",
             "canonical_exact_match_rate",
+            "stereochemistry_exact_rate",
+            "atom_count_error_rate",
+            "formal_charge_error_rate",
+            "bond_type_error_rate",
+            "expected_calibration_error",
+            "rejection_coverage",
             "molecule_equivalent_count",
             "molecule_equivalent_rate",
             "mean_similarity",
@@ -207,6 +222,31 @@ def _write_report(run_dir: Path, metadata: dict[str, Any], metrics: dict[str, An
         "canonical_exact_match_rate",
         "molecule_equivalent_rate",
     ]))
+    for group_name, label in (
+        ("source", "Source Metrics"),
+        ("image_quality", "Image Quality Metrics"),
+        ("complexity", "Structure Complexity Metrics"),
+        ("perturbation", "Perturbation Metrics"),
+    ):
+        rows_for_group = [
+            {group_name: key, **group}
+            for key, group in metrics.get("groups", {}).get(group_name, {}).items()
+        ]
+        lines.extend([
+            f"## {label}",
+            "",
+            _markdown_table(rows_for_group, [
+                group_name,
+                "total_samples",
+                "recognition_success_rate",
+                "valid_smiles_rate",
+                "canonical_exact_match_rate",
+                "stereochemistry_exact_rate",
+                "atom_count_error_rate",
+                "formal_charge_error_rate",
+                "bond_type_error_rate",
+            ]),
+        ])
     lines.extend([
         "## Ensemble Diagnostics",
         "",

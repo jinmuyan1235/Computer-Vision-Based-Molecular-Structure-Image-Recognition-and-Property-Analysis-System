@@ -43,6 +43,7 @@ def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, An
         standardization = report.get("standardization", {}) or {}
         structure_warnings = report.get("structure_warnings", []) or []
         consensus = ocsr.get("consensus", {}) or {}
+        runtime = report.get("runtime", {}) or {}
         descriptors = report.get("descriptors", {}) or {}
         lipinski = report.get("lipinski", {}) or {}
         admet = report.get("admet", {}) or {}
@@ -57,6 +58,12 @@ def save_pdf(report: Mapping[str, Any], output_path: str | Path) -> dict[str, An
             [cell("Analysis ID"), cell(report.get("analysis_id", ""))],
             [cell("Input"), cell(report.get("input", {}).get("filename") or report.get("input", {}).get("smiles", ""))],
             [cell("Backend"), cell(ocsr.get("backend", "manual"))],
+            [cell("App mode"), cell(runtime.get("app_mode", ""))],
+            [cell("Model name"), cell(ocsr.get("model_name", ""))],
+            [cell("Model version"), cell(ocsr.get("model_version", ""))],
+            [cell("Model SHA-256"), cell(ocsr.get("model_sha256", ""))],
+            [cell("Device"), cell(ocsr.get("device", ""))],
+            [cell("Git commit"), cell(ocsr.get("git_commit") or runtime.get("git_commit", ""))],
             [cell("Consensus Status"), cell(consensus.get("status", ""))],
             [cell("Recommended Backend"), cell(consensus.get("recommended_backend", ""))],
             [cell("Consensus Reason"), cell(consensus.get("reason", ""))],

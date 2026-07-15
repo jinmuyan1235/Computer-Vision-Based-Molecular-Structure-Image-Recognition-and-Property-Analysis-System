@@ -19,8 +19,12 @@ class OCSRResult:
     inference_time_ms: float | None = None
     model_name: str | None = None
     model_version: str | None = None
+    model_sha256: str | None = None
     device: str | None = None
     package_version: str | None = None
+    git_commit: str | None = None
+    dependency_versions: dict[str, str | None] | None = None
+    result_origin: str | None = None
     candidates: list[dict[str, Any]] | None = None
     consensus: dict[str, Any] | None = None
     similarity_analysis: list[dict[str, Any]] | None = None

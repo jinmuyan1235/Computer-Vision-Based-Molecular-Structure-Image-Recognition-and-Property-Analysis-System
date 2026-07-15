@@ -7,7 +7,7 @@ from typing import Any
 
 import streamlit as st
 
-from config import OUTPUT_DIR
+from config import DATA_DIR, OUTPUT_DIR
 from src.analysis.correction import (
     apply_smiles_correction,
     restore_original_prediction,
@@ -28,13 +28,19 @@ def show_ensemble_details(ocsr: dict[str, Any]) -> None:
         return
     with st.expander("多后端候选与一致性", expanded=False):
         status = consensus.get("status") or "unknown"
+        decision = consensus.get("decision") or "unknown"
         reason = consensus.get("reason") or ""
-        if status == "agreement":
-            st.success(f"候选一致：{reason}")
-        elif status == "disagreement":
+        if decision == "accepted" and status == "agreement":
+            st.success(f"自动接受：{reason}")
+        elif decision == "accepted":
             st.warning(consensus.get("warning") or reason)
+        elif decision == "review_needed":
+            st.warning(consensus.get("warning") or reason or "需要人工确认。")
+        elif decision == "rejected":
+            st.error(reason or "无可靠候选。")
         else:
             st.info(reason or "暂无一致性结论。")
+        st.caption(f"ensemble 决策：{decision}；候选状态：{status}")
         if candidates:
             rows = []
             for candidate in candidates:
@@ -75,10 +81,16 @@ def show_chemical_identity(report: dict[str, Any]) -> None:
 def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bool, key_prefix: str) -> None:
     """Render a molecule analysis report in Streamlit."""
     if report.get("status") != "success":
-        st.error(report.get("message", "分析失败。"))
         ocsr = report.get("ocsr") or {}
+        consensus = ocsr.get("consensus") or {}
+        if consensus.get("decision") == "review_needed":
+            st.warning(report.get("message", "多个后端结果不一致，需要人工确认。"))
+        else:
+            st.error(report.get("message", "分析失败。"))
         if ocsr:
             st.caption(f"后端：{backend_label(ocsr.get('backend'), short=True)}；状态：{status_label(ocsr.get('status'))}")
+            if ocsr.get("backend") == "demo":
+                st.warning("这是演示后端，不会识别任意图片；请使用真实后端或手动输入 SMILES。")
             show_ensemble_details(ocsr)
         return
 
@@ -87,6 +99,10 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
     final = report.get("final") or {}
     validation = report.get("validation") or {}
     st.success(report.get("message", "分析完成。"))
+    if ocsr.get("backend") == "demo":
+        st.warning("当前是演示结果：系统按内置样例文件名返回固定 SMILES，并没有进行真实图片识别。")
+    elif ocsr.get("result_origin") in {"real_model", "real_model_ensemble"}:
+        st.caption("当前结果来自真实 OCSR 模型推理。")
 
     left, right = st.columns([1.1, 0.9])
     with left:
@@ -173,12 +189,17 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
                 st.caption(pdf_result["message"])
 
     with st.expander("技术诊断", expanded=False):
+        runtime = report.get("runtime") or {}
         st.json({
             "backend": ocsr.get("backend"),
             "device": ocsr.get("device"),
             "model_name": ocsr.get("model_name"),
             "model_version": ocsr.get("model_version"),
+            "model_sha256": ocsr.get("model_sha256"),
             "package_version": ocsr.get("package_version"),
+            "git_commit": ocsr.get("git_commit") or runtime.get("git_commit"),
+            "app_mode": runtime.get("app_mode"),
+            "dependency_versions": ocsr.get("dependency_versions") or runtime.get("dependency_versions"),
             "inference_time_ms": ocsr.get("inference_time_ms"),
         })
 
@@ -206,7 +227,7 @@ def show_correction_panel(report: dict[str, Any]) -> dict[str, Any]:
         key=f"corrected_smiles_{analysis_id}",
         placeholder="OCSR 失败时也可以手动输入 SMILES",
     )
-    apply_col, restore_col, feedback_col = st.columns(3)
+    apply_col, restore_col = st.columns(2)
     current_report = report
     if apply_col.button("校验并应用修正", type="primary", key=f"apply_correction_{analysis_id}"):
         candidate = apply_smiles_correction(report, corrected_input, OUTPUT_DIR)
@@ -227,15 +248,84 @@ def show_correction_panel(report: dict[str, Any]) -> dict[str, Any]:
             st.session_state["image_report"] = current_report
             st.success("已恢复为模型原始预测。")
 
-    notes = st.text_area("反馈备注（可选）", value="", key=f"feedback_notes_{analysis_id}", height=70)
-    if feedback_col.button(
-        "保存为纠错反馈样本",
-        key=f"save_feedback_{analysis_id}",
-        disabled=not bool((current_report.get("correction") or {}).get("applied")),
-    ):
-        feedback_path = save_correction_feedback(current_report, OUTPUT_DIR, notes)
-        st.session_state[f"feedback_path_{analysis_id}"] = feedback_path
-        st.success(f"反馈样本已保存：{feedback_path}")
+    with st.expander("纠错反馈与数据回流", expanded=False):
+        correction_type = st.selectbox(
+            "纠错类型",
+            ["atom", "bond", "charge", "stereo", "missing_fragment", "other"],
+            format_func={
+                "atom": "原子错误",
+                "bond": "键类型/连接错误",
+                "charge": "电荷错误",
+                "stereo": "立体化学错误",
+                "missing_fragment": "缺失片段",
+                "other": "其他",
+            }.get,
+            key=f"feedback_type_{analysis_id}",
+        )
+        review_status = st.selectbox(
+            "二次审核状态",
+            ["pending", "verified", "rejected"],
+            format_func={"pending": "待审核", "verified": "已核验", "rejected": "已拒绝"}.get,
+            key=f"feedback_review_{analysis_id}",
+        )
+        source_col, license_col = st.columns(2)
+        source_reference = source_col.text_input(
+            "来源或引用（可选）",
+            value="",
+            key=f"feedback_source_{analysis_id}",
+            placeholder="DOI / 专利号 / 内部数据批次 / URL",
+        )
+        source_license = license_col.text_input(
+            "许可说明（可选）",
+            value="",
+            key=f"feedback_license_{analysis_id}",
+            placeholder="CC-BY-4.0 / internal / unknown",
+        )
+        privacy_notes = st.text_input(
+            "隐私/脱敏说明（可选）",
+            value="",
+            key=f"feedback_privacy_{analysis_id}",
+            placeholder="例如：已裁去个人信息；仅保留分子区域",
+        )
+        notes = st.text_area("反馈备注（可选）", value="", key=f"feedback_notes_{analysis_id}", height=70)
+        can_save_feedback = bool((current_report.get("correction") or {}).get("applied"))
+        save_col, accept_col = st.columns(2)
+        if save_col.button("仅保存纠错", key=f"save_feedback_{analysis_id}", disabled=not can_save_feedback):
+            result = save_correction_feedback(
+                current_report,
+                DATA_DIR,
+                notes=notes,
+                correction_type=correction_type,
+                review_status=review_status,
+                feedback_action="correction_only",
+                include_in_training=False,
+                source_reference=source_reference,
+                source_license=source_license,
+                privacy_notes=privacy_notes,
+            )
+            st.session_state[f"feedback_result_{analysis_id}"] = result
+            if result.get("duplicate_image"):
+                st.warning(f"已保存纠错；检测到重复图片，首次记录：{result.get('duplicate_of')}")
+            else:
+                st.success(f"纠错已保存：{result.get('annotation_path')}")
+        if accept_col.button("确认进入训练集", key=f"accept_feedback_{analysis_id}", disabled=not can_save_feedback):
+            result = save_correction_feedback(
+                current_report,
+                DATA_DIR,
+                notes=notes,
+                correction_type=correction_type,
+                review_status="verified",
+                feedback_action="accepted_for_dataset",
+                include_in_training=True,
+                source_reference=source_reference,
+                source_license=source_license,
+                privacy_notes=privacy_notes,
+            )
+            st.session_state[f"feedback_result_{analysis_id}"] = result
+            if result.get("duplicate_image"):
+                st.warning(f"已确认入库；检测到重复图片，首次记录：{result.get('duplicate_of')}")
+            else:
+                st.success(f"已确认进入训练集：{result.get('manifest_path')}")
 
     images = current_report.get("images") or {}
     predicted_image = images.get("predicted_molecule")

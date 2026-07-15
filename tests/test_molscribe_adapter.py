@@ -98,6 +98,37 @@ def test_molscribe_explicit_cuda_unavailable_does_not_fallback(monkeypatch) -> N
         raise AssertionError("Expected explicit CUDA failure")
 
 
+def test_molscribe_auto_can_fallback_unless_strict(monkeypatch) -> None:
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+        @staticmethod
+        def device(name: str) -> str:
+            return name
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch)
+    monkeypatch.setattr("src.ocsr.molscribe_adapter.config.OCSR_GPU_REQUIRED", False)
+
+    auto = MolScribeAdapter(model_path="models/model.pth", device="auto", strict_mode=False)
+    assert auto._resolve_device_object() == "cpu"
+    assert auto.device == "cpu"
+
+    strict_auto = MolScribeAdapter(model_path="models/model.pth", device="auto", strict_mode=True)
+    try:
+        strict_auto._resolve_device_object()
+    except MolScribeConfigurationError as exc:
+        assert "不允许回退 CPU" in str(exc)
+    else:
+        raise AssertionError("Expected strict auto device failure")
+
+
 def test_molscribe_numpy_input_uses_predict_image(monkeypatch, tmp_path: Path) -> None:
     model_path = tmp_path / "model.pth"
     model_path.write_bytes(b"placeholder")

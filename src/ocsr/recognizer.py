@@ -13,6 +13,10 @@ from .ensemble import EnsembleOCSRAdapter
 from .molscribe_adapter import MolScribeAdapter
 
 
+class ProductionModeError(ValueError):
+    """Raised when demo image recognition is requested in production mode."""
+
+
 class MoleculeRecognizer:
     """Select and execute one of the configured OCSR adapters."""
 
@@ -27,6 +31,8 @@ class MoleculeRecognizer:
         self.backend = (backend or config.OCSR_BACKEND).strip().lower()
         if self.backend not in self.ADAPTERS:
             raise ValueError(f"Unsupported OCSR backend: {self.backend}. Choose demo/molscribe/decimer/ensemble.")
+        if config.APP_MODE == "production" and self.backend == "demo":
+            raise ProductionModeError("APP_MODE=production 禁止使用 demo 图片识别后端；请配置 MolScribe/DECIMER。")
         self.runtime_config = runtime_config or {}
         self.adapter = self._build_adapter()
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -21,6 +20,7 @@ from src.ui.state import (
     runtime_config_from_key,
 )
 from src.ui.styles import page_intro
+from src.runtime.job_manager import extract_json_object, run_json_command
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -129,18 +129,17 @@ def _run_batch_subprocess(input_dir: str | Path, backend: str) -> dict:
     env = os.environ.copy()
     env.setdefault("MOLSCRIBE_ISOLATED_SUBPROCESS", "true")
     env.setdefault("DECIMER_ISOLATED_SUBPROCESS", "true")
-    completed = subprocess.run(
+    completed = run_json_command(
         command,
         cwd=PROJECT_ROOT,
         env=env,
-        capture_output=True,
-        text=True,
         timeout=1800,
     )
-    payload = _extract_json_object(completed.stdout)
+    payload = completed.payload
+    if completed.timed_out:
+        raise RuntimeError("批量处理子进程超时，已终止后台进程。")
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
-        message = detail[-1] if detail else f"批量处理子进程退出码 {completed.returncode}"
+        message = completed.last_output_line() or f"批量处理子进程退出码 {completed.returncode}"
         if payload and payload.get("message"):
             message = str(payload["message"])
         raise RuntimeError(message)
@@ -153,20 +152,7 @@ def _run_batch_subprocess(input_dir: str | Path, backend: str) -> dict:
 
 
 def _extract_json_object(text: str) -> dict | None:
-    stripped = text.strip()
-    if not stripped:
-        return None
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(stripped):
-        if char != "{":
-            continue
-        try:
-            value, _end = decoder.raw_decode(stripped[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    return None
+    return extract_json_object(text)
 
 
 def default_batch_columns_chinese() -> list[str]:

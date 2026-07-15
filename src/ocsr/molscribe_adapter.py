@@ -5,9 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import importlib.util
-import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -22,6 +20,8 @@ import config
 from src.chem.smiles_validator import validate_smiles
 from src.runtime.cuda_env import nvidia_library_paths
 from src.runtime.inference_scheduler import GLOBAL_INFERENCE_SCHEDULER
+from src.runtime.job_manager import MODEL_WORKER_RESULT_MARKER, run_json_command
+from src.runtime.metadata import dependency_versions, git_commit, sha256_file
 from .base import BaseOCSRAdapter, OCSRResult
 
 ImageStrategy = Literal["original", "grayscale", "normalized", "binary"]
@@ -114,6 +114,8 @@ class MolScribeAdapter(BaseOCSRAdapter):
         except Exception as exc:
             if requested.startswith("cuda") or requested == "gpu":
                 raise MolScribeConfigurationError(f"请求 CUDA 设备，但 PyTorch 不可导入：{exc}") from exc
+            if requested == "auto" and (self.strict_mode or config.OCSR_GPU_REQUIRED):
+                raise MolScribeConfigurationError(f"自动选择设备时 PyTorch 不可导入，且当前配置不允许回退 CPU：{exc}") from exc
             self.device = "cpu"
             return "cpu"
         wants_cuda = requested == "auto" or requested == "gpu" or requested.startswith("cuda")
@@ -121,15 +123,12 @@ class MolScribeAdapter(BaseOCSRAdapter):
             self.device = "cuda" if requested in {"auto", "gpu"} else requested
             return torch.device(self.device)
         if requested == "auto":
+            if self.strict_mode or config.OCSR_GPU_REQUIRED:
+                raise MolScribeConfigurationError("自动选择设备时 CUDA 不可用，且当前配置不允许回退 CPU。")
             self.device = "cpu"
             return torch.device("cpu")
         if requested == "gpu" or requested.startswith("cuda"):
             raise MolScribeConfigurationError("请求 CUDA 设备，但 torch.cuda.is_available() 为 False；不会静默回退 CPU。")
-        if requested == "gpu" or requested.startswith("cuda"):
-            if self.strict_mode:
-                raise MolScribeConfigurationError("请求 CUDA 设备，但 torch.cuda.is_available() 为 False。")
-            self.device = "cpu"
-            return torch.device("cpu")
         self.device = "cpu"
         return torch.device("cpu")
 
@@ -170,8 +169,12 @@ class MolScribeAdapter(BaseOCSRAdapter):
             inference_time_ms=inference_time_ms,
             model_name=self.model_name,
             model_version=self.model_version,
+            model_sha256=sha256_file(self.model_path),
             device=self.device,
             package_version=self.package_version,
+            git_commit=git_commit(),
+            dependency_versions=dependency_versions(),
+            result_origin="real_model",
             raw_output=raw_output,
         )
 
@@ -327,52 +330,36 @@ class MolScribeAdapter(BaseOCSRAdapter):
     def _recognize_in_subprocess(self, image_path_or_array: Any) -> OCSRResult:
         start = time.perf_counter()
         image_path, temp_path = self._path_for_subprocess(image_path_or_array)
-        code = """
-import json
-import os
-import sys
-from src.ocsr.molscribe_adapter import MolScribeAdapter
-
-adapter = MolScribeAdapter(
-    device=os.environ.get("MOLSCRIBE_DEVICE") or os.environ.get("OCSR_DEVICE") or "cpu",
-    isolated_subprocess=False,
-)
-result = adapter.recognize(sys.argv[1])
-print("MOLSCRIBE_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False))
-"""
         try:
-            completed = subprocess.run(
-                [sys.executable, "-c", code, image_path],
+            completed = run_json_command(
+                [
+                    sys.executable,
+                    "-m",
+                    "src.runtime.model_worker",
+                    "--backend",
+                    "molscribe",
+                    "--input",
+                    image_path,
+                    "--device",
+                    self.device,
+                ],
                 cwd=Path(__file__).resolve().parents[2],
                 env=self._subprocess_environment(),
-                capture_output=True,
-                text=True,
                 timeout=max(self.timeout_seconds + 60, 120),
+                marker=MODEL_WORKER_RESULT_MARKER,
             )
-        except subprocess.TimeoutExpired as exc:
-            elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
-            self.last_inference_time_ms = elapsed_ms
-            return self._result(None, None, "failed", f"MolScribe 隔离子进程超过 {exc.timeout:.1f} 秒超时。", elapsed_ms)
         finally:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
 
-        marker = "MOLSCRIBE_RESULT_JSON="
-        payload = None
-        for line in reversed(completed.stdout.splitlines()):
-            if line.startswith(marker):
-                payload = line[len(marker) :]
-                break
         elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
         self.last_inference_time_ms = elapsed_ms
-        if completed.returncode != 0 or payload is None:
-            detail = (completed.stderr or completed.stdout or "").strip().splitlines()
-            message = detail[-1] if detail else f"子进程退出码 {completed.returncode}"
+        if completed.timed_out:
+            return self._result(None, None, "failed", f"MolScribe 隔离子进程超过 {max(self.timeout_seconds + 60, 120):.1f} 秒超时。", elapsed_ms)
+        if completed.returncode != 0 or completed.payload is None:
+            message = completed.last_output_line() or f"子进程退出码 {completed.returncode}"
             return self._result(None, None, "failed", f"MolScribe 隔离子进程失败：{message}", elapsed_ms)
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            return self._result(None, None, "failed", f"MolScribe 子进程返回无法解析的 JSON：{exc}", elapsed_ms)
+        data = completed.payload
         result = OCSRResult(**{key: data.get(key) for key in OCSRResult.__dataclass_fields__})
         result.inference_time_ms = elapsed_ms
         self.device = result.device or self.device

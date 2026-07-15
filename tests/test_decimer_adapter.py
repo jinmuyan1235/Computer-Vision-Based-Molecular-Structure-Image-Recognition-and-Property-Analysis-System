@@ -76,6 +76,7 @@ def test_decimer_initialization_error(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_decimer_gpu_unavailable_never_silently_falls_back(monkeypatch) -> None:
+    monkeypatch.setattr("src.ocsr.decimer_adapter.config.OCSR_GPU_REQUIRED", False)
     status = {
         "tensorflow_installed": True,
         "tensorflow_version": "2.test",
@@ -96,6 +97,15 @@ def test_decimer_gpu_unavailable_never_silently_falls_back(monkeypatch) -> None:
     monkeypatch.setattr(auto, "_tensorflow_status", lambda load=True: status)
     auto._resolve_device()
     assert auto.device == "cpu"
+
+    strict_auto = DECIMERAdapter(device="auto", strict_mode=True)
+    monkeypatch.setattr(strict_auto, "_tensorflow_status", lambda load=True: status)
+    try:
+        strict_auto._resolve_device()
+    except DECIMERConfigurationError as exc:
+        assert "不允许回退 CPU" in str(exc)
+    else:
+        raise AssertionError("Expected strict auto device failure")
 
 
 def test_decimer_success_string_result(monkeypatch, tmp_path: Path) -> None:

@@ -6,7 +6,17 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-RegionType = Literal["molecule", "text", "table", "reaction_like", "unknown", "non_molecule"]
+RegionType = Literal[
+    "molecule",
+    "reaction_arrow",
+    "reaction_condition",
+    "reaction_like",
+    "text",
+    "table",
+    "figure",
+    "unknown",
+    "non_molecule",
+]
 
 
 @dataclass

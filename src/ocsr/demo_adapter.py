@@ -35,6 +35,7 @@ class DemoOCSRAdapter(BaseOCSRAdapter):
                         model_name="demo-filename-map",
                         model_version="built-in",
                         device="cpu",
+                        result_origin="demo_filename_map",
                     )
         return OCSRResult(
             smiles=None,
@@ -48,4 +49,5 @@ class DemoOCSRAdapter(BaseOCSRAdapter):
             model_name="demo-filename-map",
             model_version="built-in",
             device="cpu",
+            result_origin="demo_filename_map",
         )

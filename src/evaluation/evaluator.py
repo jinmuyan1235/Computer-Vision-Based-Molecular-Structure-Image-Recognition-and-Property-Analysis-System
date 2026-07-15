@@ -17,6 +17,7 @@ from src.evaluation.dataset import BenchmarkSample, load_manifest
 from src.evaluation.metrics import compute_metrics, enrich_prediction, molecule_identity, tanimoto_similarity
 from src.ocsr.recognizer import MoleculeRecognizer
 from src.preprocess.image_preprocessor import ImagePreprocessor
+from src.runtime.metadata import dependency_versions
 
 
 @dataclass(frozen=True)
@@ -92,7 +93,11 @@ class OCSREvaluator:
         row.update(
             {
                 "consensus_status": consensus.get("status"),
+                "consensus_decision": consensus.get("decision"),
                 "recommended_backend": consensus.get("recommended_backend"),
+                "ensemble_accepted": consensus.get("decision") == "accepted",
+                "ensemble_review_needed": consensus.get("decision") == "review_needed",
+                "ensemble_rejected": consensus.get("decision") == "rejected",
                 "ensemble_agreement": consensus.get("status") == "agreement",
                 "ensemble_disagreement": consensus.get("status") == "disagreement",
                 "ensemble_candidate_count": len(candidates),
@@ -140,8 +145,16 @@ class OCSREvaluator:
             "image_path": str(sample.image_path),
             "manifest_image_path": sample.manifest_image_path,
             "ground_truth_smiles": sample.ground_truth_smiles,
+            "expected_action": sample.expected_action,
             "category": sample.category,
             "source": sample.source,
+            "split": sample.split,
+            "scaffold_key": sample.scaffold_key,
+            "source_document": sample.source_document,
+            "image_quality": sample.image_quality,
+            "complexity": sample.complexity,
+            "perturbation": sample.perturbation,
+            "structure_features": sample.structure_features,
             "notes": sample.notes,
             "backend": self.backend,
             "preprocessing_strategy": self.preprocessing_strategy,
@@ -162,8 +175,10 @@ class OCSREvaluator:
                     "inference_time_ms": inference_time_ms,
                     "model_name": result.model_name,
                     "model_version": result.model_version,
+                    "model_sha256": result.model_sha256,
                     "device": result.device,
                     "package_version": result.package_version,
+                    "git_commit": result.git_commit,
                 }
             )
             self._add_ensemble_fields(base_row, result)
@@ -182,8 +197,10 @@ class OCSREvaluator:
                     "inference_time_ms": elapsed_ms,
                     "model_name": None,
                     "model_version": None,
+                    "model_sha256": None,
                     "device": None,
                     "package_version": None,
+                    "git_commit": None,
                 }
             )
         return enrich_prediction(
@@ -206,6 +223,7 @@ class OCSREvaluator:
             "python_version": platform.python_version(),
             "python_executable": sys.executable,
             "rdkit_version": rdkit_version(),
+            "dependency_versions": dependency_versions(),
             "backend": self.backend,
             "backend_status": self.recognizer.status(),
             "preprocessing_strategy": self.preprocessing_strategy,

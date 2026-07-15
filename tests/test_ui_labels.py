@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from src.ui.labels import backend_label, default_backend, runnable_backends, unavailable_backends
+from src.ui.labels import REGION_TYPE_LABELS, backend_label, default_backend, runnable_backends, unavailable_backends
 
 
 def test_backend_chinese_display_mapping_preserves_internal_values() -> None:
@@ -63,6 +63,17 @@ def test_demo_is_default_only_without_real_backends() -> None:
     assert default_backend(statuses, configured="decimer") == "demo"
 
 
+def test_production_mode_can_disable_demo_fallback() -> None:
+    statuses = {
+        "demo": {"available": True},
+        "molscribe": {"available": False},
+        "decimer": {"available": False},
+        "ensemble": {"available": False},
+    }
+    assert runnable_backends(statuses, allow_demo_fallback=False) == []
+    assert default_backend(statuses, configured="demo", allow_demo_fallback=False) == ""
+
+
 def test_image_preview_widths_are_limited() -> None:
     from src.ui import image_viewer
 
@@ -85,6 +96,12 @@ def test_batch_default_table_headers_are_chinese() -> None:
         "推理耗时(ms)",
         "失败原因",
     ]
+
+
+def test_document_region_type_labels_cover_reaction_workflow() -> None:
+    assert REGION_TYPE_LABELS["reaction_arrow"] == "反应箭头"
+    assert REGION_TYPE_LABELS["reaction_condition"] == "反应条件"
+    assert REGION_TYPE_LABELS["figure"] == "普通图像/插图"
 
 
 def test_batch_chart_source_uses_chinese_labels() -> None:

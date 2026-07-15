@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -20,6 +19,7 @@ from src.ui.state import (
     runtime_config_from_key,
 )
 from src.ui.styles import page_intro
+from src.runtime.job_manager import extract_json_object, run_json_command
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -79,18 +79,17 @@ def _process_image_subprocess(input_path: Path, backend: str, original_filename:
     env = os.environ.copy()
     env.setdefault("MOLSCRIBE_ISOLATED_SUBPROCESS", "true")
     env.setdefault("DECIMER_ISOLATED_SUBPROCESS", "true")
-    completed = subprocess.run(
+    completed = run_json_command(
         command,
         cwd=PROJECT_ROOT,
         env=env,
-        capture_output=True,
-        text=True,
         timeout=900,
     )
-    payload = _extract_json_object(completed.stdout)
+    payload = completed.payload
+    if completed.timed_out:
+        raise RuntimeError("图像识别子进程超时，已终止后台进程。")
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
-        message = detail[-1] if detail else f"图像识别子进程退出码 {completed.returncode}"
+        message = completed.last_output_line() or f"图像识别子进程退出码 {completed.returncode}"
         if payload and payload.get("message"):
             message = str(payload["message"])
         raise RuntimeError(f"图像识别子进程失败：{message}")
@@ -104,17 +103,4 @@ def _process_image_subprocess(input_path: Path, backend: str, original_filename:
 
 def _extract_json_object(text: str) -> dict | None:
     """Extract a JSON object from stdout that may also contain native-library logs."""
-    stripped = text.strip()
-    if not stripped:
-        return None
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(stripped):
-        if char != "{":
-            continue
-        try:
-            value, _end = decoder.raw_decode(stripped[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    return None
+    return extract_json_object(text)
