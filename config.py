@@ -88,8 +88,11 @@ class Settings:
     sample_dir: Path
     batch_input_dir: Path
     output_dir: Path
+    runs_dir: Path
     model_dir: Path
     document_output_dir: Path
+    run_retention_days: int
+    run_max_storage_gb: float
     default_image_size: tuple[int, int]
     ocsr_backend: Literal["demo", "molscribe", "decimer", "ensemble"]
     ocsr_device: str
@@ -131,6 +134,10 @@ class Settings:
     document_max_regions: int
     document_min_region_area: int
     document_max_region_area_ratio: float
+    decision_accept_threshold: float
+    decision_review_threshold: float
+    decision_min_image_quality: float
+    decision_require_calibrated_confidence: bool
 
 
 def load_settings() -> Settings:
@@ -156,8 +163,11 @@ def load_settings() -> Settings:
         sample_dir=data_dir / "samples",
         batch_input_dir=data_dir / "batch_input",
         output_dir=output_dir,
+        runs_dir=_env_path("RUNS_DIR", data_dir / "runs"),
         model_dir=model_dir,
         document_output_dir=_env_path("DOCUMENT_OUTPUT_DIR", output_dir / "documents"),
+        run_retention_days=_env_int("RUN_RETENTION_DAYS", 30, minimum=1),
+        run_max_storage_gb=_env_float("RUN_MAX_STORAGE_GB", 10.0, minimum=0.1),
         default_image_size=(512, 512),
         ocsr_backend=_choice(_env_lower("OCSR_BACKEND", "demo"), {"demo", "molscribe", "decimer", "ensemble"}, "demo"),  # type: ignore[arg-type]
         ocsr_device=_env_lower("OCSR_DEVICE", "auto"),
@@ -199,6 +209,10 @@ def load_settings() -> Settings:
         document_max_regions=_env_int("DOCUMENT_MAX_REGIONS", 80, minimum=1),
         document_min_region_area=_env_int("DOCUMENT_MIN_REGION_AREA", 1200, minimum=1),
         document_max_region_area_ratio=_env_float("DOCUMENT_MAX_REGION_AREA_RATIO", 0.80, minimum=0.01),
+        decision_accept_threshold=_env_float("DECISION_ACCEPT_THRESHOLD", 0.85, minimum=0.0),
+        decision_review_threshold=_env_float("DECISION_REVIEW_THRESHOLD", 0.65, minimum=0.0),
+        decision_min_image_quality=_env_float("DECISION_MIN_IMAGE_QUALITY", 0.55, minimum=0.0),
+        decision_require_calibrated_confidence=_env_bool("DECISION_REQUIRE_CALIBRATED_CONFIDENCE", False),
     )
 
 
@@ -222,6 +236,7 @@ def initialize_directories(settings: Settings | None = None) -> None:
         active.sample_dir,
         active.batch_input_dir,
         active.output_dir,
+        active.runs_dir,
         active.model_dir,
         active.document_output_dir,
     ):
@@ -236,6 +251,9 @@ IS_PRODUCTION_MODE = SETTINGS.app_mode == "production"
 SAMPLE_DIR = SETTINGS.sample_dir
 BATCH_INPUT_DIR = SETTINGS.batch_input_dir
 OUTPUT_DIR = SETTINGS.output_dir
+RUNS_DIR = SETTINGS.runs_dir
+RUN_RETENTION_DAYS = SETTINGS.run_retention_days
+RUN_MAX_STORAGE_GB = SETTINGS.run_max_storage_gb
 MODEL_DIR = SETTINGS.model_dir
 DEFAULT_IMAGE_SIZE = SETTINGS.default_image_size
 OCSR_BACKEND = SETTINGS.ocsr_backend
@@ -279,3 +297,7 @@ DOCUMENT_MAX_PIXELS = SETTINGS.document_max_pixels
 DOCUMENT_MAX_REGIONS = SETTINGS.document_max_regions
 DOCUMENT_MIN_REGION_AREA = SETTINGS.document_min_region_area
 DOCUMENT_MAX_REGION_AREA_RATIO = SETTINGS.document_max_region_area_ratio
+DECISION_ACCEPT_THRESHOLD = SETTINGS.decision_accept_threshold
+DECISION_REVIEW_THRESHOLD = SETTINGS.decision_review_threshold
+DECISION_MIN_IMAGE_QUALITY = SETTINGS.decision_min_image_quality
+DECISION_REQUIRE_CALIBRATED_CONFIDENCE = SETTINGS.decision_require_calibrated_confidence

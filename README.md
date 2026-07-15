@@ -11,7 +11,7 @@
 - 图片或文档页面进入系统后，先完成格式检查、预处理、区域检测和候选裁剪；
 - 通过统一适配器调用 MolScribe、DECIMER、ensemble 或 demo 后端；
 - 用 RDKit 对候选 SMILES 做解析、标准化、结构重绘和描述符计算；
-- 在前端展示识别状态、失败原因、模型来源、置信信息和人工修正入口；
+- 在前端展示识别状态、统一识别决策、失败原因、模型来源、置信信息和人工修正入口；
 - 将人工纠错样本、评测集和导出报告沉淀下来，支持后续真实测试集建设。
 
 项目不把普通图像分类当作目标，也不承诺从零训练大型 OCSR 模型。更实际的目标是：让用户能稳定上传、识别、核验、纠错、导出，并逐步积累可复现的真实测试集。
@@ -254,7 +254,21 @@ python scripts/ingest_ocsr_labeled_images.py --labels data/raw_ocsr_real/labels.
 
 完整流程见 `docs/ocsr_dataset_curation.md`。真实验收集应记录来源、授权、scaffold/source split、图像质量、结构复杂度和拒识样本；不要把无授权论文截图或专有数据提交到公开仓库。
 
-人工纠错也可以回流为数据集：单图识别页点击“仅保存纠错”会写入 `data/feedback/annotations` 和 `data/feedback/manifest.csv`；点击“确认进入训练集”会标记为已核验并可导出：
+单图上传后会先进入持久运行目录，识别、纠错和反馈都复用该路径，不再依赖识别完成后即删除的临时文件：
+
+```text
+data/runs/<analysis_id>/
+├── input/
+│   └── original.<ext>
+├── preprocessing/
+├── structures/
+├── report.json
+└── runtime.json
+```
+
+`report["input"]["path"]` 会指向 `input/original.<ext>` 的持久路径。默认清理策略由 `RUN_RETENTION_DAYS=30` 和 `RUN_MAX_STORAGE_GB=10` 控制；进入反馈库、已审核或用户标记保留的 run 会在 `runtime.json` 中标记为 protected，不会被自动清理。
+
+人工纠错也可以回流为数据集：单图识别页点击“仅保存纠错”会写入 `data/feedback/images`、`data/feedback/annotations` 和 `data/feedback/manifest.csv`；点击“确认进入训练集”会标记为已核验并可导出：
 
 ```bash
 python scripts/export_feedback_manifest.py --feedback-root data/feedback --output data/feedback/verified_manifest.csv
@@ -272,6 +286,8 @@ molecule-vision-ocsr/
 ├── data/
 │   ├── samples/
 │   ├── batch_input/
+│   ├── runs/             # 单图上传后的持久运行目录
+│   ├── feedback/         # 人工纠错与训练/评测回流数据
 │   └── outputs/
 ├── models/                # 可选本地模型；模型文件不提交到 Git
 ├── src/
@@ -287,7 +303,7 @@ molecule-vision-ocsr/
 └── docs/                  # 说明书、API 与报告模板
 ```
 
-所有运行路径由 `config.py` 统一管理。默认输出写入 `data/outputs`，包括预处理图、重绘结构、批量表格和统计图。
+所有运行路径由 `config.py` 统一管理。单图上传原图与报告写入 `data/runs`，人工反馈写入 `data/feedback`，批量、文档和导出文件默认写入 `data/outputs`。
 
 ## 答辩演示建议
 
@@ -389,6 +405,13 @@ python -m streamlit run app.py
 | `OCSR_USE_PREPROCESSED_IMAGE` | `false` | 兼容旧流程；默认 MolScribe 使用原图 |
 | `MOLSCRIBE_IMAGE_STRATEGY` | `original` | `original`、`grayscale`、`normalized`、`binary` |
 | `MOLSCRIBE_ISOLATED_SUBPROCESS` | `true` | 在独立子进程中执行真实模型推理，超时或取消时可终止进程树 |
+| `RUNS_DIR` | `data/runs` | 单图上传后的持久运行目录 |
+| `RUN_RETENTION_DAYS` | `30` | 未保护 run 的保留天数 |
+| `RUN_MAX_STORAGE_GB` | `10` | 未保护 run 的最大总存储预算 |
+| `DECISION_ACCEPT_THRESHOLD` | `0.85` | 已校准置信度达到该值时，单模型结果才可自动接受 |
+| `DECISION_REVIEW_THRESHOLD` | `0.65` | 已校准置信度低于该值时进入人工确认 |
+| `DECISION_MIN_IMAGE_QUALITY` | `0.55` | 图像质量分低于该值时进入人工确认或拒绝 |
+| `DECISION_REQUIRE_CALIBRATED_CONFIDENCE` | `false` | 为 `true` 时，未校准置信度的单模型结果不能自动接受 |
 
 默认 `original` 更贴近 MolScribe 官方模型输入预期；不要默认假设二值化图片一定更好。只有在实验需要时再切换 `grayscale`、`normalized` 或 `binary`。
 
@@ -547,8 +570,9 @@ $env:OCSR_ENSEMBLE_TOTAL_TIMEOUT_SECONDS="240"
 - 后端执行成功优先于失败；
 - RDKit 可解析候选优先于不可解析候选；
 - canonical SMILES 或 InChIKey 相同的候选视为模型一致；
-- 两个有效候选不一致时标记 `disagreement`，页面和报告会显示分歧警告；
-- 不一致时只按 `OCSR_ENSEMBLE_BACKEND_PRIORITY` 和可选可靠性权重暂选推荐结果，不会声称已确认图片真实答案；
+- 两个有效候选不一致时标记 `review_needed`，页面和报告会显示分歧警告，不会自动作为最终识别结果接受；
+- 只有一个有效候选时标记 `accepted_with_warning`，保留候选但建议人工确认；
+- `OCSR_ENSEMBLE_BACKEND_PRIORITY` 只作为展示和追溯的推荐排序依据，不用于把分歧结果强行升级为自动接受；
 - 不直接比较 MolScribe 与 DECIMER 未校准的原始 confidence；
 - 人工修正会覆盖 ensemble 推荐，并保留所有原始候选用于追溯。
 
@@ -558,7 +582,7 @@ $env:OCSR_ENSEMBLE_TOTAL_TIMEOUT_SECONDS="240"
 |---|---|---|
 | `OCSR_ENSEMBLE_BACKENDS` | `molscribe,decimer` | 启用的子后端 |
 | `OCSR_ENSEMBLE_BACKEND_PRIORITY` | `molscribe,decimer` | 分歧时的暂选优先级 |
-| `OCSR_ENSEMBLE_RELIABILITY_WEIGHTS` | `molscribe=1.0,decimer=1.0` | 可由 benchmark 校准后填写的可靠性权重 |
+| `OCSR_ENSEMBLE_RELIABILITY_WEIGHTS` | `molscribe=1.0,decimer=1.0` | 实验性可靠性权重；当前不作为最终自动接受依据 |
 | `OCSR_ENSEMBLE_PARALLEL` | `false` | 是否并行执行子后端 |
 | `OCSR_ENSEMBLE_CONTINUE_ON_ERROR` | `true` | 单个后端失败时是否继续 |
 | `OCSR_ENSEMBLE_TOTAL_TIMEOUT_SECONDS` | `240` | ensemble 总任务超时 |

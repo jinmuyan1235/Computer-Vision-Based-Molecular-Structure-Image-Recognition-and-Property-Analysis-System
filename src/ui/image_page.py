@@ -5,16 +5,16 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 import streamlit as st
 
+from src.analysis.molecule_report import MoleculeReportGenerator
+from src.runtime.run_store import ImageRun, create_image_run_from_bytes, save_run_report, write_runtime_metadata
 from src.ui.image_viewer import show_upload_preview
 from src.ui.report_view import show_correction_panel, show_report
 from src.ui.state import (
     current_runtime_key,
-    get_report_generator,
     remember_backend_status,
     runtime_config_from_key,
 )
@@ -32,42 +32,44 @@ def render_image_page(backend: str, show_preprocessing: bool, export_pdf: bool) 
         if st.button("开始识别与分析", type="primary", key="analyze_image"):
             progress = st.empty()
             progress.info("正在执行图像预处理、OCSR 与 RDKit 分析……")
-            suffix = Path(uploaded.name).suffix.lower()
-            prefix = Path(uploaded.name).stem + "_"
-            with tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False) as temporary:
-                temporary.write(uploaded.getvalue())
-                temporary_path = Path(temporary.name)
+            image_run = create_image_run_from_bytes(uploaded.getvalue(), uploaded.name)
             try:
                 if backend == "demo":
-                    report = get_report_generator(backend).generate(image_path=temporary_path)
-                    report["input"]["filename"] = uploaded.name
+                    report = MoleculeReportGenerator(backend, image_run.run_dir).generate(
+                        image_path=image_run.input_path,
+                        analysis_id=image_run.analysis_id,
+                    )
+                    save_run_report(report, image_run)
                 else:
-                    report = _process_image_subprocess(temporary_path, backend, uploaded.name)
+                    report = _process_image_subprocess(image_run, backend)
                 st.session_state["image_report"] = report
                 remember_backend_status(backend)
                 progress.empty()
             except RuntimeError as exc:
+                write_runtime_metadata(image_run, {"status": "failed", "message": str(exc)})
                 progress.empty()
                 st.error(str(exc))
-            finally:
-                temporary_path.unlink(missing_ok=True)
     if "image_report" in st.session_state:
         active_report = show_correction_panel(st.session_state["image_report"])
         show_report(active_report, show_preprocessing, export_pdf, f"image_{active_report.get('analysis_id', 'report')[:8]}")
 
 
-def _process_image_subprocess(input_path: Path, backend: str, original_filename: str) -> dict:
+def _process_image_subprocess(image_run: ImageRun, backend: str) -> dict:
     """Run real OCSR outside Streamlit so native crashes do not kill the UI server."""
     runtime = runtime_config_from_key(current_runtime_key())
     command = [
         sys.executable,
         str(PROJECT_ROOT / "scripts" / "process_image.py"),
         "--input",
-        str(input_path),
+        str(image_run.input_path),
         "--backend",
         backend,
         "--original-filename",
-        original_filename,
+        image_run.original_filename,
+        "--analysis-id",
+        image_run.analysis_id,
+        "--run-dir",
+        str(image_run.run_dir),
     ]
     if runtime.get("molscribe_device"):
         command.extend(["--molscribe-device", str(runtime["molscribe_device"])])

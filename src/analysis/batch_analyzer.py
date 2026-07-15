@@ -32,10 +32,17 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
     runtime = report.get("runtime") or {}
     consensus = ocsr.get("consensus") or {}
     candidates = ocsr.get("candidates") or []
+    decision = report.get("recognition_decision") or {}
+    image_quality = report.get("image_quality") or {}
     return {
         "filename": input_data.get("filename"),
         "status": report.get("status"),
         "message": report.get("message"),
+        "recognition_decision": decision.get("decision"),
+        "recognition_risk_level": decision.get("risk_level"),
+        "manual_review_recommended": decision.get("manual_review_recommended"),
+        "recognition_reason_codes": json.dumps(decision.get("reason_codes") or [], ensure_ascii=False),
+        "image_quality_score": image_quality.get("quality_score"),
         "backend": ocsr.get("backend"),
         "ocsr_status": ocsr.get("status"),
         "smiles": ocsr.get("smiles"),

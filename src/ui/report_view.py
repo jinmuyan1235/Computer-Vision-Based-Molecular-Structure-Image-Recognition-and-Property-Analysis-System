@@ -16,6 +16,7 @@ from src.analysis.correction import (
 )
 from src.export.json_exporter import to_json_text
 from src.export.pdf_exporter import save_pdf
+from src.runtime.run_store import mark_run_protected_from_report, report_output_dir, save_report_for_existing_run
 from src.ui.image_viewer import show_preprocess_thumbnail, show_structure
 from src.ui.labels import backend_label, status_label
 from src.ui.records import render_records
@@ -32,7 +33,7 @@ def show_ensemble_details(ocsr: dict[str, Any]) -> None:
         reason = consensus.get("reason") or ""
         if decision == "accepted" and status == "agreement":
             st.success(f"自动接受：{reason}")
-        elif decision == "accepted":
+        elif decision in {"accepted", "accepted_with_warning"}:
             st.warning(consensus.get("warning") or reason)
         elif decision == "review_needed":
             st.warning(consensus.get("warning") or reason or "需要人工确认。")
@@ -78,6 +79,30 @@ def show_chemical_identity(report: dict[str, Any]) -> None:
             render_records(normalized_warnings, title_keys=("type", "提示"))
 
 
+def show_recognition_decision(report: dict[str, Any]) -> None:
+    decision = report.get("recognition_decision") or {}
+    if not decision:
+        return
+    value = decision.get("decision")
+    message = decision.get("message") or ""
+    risk = decision.get("risk_level") or "-"
+    if value == "accepted":
+        st.success(f"识别决策：自动接受（风险：{risk}）")
+    elif value == "accepted_with_warning":
+        st.warning(f"识别决策：带警告接受（风险：{risk}）")
+    elif value == "review_needed":
+        st.warning(f"识别决策：需要人工确认（风险：{risk}）")
+    elif value == "rejected":
+        st.error(f"识别决策：拒绝（风险：{risk}）")
+    else:
+        st.info(f"识别决策：{value or '未知'}")
+    if message:
+        st.caption(message)
+    reason_codes = decision.get("reason_codes") or []
+    if reason_codes:
+        st.caption("原因码：" + ", ".join(str(item) for item in reason_codes))
+
+
 def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bool, key_prefix: str) -> None:
     """Render a molecule analysis report in Streamlit."""
     if report.get("status") != "success":
@@ -91,6 +116,7 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
             st.caption(f"后端：{backend_label(ocsr.get('backend'), short=True)}；状态：{status_label(ocsr.get('status'))}")
             if ocsr.get("backend") == "demo":
                 st.warning("这是演示后端，不会识别任意图片；请使用真实后端或手动输入 SMILES。")
+            show_recognition_decision(report)
             show_ensemble_details(ocsr)
         return
 
@@ -103,6 +129,7 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
         st.warning("当前是演示结果：系统按内置样例文件名返回固定 SMILES，并没有进行真实图片识别。")
     elif ocsr.get("result_origin") in {"real_model", "real_model_ensemble"}:
         st.caption("当前结果来自真实 OCSR 模型推理。")
+    show_recognition_decision(report)
 
     left, right = st.columns([1.1, 0.9])
     with left:
@@ -187,6 +214,9 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
                 )
             else:
                 st.caption(pdf_result["message"])
+        if report.get("run") and st.button("保留本次分析记录", key=f"protect_run_{key_prefix}"):
+            mark_run_protected_from_report(report, "user_keep")
+            st.success("已标记保留；自动清理不会删除该分析记录。")
 
     with st.expander("技术诊断", expanded=False):
         runtime = report.get("runtime") or {}
@@ -230,21 +260,23 @@ def show_correction_panel(report: dict[str, Any]) -> dict[str, Any]:
     apply_col, restore_col = st.columns(2)
     current_report = report
     if apply_col.button("校验并应用修正", type="primary", key=f"apply_correction_{analysis_id}"):
-        candidate = apply_smiles_correction(report, corrected_input, OUTPUT_DIR)
+        candidate = apply_smiles_correction(report, corrected_input, report_output_dir(report, OUTPUT_DIR))
         error = (candidate.get("correction") or {}).get("last_error")
         if error:
             st.error(error)
         else:
             current_report = candidate
+            save_report_for_existing_run(current_report)
             st.session_state["image_report"] = current_report
             st.success("人工修正已应用，性质和结构图已重新生成。")
     if restore_col.button("恢复模型原始结果", key=f"restore_prediction_{analysis_id}"):
-        candidate = restore_original_prediction(report, OUTPUT_DIR)
+        candidate = restore_original_prediction(report, report_output_dir(report, OUTPUT_DIR))
         error = (candidate.get("correction") or {}).get("last_error")
         if error:
             st.warning(error)
         else:
             current_report = candidate
+            save_report_for_existing_run(current_report)
             st.session_state["image_report"] = current_report
             st.success("已恢复为模型原始预测。")
 

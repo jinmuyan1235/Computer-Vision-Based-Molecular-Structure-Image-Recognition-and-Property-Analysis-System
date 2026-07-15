@@ -17,6 +17,7 @@ from src.chem.lipinski import evaluate_lipinski
 from src.chem.mol_drawer import draw_molecule
 from src.chem.smiles_validator import smiles_to_mol, validate_smiles
 from src.chem.standardization import standardize_smiles
+from src.analysis.recognition_decision import apply_recognition_decision
 from src.ml.admet_baseline import ConfiguredADMETPredictor
 from src.utils.file_utils import ensure_directory, safe_stem
 
@@ -147,7 +148,7 @@ def _apply_final_smiles(
     descriptors = calculate_descriptors(analysis_smiles)
     lipinski = evaluate_lipinski(descriptors)
     output_root = ensure_directory(output_dir)
-    drawing_path = output_root / "redrawn" / f"{_report_prefix(updated, image_slot)}_structure.png"
+    drawing_path = output_root / "structures" / f"{_report_prefix(updated, image_slot)}_structure.png"
     drawing = draw_molecule(analysis_smiles, drawing_path)
     updated["validation"] = validation
     updated["chemical_identity"] = identity
@@ -167,6 +168,17 @@ def _apply_final_smiles(
     updated["images"][image_slot] = drawing
     updated["status"] = "success"
     updated["message"] = message
+    updated = apply_recognition_decision(updated)
+    if source in {"user_correction", "manual_after_ocsr_failure"}:
+        updated["recognition_decision"] = {
+            "decision": "accepted",
+            "risk_level": "low",
+            "reason_codes": ["manual_correction"],
+            "manual_review_recommended": False,
+            "calibrated_confidence": None,
+            "quality_score": (updated.get("image_quality") or {}).get("quality_score"),
+            "message": "用户已人工修正并重新计算性质。",
+        }
     return updated
 
 

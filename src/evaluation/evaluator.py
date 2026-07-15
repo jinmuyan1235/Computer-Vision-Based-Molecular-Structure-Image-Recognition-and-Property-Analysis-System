@@ -96,6 +96,7 @@ class OCSREvaluator:
                 "consensus_decision": consensus.get("decision"),
                 "recommended_backend": consensus.get("recommended_backend"),
                 "ensemble_accepted": consensus.get("decision") == "accepted",
+                "ensemble_accepted_with_warning": consensus.get("decision") == "accepted_with_warning",
                 "ensemble_review_needed": consensus.get("decision") == "review_needed",
                 "ensemble_rejected": consensus.get("decision") == "rejected",
                 "ensemble_agreement": consensus.get("status") == "agreement",
@@ -170,6 +171,17 @@ class OCSREvaluator:
                     "confidence": result.confidence,
                     "recognition_status": result.status,
                     "recognition_success": result.status == "success" and bool(result.smiles),
+                    "recognition_decision": result.decision or (
+                        "accepted_with_warning" if result.status == "success" and result.smiles else "rejected"
+                    ),
+                    "recognition_risk_level": result.risk_level or (
+                        "medium" if result.status == "success" and result.smiles else "high"
+                    ),
+                    "manual_review_recommended": (
+                        result.manual_review_recommended
+                        if result.manual_review_recommended is not None
+                        else bool(result.status == "success" and result.smiles)
+                    ),
                     "message": result.message,
                     "failure_reason": "" if result.status == "success" else result.message,
                     "inference_time_ms": inference_time_ms,
@@ -192,6 +204,9 @@ class OCSREvaluator:
                     "confidence": None,
                     "recognition_status": "failed",
                     "recognition_success": False,
+                    "recognition_decision": "rejected",
+                    "recognition_risk_level": "high",
+                    "manual_review_recommended": True,
                     "message": f"evaluation_error: {exc}",
                     "failure_reason": f"evaluation_error: {exc}",
                     "inference_time_ms": elapsed_ms,
