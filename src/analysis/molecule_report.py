@@ -10,6 +10,8 @@ from uuid import uuid4
 import config
 from config import OUTPUT_DIR
 from src.runtime.metadata import report_runtime_metadata
+from src.analysis.image_quality import assess_image_quality
+from src.analysis.recognition_decision import apply_recognition_decision
 from src.chem.descriptors import calculate_descriptors
 from src.chem.lipinski import evaluate_lipinski
 from src.chem.mol_drawer import draw_molecule
@@ -44,9 +46,9 @@ class MoleculeReportGenerator:
         self.admet_predictor = ConfiguredADMETPredictor()
 
     @staticmethod
-    def _base_report(input_data: dict[str, Any]) -> dict[str, Any]:
+    def _base_report(input_data: dict[str, Any], analysis_id: str | None = None) -> dict[str, Any]:
         return {
-            "analysis_id": uuid4().hex,
+            "analysis_id": analysis_id or uuid4().hex,
             "status": "failed",
             "message": "分析尚未完成。",
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -69,47 +71,55 @@ class MoleculeReportGenerator:
                 "predicted_molecule": None,
                 "corrected_molecule": None,
             },
+            "image_quality": None,
+            "recognition_decision": None,
         }
 
-    def generate(self, image_path: str | Path | None = None, smiles: str | None = None) -> dict[str, Any]:
+    def generate(
+        self,
+        image_path: str | Path | None = None,
+        smiles: str | None = None,
+        analysis_id: str | None = None,
+    ) -> dict[str, Any]:
         """Generate a complete report from exactly one image or SMILES input."""
         if (image_path is None) == (smiles is None):
             raise ValueError("请且仅提供 image_path 或 smiles 其中一项。")
-        return self._from_image(image_path) if image_path is not None else self._from_smiles(smiles or "")
+        return self._from_image(image_path, analysis_id=analysis_id) if image_path is not None else self._from_smiles(smiles or "", analysis_id=analysis_id)
 
-    def _from_image(self, image_path: str | Path) -> dict[str, Any]:
+    def _from_image(self, image_path: str | Path, analysis_id: str | None = None) -> dict[str, Any]:
         path = Path(image_path).expanduser().resolve()
         report = self._base_report({
             "type": "image",
             "filename": path.name,
             "path": str(path),
             "image_sha256": sha256_file(path),
-        })
+        }, analysis_id=analysis_id)
+        report["image_quality"] = assess_image_quality(path)
         prefix = f"{safe_stem(path.stem)}_{report['analysis_id'][:8]}"
         try:
             stages = self.preprocessor.preprocess_pipeline(path)
-            stage_paths = save_preprocessing_stages(stages, self.output_dir / "preprocessed", prefix)
+            stage_paths = save_preprocessing_stages(stages, self.output_dir / "preprocessing", prefix)
             report["images"]["preprocessing"] = stage_paths
             report["images"]["preprocessed"] = stage_paths["normalized"]
         except Exception as exc:
             report["message"] = f"图像预处理失败：{exc}"
-            return report
+            return apply_recognition_decision(report)
 
         if self.recognizer is None:
             report["message"] = "手动 SMILES 分析器不能处理图片；请选择真实 OCSR 后端。"
-            return report
+            return apply_recognition_decision(report)
         recognition_target = path if self.recognizer.preferred_image_stage == "original" else report["images"]["preprocessed"]
         result = self.recognizer.recognize(recognition_target)
         report["ocsr"] = normalize_ocsr_block(result.to_dict())
         if result.status != "success" or not result.smiles:
             report["message"] = result.message
             report["validation"]["error"] = "未获得可校验的 SMILES。"
-            return report
+            return apply_recognition_decision(report)
         final_source = "ensemble_recommendation" if result.backend == "ensemble" else "ocsr"
-        return self._complete_chemistry(report, result.smiles, prefix, final_source=final_source)
+        return apply_recognition_decision(self._complete_chemistry(report, result.smiles, prefix, final_source=final_source))
 
-    def _from_smiles(self, smiles: str) -> dict[str, Any]:
-        report = self._base_report({"type": "smiles", "smiles": smiles})
+    def _from_smiles(self, smiles: str, analysis_id: str | None = None) -> dict[str, Any]:
+        report = self._base_report({"type": "smiles", "smiles": smiles}, analysis_id=analysis_id)
         prefix = f"manual_{safe_stem(smiles, 'smiles')[:40]}_{report['analysis_id'][:8]}"
         report["ocsr"] = OCSRResult(
             smiles=smiles,
@@ -124,7 +134,7 @@ class MoleculeReportGenerator:
             result_origin="manual_input",
         ).to_dict()
         report["ocsr"] = normalize_ocsr_block(report["ocsr"])
-        return self._complete_chemistry(report, smiles, prefix, final_source="manual")
+        return apply_recognition_decision(self._complete_chemistry(report, smiles, prefix, final_source="manual"))
 
     def _complete_chemistry(
         self,
@@ -153,7 +163,7 @@ class MoleculeReportGenerator:
         try:
             descriptors = calculate_descriptors(analysis_smiles)
             lipinski = evaluate_lipinski(descriptors)
-            drawing_path = self.output_dir / "redrawn" / f"{prefix}_structure.png"
+            drawing_path = self.output_dir / "structures" / f"{prefix}_structure.png"
             report["descriptors"] = descriptors
             report["lipinski"] = lipinski
             report["admet"] = self.admet_predictor.predict(analysis_smiles)

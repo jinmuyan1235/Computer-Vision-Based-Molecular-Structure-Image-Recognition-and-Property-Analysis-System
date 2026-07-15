@@ -75,7 +75,8 @@ def test_ensemble_prefers_only_valid_candidate() -> None:
     result = adapter.recognize("image.png")
     assert result.status == "success"
     assert result.consensus["status"] == "single_valid"
-    assert result.consensus["decision"] == "accepted"
+    assert result.consensus["decision"] == "accepted_with_warning"
+    assert result.consensus["manual_review_recommended"] is True
     assert result.consensus["decision_note"] == "accepted_with_single_backend"
     assert result.consensus["recommended_backend"] == "decimer"
     assert result.smiles == "CCO"

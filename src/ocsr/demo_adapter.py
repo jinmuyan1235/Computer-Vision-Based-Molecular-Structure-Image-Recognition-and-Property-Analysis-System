@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ class DemoOCSRAdapter(BaseOCSRAdapter):
     def recognize(self, image_path_or_array: Any) -> OCSRResult:
         """Map a recognizable filename to a predefined demonstration SMILES."""
         if isinstance(image_path_or_array, (str, Path)):
-            filename = Path(image_path_or_array).stem.lower()
+            filename = self._matching_stem(Path(image_path_or_array))
             for keyword, smiles in self.SAMPLE_SMILES.items():
                 if keyword in filename:
                     return OCSRResult(
@@ -51,3 +52,18 @@ class DemoOCSRAdapter(BaseOCSRAdapter):
             device="cpu",
             result_origin="demo_filename_map",
         )
+
+    @staticmethod
+    def _matching_stem(path: Path) -> str:
+        stem = path.stem.lower()
+        if stem != "original":
+            return stem
+        runtime_path = path.parent.parent / "runtime.json"
+        if not runtime_path.is_file():
+            return stem
+        try:
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+            original = str(runtime.get("original_filename") or "")
+            return Path(original).stem.lower() or stem
+        except Exception:
+            return stem

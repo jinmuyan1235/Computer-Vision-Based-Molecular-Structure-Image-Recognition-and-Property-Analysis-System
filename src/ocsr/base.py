@@ -28,6 +28,9 @@ class OCSRResult:
     candidates: list[dict[str, Any]] | None = None
     consensus: dict[str, Any] | None = None
     similarity_analysis: list[dict[str, Any]] | None = None
+    decision: Literal["accepted", "accepted_with_warning", "review_needed", "rejected"] | None = None
+    risk_level: Literal["low", "medium", "high"] | None = None
+    manual_review_recommended: bool | None = None
     raw_output: str | None = None
 
     def to_dict(self) -> dict[str, Any]:

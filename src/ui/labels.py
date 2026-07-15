@@ -63,6 +63,10 @@ BATCH_COLUMN_LABELS = {
     "confidence": "置信度",
     "inference_time_ms": "推理耗时(ms)",
     "message": "失败原因",
+    "recognition_decision": "识别决策",
+    "recognition_risk_level": "风险等级",
+    "manual_review_recommended": "建议人工确认",
+    "image_quality_score": "图像质量分",
 }
 
 DOCUMENT_COLUMN_LABELS = {

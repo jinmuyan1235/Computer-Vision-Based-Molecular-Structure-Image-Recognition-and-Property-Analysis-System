@@ -12,6 +12,7 @@ from PIL import Image
 
 from src.chem.smiles_validator import validate_smiles
 from src.export.json_exporter import save_json
+from src.runtime.run_store import mark_run_protected_from_report
 from src.runtime.metadata import sha256_file
 from src.utils.file_utils import ensure_directory, safe_stem
 
@@ -286,6 +287,7 @@ def save_feedback_sample(
     save_json(annotation, annotation_path)
     manifest_row = _manifest_row(annotation, feedback_root, annotation_path)
     _upsert_manifest_row(manifest_path, manifest_row)
+    mark_run_protected_from_report(traced, "feedback")
     return {
         "feedback_root": str(feedback_root),
         "annotation_path": str(annotation_path.resolve()),

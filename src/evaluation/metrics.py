@@ -353,6 +353,7 @@ def ensemble_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     agreement = sum(bool(row.get("ensemble_agreement")) for row in ensemble_rows)
     disagreement = sum(bool(row.get("ensemble_disagreement")) for row in ensemble_rows)
     accepted = sum(bool(row.get("ensemble_accepted")) for row in ensemble_rows)
+    accepted_with_warning = sum(bool(row.get("ensemble_accepted_with_warning")) for row in ensemble_rows)
     review_needed = sum(bool(row.get("ensemble_review_needed")) for row in ensemble_rows)
     rejected = sum(bool(row.get("ensemble_rejected")) for row in ensemble_rows)
     candidate_backend_metrics: dict[str, Any] = {}
@@ -406,6 +407,8 @@ def ensemble_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "disagreement_rate": _rate(disagreement, total),
         "accepted_count": accepted,
         "accepted_rate": _rate(accepted, total),
+        "accepted_with_warning_count": accepted_with_warning,
+        "accepted_with_warning_rate": _rate(accepted_with_warning, total),
         "review_needed_count": review_needed,
         "review_needed_rate": _rate(review_needed, total),
         "rejected_count": rejected,

@@ -168,6 +168,9 @@ def rank_candidates(
         return {
             "status": "all_failed",
             "decision": "rejected",
+            "risk_level": "high",
+            "reason_codes": ["all_backends_failed"],
+            "manual_review_recommended": True,
             "recommended_smiles": None,
             "recommended_backend": None,
             "reason": "所有启用的 OCSR 后端均未返回 SMILES。",
@@ -177,6 +180,9 @@ def rank_candidates(
         return {
             "status": "invalid_candidates",
             "decision": "rejected",
+            "risk_level": "high",
+            "reason_codes": ["rdkit_invalid_candidates"],
+            "manual_review_recommended": True,
             "recommended_smiles": None,
             "recommended_backend": None,
             "reason": "至少一个后端返回了 SMILES，但均无法被 RDKit 解析。",
@@ -199,6 +205,9 @@ def rank_candidates(
         return {
             "status": "agreement",
             "decision": "accepted",
+            "risk_level": "low",
+            "reason_codes": ["multi_backend_agreement"],
+            "manual_review_recommended": False,
             "recommended_smiles": representative.get("canonical_smiles"),
             "recommended_backend": "consensus",
             "supporting_backends": [candidate.get("backend") for candidate in group],
@@ -209,7 +218,10 @@ def rank_candidates(
         candidate = valid[0]
         return {
             "status": "single_valid",
-            "decision": "accepted",
+            "decision": "accepted_with_warning",
+            "risk_level": "medium",
+            "reason_codes": ["single_backend_only", "uncalibrated_confidence"],
+            "manual_review_recommended": True,
             "decision_note": "accepted_with_single_backend",
             "recommended_smiles": candidate.get("canonical_smiles"),
             "recommended_backend": candidate.get("backend"),
@@ -227,6 +239,9 @@ def rank_candidates(
     return {
         "status": "disagreement",
         "decision": "review_needed",
+        "risk_level": "high",
+        "reason_codes": ["backend_disagreement"],
+        "manual_review_recommended": True,
         "recommended_smiles": None,
         "recommended_backend": None,
         "review_candidates": [
@@ -345,7 +360,7 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
         self.last_inference_time_ms = elapsed_ms
         recommended = consensus.get("recommended_smiles")
         decision = str(consensus.get("decision") or ("accepted" if recommended else "rejected"))
-        status = "success" if decision == "accepted" and recommended else "failed"
+        status = "success" if decision in {"accepted", "accepted_with_warning"} and recommended else "failed"
         message = str(consensus.get("reason") or "ensemble 推理完成。")
         return OCSRResult(
             smiles=str(recommended) if recommended else None,
@@ -364,6 +379,9 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
             candidates=candidates,
             consensus=consensus,
             similarity_analysis=similarity,
+            decision=decision if decision in {"accepted", "accepted_with_warning", "review_needed", "rejected"} else None,
+            risk_level=consensus.get("risk_level"),
+            manual_review_recommended=consensus.get("manual_review_recommended"),
         )
 
     @property
@@ -399,6 +417,7 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
             "enabled_backends": self.enabled_backends,
             "backend_priority": self.backend_priority,
             "reliability_weights": self.reliability_weights,
+            "reliability_weights_policy": "experimental_not_used_for_final_decision",
             "parallel": self.parallel,
             "continue_on_error": self.continue_on_error,
             "total_timeout_seconds": self.total_timeout_seconds,
