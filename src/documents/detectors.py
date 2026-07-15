@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
 import cv2
 import numpy as np
 
 import config
-from src.documents.models import DocumentPage, DocumentRegion
+from src.documents.models import DocumentPage, DocumentRegion, normalize_bbox
+
+
+DetectorPrediction = DocumentRegion | dict[str, Any]
 
 
 class BaseMoleculeRegionDetector(ABC):
@@ -22,6 +25,130 @@ class BaseMoleculeRegionDetector(ABC):
     def detect(self, page: DocumentPage) -> list[DocumentRegion]:
         """Return detected regions for one rendered page."""
         raise NotImplementedError
+
+
+class TrainableMoleculeRegionDetector(BaseMoleculeRegionDetector):
+    """Adapter for a trained layout detector when one is configured.
+
+    The project does not ship a trained detector yet. This class keeps the
+    document pipeline ready for one by normalizing model predictions into
+    DocumentRegion objects while returning no regions when no predictor exists.
+    """
+
+    name = "trainable-layout"
+
+    def __init__(
+        self,
+        predictor: Callable[[DocumentPage], Sequence[DetectorPrediction]] | None = None,
+        name: str | None = None,
+        min_confidence: float = 0.35,
+    ) -> None:
+        self.predictor = predictor
+        if name:
+            self.name = name
+        self.min_confidence = min_confidence
+
+    @property
+    def available(self) -> bool:
+        return self.predictor is not None
+
+    def detect(self, page: DocumentPage) -> list[DocumentRegion]:
+        if self.predictor is None:
+            return []
+        predictions = self.predictor(page)
+        regions: list[DocumentRegion] = []
+        for index, prediction in enumerate(predictions, start=1):
+            region = self._coerce_prediction(page, prediction, index)
+            if region is not None:
+                regions.append(region)
+        return regions
+
+    def _coerce_prediction(
+        self,
+        page: DocumentPage,
+        prediction: DetectorPrediction,
+        index: int,
+    ) -> DocumentRegion | None:
+        if isinstance(prediction, DocumentRegion):
+            confidence = prediction.detection_confidence
+            if confidence is not None and confidence < self.min_confidence:
+                return None
+            try:
+                bbox = normalize_bbox(prediction.bbox, page.width, page.height)
+            except ValueError:
+                return None
+            prediction.document_id = page.document_id
+            prediction.page_number = page.page_number
+            prediction.region_id = prediction.region_id or f"p{page.page_number:03d}_t{index:03d}"
+            prediction.bbox = bbox
+            prediction.detector_name = prediction.detector_name or self.name
+            return prediction
+
+        confidence = prediction.get("detection_confidence", prediction.get("confidence", prediction.get("score")))
+        if confidence is not None:
+            confidence = float(confidence)
+            if confidence < self.min_confidence:
+                return None
+        try:
+            bbox = normalize_bbox(prediction["bbox"], page.width, page.height)
+        except (KeyError, TypeError, ValueError):
+            return None
+        return DocumentRegion(
+            document_id=page.document_id,
+            page_number=page.page_number,
+            region_id=str(prediction.get("region_id") or f"p{page.page_number:03d}_t{index:03d}"),
+            bbox=bbox,
+            region_type=str(prediction.get("region_type") or prediction.get("label") or "unknown"),
+            detection_confidence=round(confidence, 3) if confidence is not None else None,
+            detector_name=str(prediction.get("detector_name") or self.name),
+            message=prediction.get("message"),
+        )
+
+
+class HybridMoleculeRegionDetector(BaseMoleculeRegionDetector):
+    """Combine an optional trainable detector with the OpenCV fallback."""
+
+    name = "hybrid-layout"
+
+    def __init__(
+        self,
+        trainable: TrainableMoleculeRegionDetector | None = None,
+        fallback: "HeuristicMoleculeRegionDetector | None" = None,
+        overlap_threshold: float = 0.68,
+    ) -> None:
+        self.trainable = trainable or TrainableMoleculeRegionDetector()
+        self.fallback = fallback or HeuristicMoleculeRegionDetector()
+        self.overlap_threshold = overlap_threshold
+
+    def detect(self, page: DocumentPage) -> list[DocumentRegion]:
+        fallback_regions = self.fallback.detect(page)
+        trainable_regions: list[DocumentRegion] = []
+        if self.trainable.available:
+            try:
+                trainable_regions = self.trainable.detect(page)
+            except Exception:
+                trainable_regions = []
+        if not trainable_regions:
+            return self._renumber(page, fallback_regions)
+
+        selected = list(trainable_regions)
+        for region in fallback_regions:
+            if not self._overlaps_selected(region, selected):
+                selected.append(region)
+        return self._renumber(page, sorted(selected, key=lambda item: (item.bbox[1], item.bbox[0])))
+
+    def _overlaps_selected(self, region: DocumentRegion, selected: list[DocumentRegion]) -> bool:
+        return any(
+            HeuristicMoleculeRegionDetector._overlap_ratio(region.bbox, existing.bbox) >= self.overlap_threshold
+            for existing in selected
+        )
+
+    def _renumber(self, page: DocumentPage, regions: list[DocumentRegion]) -> list[DocumentRegion]:
+        for index, region in enumerate(regions, start=1):
+            region.document_id = page.document_id
+            region.page_number = page.page_number
+            region.region_id = f"p{page.page_number:03d}_r{index:03d}"
+        return regions
 
 
 def page_quality(image: np.ndarray) -> dict[str, Any]:
@@ -205,8 +332,20 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             return "text", 0.45, "Region is too small for reliable single-molecule OCSR."
         if self._looks_like_table(crop, aspect, horizontal_projection, vertical_projection):
             return "table", 0.55, "Grid-like line structure; not sent to single-molecule OCSR by default."
-        if self._looks_like_reaction(crop, aspect, width, height):
-            return "reaction_like", 0.62, "Wide arrow/plus-like region; reaction parsing is not supported yet."
+        if self._looks_like_reaction_arrow(crop, aspect, width, height, ink_ratio):
+            if len(significant_components) >= 6 or text_line_count >= 2:
+                return "reaction_like", 0.64, "Reaction-like scheme; route to reaction review instead of single-molecule OCSR."
+            return "reaction_arrow", 0.7, "Reaction arrow/line detected; route to reaction workflow."
+        if self._looks_like_reaction_condition(
+            width,
+            height,
+            aspect,
+            ink_ratio,
+            significant_components,
+            text_line_count,
+            small_component_ratio,
+        ):
+            return "reaction_condition", 0.57, "Short reaction-condition-like label; not a molecule crop."
         if self._looks_like_text(
             width,
             height,
@@ -219,6 +358,8 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             skeletal_linework,
         ):
             return "text", 0.68, "Text-like compact components; not treated as a molecule."
+        if self._looks_like_figure(ink_ratio, page_area_ratio, edge_ratio):
+            return "figure", 0.52, "Dense figure-like image region; requires manual review before OCSR."
 
         confidence = 0.25
         if 0.012 <= ink_ratio <= 0.24:
@@ -369,8 +510,14 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         return bool(horizontal_lines and vertical_lines)
 
     @staticmethod
-    def _looks_like_reaction(crop: np.ndarray, aspect: float, width: int, height: int) -> bool:
-        if aspect < 2.5 or width < 180:
+    def _looks_like_reaction_arrow(
+        crop: np.ndarray,
+        aspect: float,
+        width: int,
+        height: int,
+        ink_ratio: float,
+    ) -> bool:
+        if aspect < 2.5 or width < 180 or height > 190 or ink_ratio > 0.18:
             return False
         lines = cv2.HoughLinesP(crop, 1, np.pi / 180, threshold=40, minLineLength=max(60, width // 4), maxLineGap=8)
         if lines is None:
@@ -382,3 +529,42 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             if length > width * 0.25 and abs(y2 - y1) <= max(4, height * 0.08):
                 long_horizontal += 1
         return long_horizontal >= 1
+
+    @staticmethod
+    def _looks_like_reaction(
+        crop: np.ndarray,
+        aspect: float,
+        width: int,
+        height: int,
+        ink_ratio: float | None = None,
+    ) -> bool:
+        if ink_ratio is None:
+            area = max(width * height, 1)
+            ink_ratio = float(np.count_nonzero(crop) / area)
+        return HeuristicMoleculeRegionDetector._looks_like_reaction_arrow(crop, aspect, width, height, ink_ratio)
+
+    @staticmethod
+    def _looks_like_reaction_condition(
+        width: int,
+        height: int,
+        aspect: float,
+        ink_ratio: float,
+        significant_components: list[int],
+        text_line_count: int,
+        small_component_ratio: float,
+    ) -> bool:
+        if height < 55 or height > 145:
+            return False
+        if aspect < 1.7 or aspect > 8.0:
+            return False
+        if not (0.008 <= ink_ratio <= 0.20):
+            return False
+        if not (1 <= text_line_count <= 3):
+            return False
+        if not (3 <= len(significant_components) <= 28):
+            return False
+        return small_component_ratio >= 0.25
+
+    @staticmethod
+    def _looks_like_figure(ink_ratio: float, page_area_ratio: float, edge_ratio: float) -> bool:
+        return bool(page_area_ratio > 0.025 and ink_ratio > 0.34 and edge_ratio > 0.025)

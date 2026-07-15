@@ -11,6 +11,16 @@ import config
 from src.chem.smiles_validator import validate_smiles
 
 REQUIRED_FIELDS = ("sample_id", "image_path", "ground_truth_smiles", "category", "source", "notes")
+RECOMMENDED_FIELDS = (
+    "expected_action",
+    "split",
+    "scaffold_key",
+    "source_document",
+    "image_quality",
+    "complexity",
+    "perturbation",
+    "structure_features",
+)
 
 
 @dataclass(frozen=True)
@@ -21,10 +31,18 @@ class BenchmarkSample:
     image_path: Path
     manifest_image_path: str
     ground_truth_smiles: str
-    ground_truth_canonical_smiles: str
+    ground_truth_canonical_smiles: str | None
     category: str
     source: str
     notes: str
+    expected_action: str = "recognize"
+    split: str = "unspecified"
+    scaffold_key: str = "unspecified"
+    source_document: str = "unspecified"
+    image_quality: str = "unspecified"
+    complexity: str = "unspecified"
+    perturbation: str = "none"
+    structure_features: str = "unspecified"
 
 
 class ManifestValidationError(ValueError):
@@ -77,8 +95,15 @@ def load_manifest(manifest_path: str | Path, dataset_root: str | Path | None = N
         for line_number, row in enumerate(reader, start=2):
             row_errors: list[str] = []
             values = {field: (row.get(field) or "").strip() for field in REQUIRED_FIELDS}
+            recommended = {
+                field: (row.get(field) or "").strip() or BenchmarkSample.__dataclass_fields__[field].default
+                for field in RECOMMENDED_FIELDS
+            }
+            expected_action = str(recommended["expected_action"]).lower()
             for field in REQUIRED_FIELDS:
                 if field != "notes" and not values[field]:
+                    if field == "ground_truth_smiles" and expected_action == "reject":
+                        continue
                     row_errors.append(f"Line {line_number}: required field '{field}' is empty.")
 
             sample_id = values["sample_id"]
@@ -94,7 +119,14 @@ def load_manifest(manifest_path: str | Path, dataset_root: str | Path | None = N
                 elif not image_path.is_file():
                     row_errors.append(f"Line {line_number}: image file does not exist: {image_path}")
 
-            validation = validate_smiles(values["ground_truth_smiles"])
+            if expected_action not in {"recognize", "reject"}:
+                row_errors.append(f"Line {line_number}: expected_action must be 'recognize' or 'reject'.")
+                expected_action = "recognize"
+            validation = {"valid": False, "canonical_smiles": None, "error": None}
+            if expected_action == "reject" and not values["ground_truth_smiles"]:
+                validation = {"valid": True, "canonical_smiles": None, "error": None}
+            else:
+                validation = validate_smiles(values["ground_truth_smiles"])
             if not validation["valid"]:
                 row_errors.append(
                     f"Line {line_number}: invalid ground_truth_smiles for sample_id '{sample_id}': "
@@ -110,10 +142,20 @@ def load_manifest(manifest_path: str | Path, dataset_root: str | Path | None = N
                     image_path=image_path,
                     manifest_image_path=values["image_path"],
                     ground_truth_smiles=values["ground_truth_smiles"],
-                    ground_truth_canonical_smiles=str(validation["canonical_smiles"]),
+                    ground_truth_canonical_smiles=(
+                        str(validation["canonical_smiles"]) if validation["canonical_smiles"] is not None else None
+                    ),
                     category=values["category"],
                     source=values["source"],
                     notes=values["notes"],
+                    expected_action=expected_action,
+                    split=recommended["split"],
+                    scaffold_key=recommended["scaffold_key"],
+                    source_document=recommended["source_document"],
+                    image_quality=recommended["image_quality"],
+                    complexity=recommended["complexity"],
+                    perturbation=recommended["perturbation"],
+                    structure_features=recommended["structure_features"],
                 )
             )
 

@@ -21,7 +21,7 @@ def main() -> int:
     parser.add_argument("--smiles", required=True, help="待分析的 SMILES")
     parser.add_argument("--output", default=str(OUTPUT_DIR / "smiles_report.json"))
     args = parser.parse_args()
-    report = MoleculeReportGenerator(output_dir=Path(args.output).parent).generate(smiles=args.smiles)
+    report = MoleculeReportGenerator("manual", output_dir=Path(args.output).parent).generate(smiles=args.smiles)
     save_json(report, args.output)
     print(to_json_text(report))
     return 0 if report["status"] == "success" else 1

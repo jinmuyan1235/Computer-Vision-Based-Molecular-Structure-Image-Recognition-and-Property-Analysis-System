@@ -29,6 +29,7 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
     structure_warnings = report.get("structure_warnings") or []
     descriptors = report.get("descriptors") or {}
     lipinski = report.get("lipinski") or {}
+    runtime = report.get("runtime") or {}
     consensus = ocsr.get("consensus") or {}
     candidates = ocsr.get("candidates") or []
     return {
@@ -52,10 +53,15 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
         "inference_time_ms": ocsr.get("inference_time_ms"),
         "model_name": ocsr.get("model_name"),
         "model_version": ocsr.get("model_version"),
+        "model_sha256": ocsr.get("model_sha256"),
         "device": ocsr.get("device"),
+        "app_mode": runtime.get("app_mode"),
+        "git_commit": ocsr.get("git_commit") or runtime.get("git_commit"),
         "candidate_count": len(candidates),
         "consensus_status": consensus.get("status"),
+        "consensus_decision": consensus.get("decision"),
         "recommended_backend": consensus.get("recommended_backend"),
+        "ensemble_review_needed": consensus.get("decision") == "review_needed",
         "ensemble_disagreement": consensus.get("status") == "disagreement",
         "ensemble_candidates": json.dumps(candidates, ensure_ascii=False),
         "valid": bool(validation.get("valid", False)),

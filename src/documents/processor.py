@@ -17,13 +17,16 @@ from PIL import Image, ImageDraw
 import config
 from src.analysis.batch_analyzer import flatten_report
 from src.analysis.molecule_report import MoleculeReportGenerator
-from src.documents.detectors import BaseMoleculeRegionDetector, HeuristicMoleculeRegionDetector
+from src.documents.detectors import BaseMoleculeRegionDetector, HeuristicMoleculeRegionDetector, HybridMoleculeRegionDetector
 from src.documents.input_loader import DocumentInputLoader
 from src.documents.models import DocumentPage, DocumentRegion, normalize_bbox, relative_path
 from src.documents.region_editing import apply_region_edits, summarize_regions
 from src.export.csv_exporter import save_csv
 from src.export.json_exporter import save_json
 from src.utils.file_utils import ensure_directory
+
+
+REACTION_REGION_TYPES = {"reaction_like", "reaction_arrow", "reaction_condition"}
 
 
 class DocumentOCSRProcessor:
@@ -39,7 +42,7 @@ class DocumentOCSRProcessor:
     ) -> None:
         self.output_dir = ensure_directory(output_dir)
         self.backend = backend
-        self.detector = detector or HeuristicMoleculeRegionDetector()
+        self.detector = detector or HybridMoleculeRegionDetector()
         self.loader = loader or DocumentInputLoader(self.output_dir)
         self.report_generator = MoleculeReportGenerator(
             backend=backend,
@@ -190,9 +193,10 @@ class DocumentOCSRProcessor:
         if region.status == "deleted":
             return False
         if region.region_type != "molecule":
+            detector_message = region.message
             region.status = "skipped"
-            region.message = region.message or "该区域不是分子结构，已跳过单分子识别。"
-            region.screening = {"passed": False, "reason": region.message}
+            region.message = self._non_molecule_skip_message(region.region_type)
+            region.screening = {"passed": False, "reason": region.message, "detector_message": detector_message}
             return False
         try:
             page = self._find_page(pages, region.page_number)
@@ -210,6 +214,18 @@ class DocumentOCSRProcessor:
         region.status = "detected"
         region.message = str(screening.get("reason") or "通过分子区域二次筛选。")
         return True
+
+    @staticmethod
+    def _non_molecule_skip_message(region_type: str) -> str:
+        if region_type in REACTION_REGION_TYPES:
+            return "该区域属于反应式、箭头或反应条件，已分流，不作为单分子识别；请人工框选单个底物/产物分子，或进入反应解析流程。"
+        if region_type == "table":
+            return "该区域是表格，已跳过单分子识别。"
+        if region_type == "text":
+            return "该区域是文本，已跳过单分子识别。"
+        if region_type == "figure":
+            return "该区域像普通图像/插图，已跳过单分子识别，建议人工确认。"
+        return "该区域不是单个分子结构，已跳过单分子识别。"
 
     def _screen_region_candidate(
         self,
@@ -240,7 +256,8 @@ class DocumentOCSRProcessor:
         foreground = gray < 245
         ink_ratio = float(np.mean(foreground))
         aspect = width / max(height, 1)
-        binary = self.detector._foreground_binary(crop) if isinstance(self.detector, HeuristicMoleculeRegionDetector) else None
+        heuristic_detector = self._heuristic_detector()
+        binary = heuristic_detector._foreground_binary(crop) if heuristic_detector is not None else None
         component_count = 0
         significant_components = 0
         small_component_ratio = 0.0
@@ -285,6 +302,23 @@ class DocumentOCSRProcessor:
         if ink_ratio > 0.38:
             base.update({"passed": False, "reason": "区域前景过密，疑似正文或表格，已跳过识别。"})
             return False, base
+        if binary is not None and HeuristicMoleculeRegionDetector._looks_like_table(binary, aspect, horizontal_projection, vertical_projection):
+            base.update({"passed": False, "reason": "区域呈表格网格形态，已跳过单分子识别。"})
+            return False, base
+        if binary is not None and HeuristicMoleculeRegionDetector._looks_like_reaction_arrow(binary, aspect, width, height, ink_ratio):
+            base.update({"passed": False, "reason": "区域疑似反应箭头或反应式，已分流，不作为单分子识别。"})
+            return False, base
+        if binary is not None and HeuristicMoleculeRegionDetector._looks_like_reaction_condition(
+            width,
+            height,
+            aspect,
+            ink_ratio,
+            [1] * significant_components,
+            text_line_count,
+            small_component_ratio,
+        ):
+            base.update({"passed": False, "reason": "区域疑似反应条件标签，已跳过单分子识别。"})
+            return False, base
         if (height < 90 and aspect > 1.8 and significant_components >= 2) or (aspect > 4.5 and height < 150):
             base.update({"passed": False, "reason": "区域形态像单行文字标签，已跳过识别。"})
             return False, base
@@ -302,6 +336,14 @@ class DocumentOCSRProcessor:
             return False, base
         base["reason"] = "通过分子区域二次筛选。"
         return True, base
+
+    def _heuristic_detector(self) -> HeuristicMoleculeRegionDetector | None:
+        if isinstance(self.detector, HeuristicMoleculeRegionDetector):
+            return self.detector
+        fallback = getattr(self.detector, "fallback", None)
+        if isinstance(fallback, HeuristicMoleculeRegionDetector):
+            return fallback
+        return None
 
     def apply_edits(self, document_result: dict[str, Any], edits: list[dict[str, Any]], rerun_ocsr: bool = False) -> dict[str, Any]:
         """Apply human bbox/type edits and optionally re-run OCSR on edited molecule regions."""
@@ -462,7 +504,10 @@ class DocumentOCSRProcessor:
         colors = {
             "molecule": "green",
             "reaction_like": "orange",
+            "reaction_arrow": "orange",
+            "reaction_condition": "darkorange",
             "table": "blue",
+            "figure": "teal",
             "text": "gray",
             "unknown": "purple",
             "non_molecule": "red",

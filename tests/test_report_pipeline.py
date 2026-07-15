@@ -25,6 +25,15 @@ def test_manual_smiles_pipeline_creates_unique_outputs(tmp_path: Path) -> None:
     assert Path(first["images"]["redrawn_molecule"]).is_file()
 
 
+def test_manual_smiles_pipeline_works_in_production_mode(monkeypatch, tmp_path: Path) -> None:
+    import config
+
+    monkeypatch.setattr(config, "APP_MODE", "production")
+    report = MoleculeReportGenerator("manual", tmp_path).generate(smiles="CCO")
+    assert report["status"] == "success"
+    assert report["ocsr"]["backend"] == "manual"
+
+
 def test_demo_image_pipeline_and_pdf_export(tmp_path: Path) -> None:
     sample = PROJECT_ROOT / "data" / "samples" / "aspirin.png"
     report = MoleculeReportGenerator("demo", tmp_path).generate(image_path=sample)

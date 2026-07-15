@@ -34,7 +34,8 @@ def test_streamlit_correction_widgets_are_present() -> None:
     source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "report_view.py").read_text(encoding="utf-8")
     assert "校验并应用修正" in source
     assert "恢复模型原始结果" in source
-    assert "保存为纠错反馈样本" in source
+    assert "仅保存纠错" in source
+    assert "确认进入训练集" in source
     assert "多后端候选与一致性" in source
 
 

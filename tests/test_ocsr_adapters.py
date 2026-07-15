@@ -5,12 +5,25 @@ from pathlib import Path
 from src.ocsr.decimer_adapter import DECIMERAdapter
 from src.ocsr.demo_adapter import DemoOCSRAdapter
 from src.ocsr.molscribe_adapter import MolScribeAdapter
+from src.ocsr.recognizer import MoleculeRecognizer, ProductionModeError
 
 
 def test_demo_backend_reports_available() -> None:
     status = DemoOCSRAdapter().status()
     assert status["backend"] == "demo"
     assert status["available"] is True
+
+
+def test_production_mode_blocks_demo_recognizer(monkeypatch) -> None:
+    import config
+
+    monkeypatch.setattr(config, "APP_MODE", "production")
+    try:
+        MoleculeRecognizer("demo")
+    except ProductionModeError:
+        pass
+    else:
+        raise AssertionError("Expected demo backend to be blocked in production mode")
 
 
 def test_decimer_tuple_result_with_confidence(tmp_path: Path) -> None:

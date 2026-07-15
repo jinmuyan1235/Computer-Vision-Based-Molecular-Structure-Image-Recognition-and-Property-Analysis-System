@@ -11,13 +11,12 @@ from typing import Any
 from rdkit import DataStructs
 from rdkit.Chem import AllChem
 
-from config import OUTPUT_DIR, PROJECT_ROOT
+from config import DATA_DIR, OUTPUT_DIR
 from src.chem.descriptors import calculate_descriptors
 from src.chem.lipinski import evaluate_lipinski
 from src.chem.mol_drawer import draw_molecule
 from src.chem.smiles_validator import smiles_to_mol, validate_smiles
 from src.chem.standardization import standardize_smiles
-from src.export.json_exporter import save_json
 from src.ml.admet_baseline import ConfiguredADMETPredictor
 from src.utils.file_utils import ensure_directory, safe_stem
 
@@ -233,42 +232,29 @@ def restore_original_prediction(report: dict[str, Any], output_dir: str | Path =
 
 def save_correction_feedback(
     report: dict[str, Any],
-    output_dir: str | Path = OUTPUT_DIR,
+    output_dir: str | Path = DATA_DIR,
     notes: str = "",
-) -> str:
-    """Persist a user-triggered correction feedback sample without personal data."""
+    correction_type: str = "other",
+    review_status: str = "pending",
+    feedback_action: str = "correction_only",
+    include_in_training: bool | None = None,
+    source_reference: str = "",
+    source_license: str = "",
+    privacy_notes: str = "",
+) -> dict[str, Any]:
+    """Persist a user-triggered correction feedback sample and manifest row."""
+    from src.feedback.store import save_feedback_sample
+
     traced = ensure_traceability_blocks(report)
-    analysis_id = str(traced.get("analysis_id") or "analysis")
-    feedback_dir = ensure_directory(Path(output_dir) / "feedback")
-    input_data = traced.get("input") or {}
-    path = input_data.get("path")
-    relative_path = None
-    if path:
-        try:
-            resolved = Path(path).expanduser().resolve()
-            relative_path = str(resolved.relative_to(PROJECT_ROOT))
-        except Exception:
-            relative_path = None
-    ocsr = traced.get("ocsr") or {}
-    payload = {
-        "analysis_id": analysis_id,
-        "saved_at": utc_now_iso(),
-        "input": {
-            "filename": input_data.get("filename"),
-            "relative_path": relative_path,
-            "image_sha256": input_data.get("image_sha256"),
-        },
-        "prediction": {
-            "predicted_smiles": ocsr.get("predicted_smiles") or ocsr.get("smiles"),
-            "predicted_canonical_smiles": ocsr.get("predicted_canonical_smiles"),
-            "predicted_standardized_smiles": ocsr.get("predicted_standardized_smiles"),
-            "confidence": ocsr.get("confidence"),
-            "backend": ocsr.get("backend"),
-            "model_name": ocsr.get("model_name"),
-            "model_version": ocsr.get("model_version"),
-        },
-        "correction": traced.get("correction"),
-        "final": traced.get("final"),
-        "notes": notes,
-    }
-    return save_json(payload, feedback_dir / f"{safe_stem(analysis_id)}.json")
+    return save_feedback_sample(
+        traced,
+        output_dir=output_dir,
+        notes=notes,
+        correction_type=correction_type,
+        review_status=review_status,
+        feedback_action=feedback_action,
+        include_in_training=include_in_training,
+        source_reference=source_reference,
+        source_license=source_license,
+        privacy_notes=privacy_notes,
+    )

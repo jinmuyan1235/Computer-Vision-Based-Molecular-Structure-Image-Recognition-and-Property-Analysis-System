@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+import config
 from src.ui.about_page import render_about_page
 from src.ui.batch_page import render_batch_page
 from src.ui.document_page import render_document_page
@@ -14,11 +15,12 @@ from src.ui.smiles_page import render_smiles_page
 from src.ui.styles import apply_styles
 
 
+config.initialize_directories()
 st.set_page_config(page_title="分子结构识别与性质分析", page_icon="🧪", layout="wide")
 apply_styles()
 
 st.title("分子结构识别与性质分析")
-st.caption("图片/PDF → OpenCV 区域处理 → OCSR → SMILES → RDKit 校验与报告")
+st.caption(f"图片/PDF → OpenCV 区域处理 → OCSR → SMILES → RDKit 校验与报告；当前模式：{config.APP_MODE}")
 
 selected_backend, show_preprocessing, export_pdf = render_sidebar()
 

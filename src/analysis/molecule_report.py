@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import config
 from config import OUTPUT_DIR
+from src.runtime.metadata import report_runtime_metadata
 from src.chem.descriptors import calculate_descriptors
 from src.chem.lipinski import evaluate_lipinski
 from src.chem.mol_drawer import draw_molecule
@@ -36,7 +38,8 @@ class MoleculeReportGenerator:
         runtime_config: dict[str, Any] | None = None,
     ) -> None:
         self.output_dir = ensure_directory(output_dir)
-        self.recognizer = MoleculeRecognizer(backend, runtime_config=runtime_config)
+        self.backend = "manual" if backend == "manual" else (backend or config.OCSR_BACKEND).strip().lower()
+        self.recognizer = None if self.backend == "manual" else MoleculeRecognizer(backend, runtime_config=runtime_config)
         self.preprocessor = ImagePreprocessor()
         self.admet_predictor = ConfiguredADMETPredictor()
 
@@ -48,6 +51,7 @@ class MoleculeReportGenerator:
             "message": "分析尚未完成。",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "input": input_data,
+            "runtime": report_runtime_metadata(),
             "ocsr": None,
             "correction": default_correction_state(),
             "final": default_final_state(),
@@ -91,6 +95,9 @@ class MoleculeReportGenerator:
             report["message"] = f"图像预处理失败：{exc}"
             return report
 
+        if self.recognizer is None:
+            report["message"] = "手动 SMILES 分析器不能处理图片；请选择真实 OCSR 后端。"
+            return report
         recognition_target = path if self.recognizer.preferred_image_stage == "original" else report["images"]["preprocessed"]
         result = self.recognizer.recognize(recognition_target)
         report["ocsr"] = normalize_ocsr_block(result.to_dict())
@@ -114,6 +121,7 @@ class MoleculeReportGenerator:
             model_name="manual",
             model_version="built-in",
             device="cpu",
+            result_origin="manual_input",
         ).to_dict()
         report["ocsr"] = normalize_ocsr_block(report["ocsr"])
         return self._complete_chemistry(report, smiles, prefix, final_source="manual")

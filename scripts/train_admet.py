@@ -24,6 +24,10 @@ def main() -> int:
     parser.add_argument("--smiles-column", default="smiles")
     parser.add_argument("--target-column", required=True)
     parser.add_argument("--task", choices=["classification", "regression"], default="classification")
+    parser.add_argument("--split-strategy", choices=["scaffold", "random"], default="scaffold")
+    parser.add_argument("--test-size", type=float, default=0.2)
+    parser.add_argument("--min-samples", type=int, default=20)
+    parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--output", default=str(ADMET_MODEL_PATH))
     args = parser.parse_args()
     try:
@@ -36,9 +40,21 @@ def main() -> int:
             frame[args.target_column],
             target_name=args.target_column,
             task_type=args.task,
+            random_state=args.random_state,
+            split_strategy=args.split_strategy,
+            test_size=args.test_size,
+            min_samples=args.min_samples,
         )
         path = model.save(args.output)
-        print(json.dumps({"model_path": path, "training_samples": model.training_samples}, ensure_ascii=False, indent=2))
+        print(json.dumps({
+            "model_path": path,
+            "training_samples": model.training_samples,
+            "validation_samples": model.validation_samples,
+            "split_strategy": model.split_strategy,
+            "metrics": model.metrics,
+            "quality_gate": model.quality_gate,
+            "applicability_domain": model.applicability_domain,
+        }, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:
         print(f"ADMET baseline 训练失败：{exc}", file=sys.stderr)

@@ -48,14 +48,15 @@ python -m pip install --force-reinstall "numpy>=1.26,<2.0" "Pillow>=10,<12" "ope
 
 echo "[6/6] Writing GPU environment hint"
 cat > "$PROJECT_ROOT/.env.gpu.example" <<'EOF'
+APP_MODE=production
+OCSR_BACKEND=molscribe
 OCSR_DEVICE=cuda:0
 DECIMER_DEVICE=gpu
-OCSR_STRICT_MODE=true
-DECIMER_STRICT_MODE=true
 OCSR_GPU_REQUIRED=true
 OCSR_GPU_MAX_CONCURRENT_INFERENCE=1
 OCSR_ENSEMBLE_PARALLEL=false
 MOLSCRIBE_MODEL_PATH=models/molscribe/swin_base_char_aux_1m.pth
+SKIP_OCSR_PRODUCTION_CHECK=false
 LD_LIBRARY_PATH=/usr/lib/wsl/lib:$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cudnn/lib:$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cublas/lib:$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cuda_cupti/lib:$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cufft/lib:$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/curand/lib:$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cusolver/lib:$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cusparse/lib:$LD_LIBRARY_PATH
 EOF
 
@@ -63,4 +64,4 @@ echo "GPU environment created. Activate with:"
 echo "source \"$VENV_DIR/bin/activate\""
 echo "Then run:"
 echo "python scripts/download_ocsr_models.py"
-echo "python scripts/verify_gpu_environment.py"
+echo "python scripts/check_ocsr_backend.py --backend molscribe --production --warmup"

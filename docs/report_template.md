@@ -5,6 +5,7 @@
 - 输入类型：图片 / 手动 SMILES
 - 文件名：
 - OCSR 后端：
+- 运行模式：demo / production
 - 生成时间：
 
 ## 识别结果
@@ -14,6 +15,15 @@
 - RDKit 是否有效：
 - Canonical SMILES：
 - 错误或提示：
+
+## 追溯信息
+
+- 模型名称：
+- 模型版本：
+- 模型权重 SHA-256：
+- 推理设备：
+- Git commit：
+- 关键依赖版本：RDKit / PyTorch / TensorFlow / MolScribe / DECIMER / Streamlit
 
 ## 分子性质
 

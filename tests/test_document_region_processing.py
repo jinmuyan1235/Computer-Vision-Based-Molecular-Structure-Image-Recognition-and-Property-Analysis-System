@@ -11,7 +11,11 @@ from PIL import Image, ImageDraw
 from reportlab.pdfgen import canvas
 
 import config
-from src.documents.detectors import HeuristicMoleculeRegionDetector
+from src.documents.detectors import (
+    HeuristicMoleculeRegionDetector,
+    HybridMoleculeRegionDetector,
+    TrainableMoleculeRegionDetector,
+)
 from src.documents.input_loader import DocumentInputError, DocumentInputLoader, PDFRenderer, check_file_size
 from src.documents.models import DocumentPage, DocumentRegion
 from src.documents.processor import DocumentOCSRProcessor
@@ -181,6 +185,12 @@ def test_detect_only_mode_does_not_call_ocsr(tmp_path: Path) -> None:
     assert result["regions"][0]["status"] == "detected"
 
 
+def test_default_processor_uses_hybrid_detector(tmp_path: Path) -> None:
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out")
+    assert isinstance(processor.detector, HybridMoleculeRegionDetector)
+    assert isinstance(processor.detector.fallback, HeuristicMoleculeRegionDetector)
+
+
 def test_full_document_mode_only_recognizes_screened_molecule_regions(tmp_path: Path) -> None:
     page_path = _make_page(tmp_path / "aspirin_page.png", ["aspirin"], text="Aspirin")
     detector = FakeDetector([
@@ -236,6 +246,30 @@ def test_multi_molecule_page_and_text_not_molecule(tmp_path: Path) -> None:
     text_regions = [region for region in regions if region.region_type == "text"]
     assert len(molecule_regions) >= 2
     assert text_regions
+
+
+def test_trainable_detector_predictions_can_be_hybridized(tmp_path: Path) -> None:
+    page_path = _make_page(tmp_path / "trainable_page.png", [], text="")
+    page = DocumentPage("doc", 1, str(page_path), 900, 600)
+
+    trainable = TrainableMoleculeRegionDetector(
+        predictor=lambda _page: [
+            {
+                "bbox": [100, 120, 320, 300],
+                "region_type": "molecule",
+                "confidence": 0.91,
+                "message": "model candidate",
+            }
+        ],
+        name="layout-model",
+    )
+    detector = HybridMoleculeRegionDetector(trainable=trainable, fallback=HeuristicMoleculeRegionDetector())
+
+    regions = detector.detect(page)
+
+    assert regions[0].region_type == "molecule"
+    assert regions[0].detection_confidence == 0.91
+    assert regions[0].detector_name == "layout-model"
 
 
 def test_complex_linework_is_not_filtered_as_text() -> None:
@@ -328,8 +362,25 @@ def test_reaction_like_region_is_not_ocrd_as_single_molecule(tmp_path: Path) -> 
     page_path = tmp_path / "reaction_like.png"
     page.save(page_path)
     result = DocumentOCSRProcessor("demo", tmp_path / "out").process(page_path)
-    assert any(region["region_type"] == "reaction_like" for region in result["regions"])
-    assert all(region["status"] != "recognized" for region in result["regions"] if region["region_type"] == "reaction_like")
+    reaction_regions = [region for region in result["regions"] if region["region_type"] in {"reaction_arrow", "reaction_like"}]
+    assert reaction_regions
+    assert all(region["status"] != "recognized" for region in reaction_regions)
+    assert all("单分子识别" in str(region["message"]) for region in reaction_regions)
+
+
+def test_reaction_condition_region_is_not_sent_to_single_molecule_ocsr(tmp_path: Path) -> None:
+    page_path = _make_page(tmp_path / "condition_page.png", [])
+    page = DocumentPage("doc", 1, str(page_path), 900, 600)
+    region = DocumentRegion("doc", 1, "p001_r001", (100, 100, 500, 180), "reaction_condition", 0.8)
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out")
+    fake_generator = FakeReportGenerator()
+    processor.report_generator = fake_generator
+
+    processor.recognize_region(region, [page], tmp_path / "out")
+
+    assert region.status == "skipped"
+    assert "反应" in str(region.message)
+    assert fake_generator.calls == []
 
 
 def test_zip_image_collection_is_supported(tmp_path: Path) -> None:

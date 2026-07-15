@@ -13,6 +13,7 @@ from src.analysis.correction import (
 from src.analysis.molecule_report import MoleculeReportGenerator
 from src.export.json_exporter import to_json_text
 from src.export.pdf_exporter import save_pdf
+from src.feedback.store import export_feedback_manifest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -89,11 +90,54 @@ def test_feedback_file_only_created_when_explicitly_saved(tmp_path: Path) -> Non
     corrected = apply_smiles_correction(report, "CCO", tmp_path)
     feedback_dir = tmp_path / "feedback"
     assert not feedback_dir.exists()
-    feedback_path = save_correction_feedback(corrected, tmp_path, notes="unit note")
-    payload = json.loads(Path(feedback_path).read_text(encoding="utf-8"))
+    result = save_correction_feedback(
+        corrected,
+        tmp_path,
+        notes="unit note",
+        correction_type="atom",
+        source_reference="unit-source",
+        source_license="internal-test",
+    )
+    payload = json.loads(Path(result["annotation_path"]).read_text(encoding="utf-8"))
     assert payload["correction"]["corrected_smiles"] == "CCO"
     assert payload["prediction"]["backend"] == "demo"
-    assert payload["notes"] == "unit note"
+    assert payload["feedback"]["notes"] == "unit note"
+    assert payload["feedback"]["correction_type"] == "atom"
+    assert Path(result["image_path"]).is_file()
+    assert (feedback_dir / "manifest.csv").is_file()
+
+
+def test_feedback_detects_duplicate_images_and_exports_manifest(tmp_path: Path) -> None:
+    first = MoleculeReportGenerator("demo", tmp_path).generate(image_path=_copy_sample(tmp_path, "aspirin_a.png"))
+    second = MoleculeReportGenerator("demo", tmp_path).generate(image_path=_copy_sample(tmp_path, "aspirin_b.png"))
+    first_corrected = apply_smiles_correction(first, "CCO", tmp_path)
+    second_corrected = apply_smiles_correction(second, "CCO", tmp_path)
+
+    first_result = save_correction_feedback(
+        first_corrected,
+        tmp_path,
+        correction_type="other",
+        review_status="verified",
+        feedback_action="accepted_for_dataset",
+        include_in_training=True,
+    )
+    second_result = save_correction_feedback(
+        second_corrected,
+        tmp_path,
+        correction_type="other",
+        review_status="verified",
+        feedback_action="accepted_for_dataset",
+        include_in_training=True,
+    )
+
+    assert first_result["duplicate_image"] is False
+    assert second_result["duplicate_image"] is True
+    output_manifest = tmp_path / "feedback_train_manifest.csv"
+    export = export_feedback_manifest(tmp_path / "feedback", output_manifest)
+    assert export["exported_count"] == 1
+    rows = output_manifest.read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 2
+    assert "feedback_" in rows[1]
 
 
 def test_different_analysis_ids_do_not_share_correction_outputs(tmp_path: Path) -> None:
