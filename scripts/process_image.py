@@ -13,12 +13,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import config
 from src.analysis.molecule_report import MoleculeReportGenerator
+from src.analysis.correction import sha256_file
 from src.runtime.run_store import (
     create_image_run_from_file,
     load_image_run,
     save_run_report,
     write_runtime_metadata,
 )
+from src.storage.analysis_repository import record_report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-dir", default=None, help="Existing persistent run directory to reuse.")
     parser.add_argument("--analysis-id", default=None, help="Analysis id to use for the persistent run and report.")
     parser.add_argument("--original-filename", default=None, help="User-facing filename to preserve in the report.")
+    parser.add_argument("--effective-input", default=None, help="Adjusted image path to use for recognition while preserving the original run input.")
+    parser.add_argument("--user-preprocessing-json", default=None, help="Serialized user preprocessing parameters.")
     parser.add_argument("--molscribe-device", default=None, help="Runtime MolScribe device override.")
     parser.add_argument("--decimer-device", default=None, help="Runtime DECIMER device override.")
     parser.add_argument("--visible-gpu-index", default=None, help="CUDA_VISIBLE_DEVICES index for TensorFlow/DECIMER.")
@@ -53,9 +57,30 @@ def main() -> int:
             "decimer_device": args.decimer_device,
             "visible_gpu_index": args.visible_gpu_index,
         }
+        effective_input = Path(args.effective_input).expanduser().resolve() if args.effective_input else image_run.input_path
+        if not effective_input.is_file():
+            raise FileNotFoundError(f"有效输入图片不存在：{effective_input}")
+        user_preprocessing = {}
+        if args.user_preprocessing_json:
+            decoded = json.loads(args.user_preprocessing_json)
+            if isinstance(decoded, dict):
+                user_preprocessing = decoded
         generator = MoleculeReportGenerator(args.backend, image_run.run_dir, runtime_config=runtime_config)
-        report = generator.generate(image_path=image_run.input_path, analysis_id=image_run.analysis_id)
+        report = generator.generate(image_path=effective_input, analysis_id=image_run.analysis_id)
+        report["user_preprocessing"] = {
+            **user_preprocessing,
+            "effective_image_path": str(effective_input),
+            "effective_image_sha256": sha256_file(effective_input),
+        }
+        report.setdefault("input", {})
+        report["input"]["effective_path"] = str(effective_input)
+        report["input"]["effective_image_sha256"] = report["user_preprocessing"]["effective_image_sha256"]
+        if effective_input.resolve() != image_run.input_path.resolve():
+            preprocessing = report.setdefault("images", {}).setdefault("preprocessing", {})
+            preprocessing["uploaded_original"] = str(image_run.input_path.resolve())
+            preprocessing["user_adjusted"] = str(effective_input)
         result_path = save_run_report(report, image_run)
+        record_report(report, result_path)
     except Exception as exc:
         if image_run is not None:
             write_runtime_metadata(image_run, {"status": "failed", "message": str(exc)})

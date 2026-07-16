@@ -57,6 +57,31 @@ def default_final_state() -> dict[str, Any]:
     return {"smiles": None, "raw_smiles": None, "canonical_smiles": None, "standardized_smiles": None, "source": None}
 
 
+def current_final_smiles(report: dict[str, Any]) -> str | None:
+    """Return the current user-facing final SMILES for audit/history use."""
+    final = report.get("final") or {}
+    ocsr = report.get("ocsr") or {}
+    return final.get("smiles") or final.get("canonical_smiles") or ocsr.get("smiles")
+
+
+def append_correction_event(
+    report: dict[str, Any],
+    previous_smiles: str | None,
+    new_smiles: str | None,
+    source: str,
+    notes: str = "",
+) -> dict[str, Any]:
+    """Append an in-report correction audit event."""
+    report.setdefault("correction_events", []).append({
+        "previous_smiles": previous_smiles,
+        "new_smiles": new_smiles,
+        "source": source,
+        "created_at": utc_now_iso(),
+        "notes": notes,
+    })
+    return report
+
+
 def normalize_ocsr_block(ocsr: dict[str, Any] | None) -> dict[str, Any] | None:
     """Add prediction-specific aliases while keeping legacy OCSR fields."""
     if not ocsr:
@@ -169,16 +194,22 @@ def _apply_final_smiles(
     updated["status"] = "success"
     updated["message"] = message
     updated = apply_recognition_decision(updated)
-    if source in {"user_correction", "manual_after_ocsr_failure"}:
+    if source in {"user_correction", "manual_after_ocsr_failure", "strategy_selection"} or source.startswith("user_selected_"):
         updated["recognition_decision"] = {
             "decision": "accepted",
             "risk_level": "low",
-            "reason_codes": ["manual_correction"],
+            "reason_codes": ["manual_selection"] if source.startswith("user_selected_") or source == "strategy_selection" else ["manual_correction"],
             "manual_review_recommended": False,
             "calibrated_confidence": None,
             "quality_score": (updated.get("image_quality") or {}).get("quality_score"),
-            "message": "用户已人工修正并重新计算性质。",
+            "message": "用户已明确选择结果并重新计算性质。"
+            if source.startswith("user_selected_") or source == "strategy_selection"
+            else "用户已人工修正并重新计算性质。",
         }
+        if isinstance(updated.get("ocsr"), dict):
+            updated["ocsr"]["decision"] = "accepted"
+            updated["ocsr"]["risk_level"] = "low"
+            updated["ocsr"]["manual_review_recommended"] = False
     return updated
 
 
@@ -200,6 +231,7 @@ def apply_smiles_correction(
     ocsr = updated.get("ocsr") or {}
     if ocsr.get("status") == "success" and ocsr.get("predicted_smiles"):
         source = "user_correction"
+    previous_smiles = current_final_smiles(updated)
     corrected = _apply_final_smiles(
         updated,
         attempted,
@@ -218,6 +250,7 @@ def apply_smiles_correction(
         "source": "user",
         "last_error": None,
     }
+    append_correction_event(corrected, previous_smiles, current_final_smiles(corrected), source, "用户手动修正 SMILES")
     return corrected
 
 
@@ -230,6 +263,7 @@ def restore_original_prediction(report: dict[str, Any], output_dir: str | Path =
     if not validation["valid"]:
         updated["correction"]["last_error"] = "原始模型预测无法被 RDKit 解析，不能恢复为最终分析结果。"
         return updated
+    previous_smiles = current_final_smiles(updated)
     restored = _apply_final_smiles(
         updated,
         str(predicted),
@@ -239,7 +273,115 @@ def restore_original_prediction(report: dict[str, Any], output_dir: str | Path =
         "已恢复为模型原始预测并重新计算性质。",
     )
     restored["correction"] = default_correction_state()
+    append_correction_event(restored, previous_smiles, current_final_smiles(restored), "restore_original_prediction", "恢复模型原始结果")
     return restored
+
+
+def apply_strategy_attempt_result(
+    report: dict[str, Any],
+    strategy: str,
+    output_dir: str | Path = OUTPUT_DIR,
+) -> dict[str, Any]:
+    """Apply a cached valid preprocessing-strategy attempt as the final result."""
+    updated = ensure_traceability_blocks(report)
+    ocsr = updated.get("ocsr") or {}
+    attempts = ocsr.get("strategy_attempts") or []
+    selected = next((attempt for attempt in attempts if attempt.get("strategy") == strategy), None)
+    if not selected:
+        updated["correction"]["last_error"] = f"未找到预处理策略结果：{strategy}"
+        return updated
+    smiles = selected.get("smiles")
+    validation = validate_smiles(smiles)
+    if not validation["valid"]:
+        updated["correction"]["last_error"] = validation["error"]
+        return updated
+    previous_smiles = current_final_smiles(updated)
+
+    ocsr.update({
+        "status": "success",
+        "smiles": smiles,
+        "predicted_smiles": smiles,
+        "predicted_canonical_smiles": selected.get("canonical_smiles") or validation["canonical_smiles"],
+        "confidence": selected.get("confidence"),
+        "selected_strategy": strategy,
+        "preprocessing_strategy": strategy,
+        "message": selected.get("message") or ocsr.get("message"),
+    })
+    updated["ocsr"] = ocsr
+    applied = _apply_final_smiles(
+        updated,
+        str(smiles),
+        "strategy_selection",
+        output_dir,
+        "predicted_molecule",
+        "已应用所选预处理策略结果并重新计算性质。",
+    )
+    applied["strategy_selection"] = {
+        "applied": True,
+        "strategy": strategy,
+        "selected_at": utc_now_iso(),
+    }
+    append_correction_event(applied, previous_smiles, current_final_smiles(applied), "strategy_selection", f"应用预处理策略 {strategy}")
+    return applied
+
+
+def apply_ensemble_candidate_result(
+    report: dict[str, Any],
+    backend: str,
+    output_dir: str | Path = OUTPUT_DIR,
+) -> dict[str, Any]:
+    """Apply one cached ensemble backend candidate as the final result."""
+    updated = ensure_traceability_blocks(report)
+    ocsr = updated.get("ocsr") or {}
+    candidates = ocsr.get("candidates") or []
+    selected = next((candidate for candidate in candidates if candidate.get("backend") == backend), None)
+    if not selected:
+        updated["correction"]["last_error"] = f"未找到候选后端结果：{backend}"
+        return updated
+    smiles = selected.get("raw_smiles") or selected.get("smiles") or selected.get("canonical_smiles")
+    validation = validate_smiles(smiles)
+    if not validation["valid"]:
+        updated["correction"]["last_error"] = validation["error"]
+        return updated
+
+    previous_smiles = current_final_smiles(updated)
+    source = f"user_selected_{backend}_candidate"
+    ocsr.update({
+        "status": "success",
+        "smiles": smiles,
+        "predicted_smiles": smiles,
+        "predicted_canonical_smiles": selected.get("canonical_smiles") or validation["canonical_smiles"],
+        "confidence": selected.get("confidence"),
+        "selected_candidate_backend": backend,
+        "selected_candidate_smiles": smiles,
+        "message": f"用户已采用 {backend} 候选结果。",
+    })
+    updated["ocsr"] = ocsr
+    applied = _apply_final_smiles(
+        updated,
+        str(smiles),
+        source,
+        output_dir,
+        "predicted_molecule",
+        f"已采用 {backend} 候选结果并重新计算性质。",
+    )
+    applied["candidate_selection"] = {
+        "applied": True,
+        "backend": backend,
+        "smiles": str(smiles),
+        "canonical_smiles": applied.get("validation", {}).get("canonical_smiles"),
+        "selected_at": utc_now_iso(),
+        "source": source,
+        "candidate": selected,
+    }
+    applied.setdefault("audit", []).append({
+        "operation": "apply_ensemble_candidate",
+        "backend": backend,
+        "smiles": str(smiles),
+        "at": applied["candidate_selection"]["selected_at"],
+    })
+    append_correction_event(applied, previous_smiles, current_final_smiles(applied), source, f"采用 {backend} 候选结果")
+    return applied
 
 
 def save_correction_feedback(

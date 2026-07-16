@@ -183,6 +183,7 @@ def _latency_metrics(rows: list[dict[str, Any]]) -> dict[str, float | None]:
         return {"mean_latency_ms": None, "median_latency_ms": None, "p95_latency_ms": None}
     return {
         "mean_latency_ms": round(float(statistics.mean(latencies)), 3),
+        "p50_latency_ms": percentile(latencies, 50),
         "median_latency_ms": round(float(statistics.median(latencies)), 3),
         "p95_latency_ms": percentile(latencies, 95),
     }
@@ -231,11 +232,66 @@ def _rejection_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         )
     ]
     rejected = sum(not bool(row.get("recognition_success")) for row in negatives)
+    false_accepts = sum(bool(row.get("recognition_success")) for row in negatives)
     return {
         "rejection_target_count": len(negatives),
         "rejection_count": rejected,
         "rejection_coverage": _rate(rejected, len(negatives)),
+        "false_accept_count": false_accepts,
+        "false_accept_rate": _rate(false_accepts, len(negatives)),
     }
+
+
+def _review_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    review_needed = [
+        row for row in rows
+        if str(row.get("recognition_decision") or "").lower() == "review_needed"
+        or bool(row.get("manual_review_recommended"))
+    ]
+    high_risk_errors = [
+        row for row in rows
+        if _is_high_risk(row) and _is_error(row)
+    ]
+    reviewed_high_risk_errors = [
+        row for row in high_risk_errors
+        if str(row.get("recognition_decision") or "").lower() == "review_needed"
+        or bool(row.get("manual_review_recommended"))
+    ]
+    return {
+        "review_needed_count": len(review_needed),
+        "review_needed_rate": _rate(len(review_needed), len(rows)),
+        "high_risk_error_count": len(high_risk_errors),
+        "high_risk_error_review_needed_count": len(reviewed_high_risk_errors),
+        "high_risk_error_review_needed_rate": _rate(len(reviewed_high_risk_errors), len(high_risk_errors)),
+    }
+
+
+def _is_error(row: dict[str, Any]) -> bool:
+    if str(row.get("expected_action") or "").lower() == "reject":
+        return bool(row.get("recognition_success"))
+    return not bool(row.get("canonical_exact_match"))
+
+
+def _is_high_risk(row: dict[str, Any]) -> bool:
+    fields = " ".join(
+        str(row.get(field) or "").lower()
+        for field in ("expected_action", "category", "complexity", "structure_features", "supported_scope", "notes")
+    )
+    markers = (
+        "reject",
+        "distractor",
+        "non_molecule",
+        "reaction",
+        "stereo",
+        "charge",
+        "salt",
+        "fragment",
+        "metal",
+        "multiple",
+        "multi",
+        "high",
+    )
+    return any(marker in fields for marker in markers)
 
 
 def summarize_rows(rows: list[dict[str, Any]], similarity_threshold: float) -> dict[str, Any]:
@@ -298,6 +354,7 @@ def summarize_rows(rows: list[dict[str, Any]], similarity_threshold: float) -> d
     metrics.update(_latency_metrics(rows))
     metrics.update(_confidence_calibration(rows))
     metrics.update(_rejection_metrics(rows))
+    metrics.update(_review_metrics(rows))
     return metrics
 
 

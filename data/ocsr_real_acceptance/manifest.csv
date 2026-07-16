@@ -1,0 +1,1 @@
+sample_id,image_path,dataset_version,image_sha256,ground_truth_smiles,ground_truth_inchikey,expected_action,supported_scope,category,source,source_document,source_license,annotator,reviewer,review_status,split,scaffold_key,image_quality,complexity,perturbation,structure_features,notes

@@ -99,6 +99,16 @@ def decide_recognition(report: dict[str, Any]) -> dict[str, Any]:
             quality_score,
             "模型返回的 SMILES 不能通过 RDKit 校验。",
         )
+    if ocsr.get("strategy_agreement") is False:
+        return _decision_payload(
+            "review_needed",
+            "high",
+            sorted(set(reason_codes + ["strategy_disagreement"])),
+            True,
+            calibrated_confidence,
+            quality_score,
+            "多个预处理策略返回了不同的有效结构，需要人工审核。",
+        )
     if ocsr.get("backend") == "ensemble" and consensus:
         return _decision_from_consensus(consensus, reason_codes, calibrated_confidence, quality_score)
 

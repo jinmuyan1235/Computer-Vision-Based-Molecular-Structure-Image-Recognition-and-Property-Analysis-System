@@ -18,7 +18,7 @@ from src.utils.file_utils import ensure_directory, safe_stem
 
 
 CORRECTION_TYPES = {"atom", "bond", "charge", "stereo", "missing_fragment", "other"}
-REVIEW_STATUSES = {"pending", "verified", "rejected"}
+REVIEW_STATUSES = {"pending", "verified", "rejected", "returned", "duplicate", "license_unclear"}
 FEEDBACK_ACTIONS = {"correction_only", "accepted_for_dataset"}
 
 FEEDBACK_MANIFEST_FIELDS = [
@@ -70,6 +70,11 @@ def _feedback_root(output_dir: str | Path) -> Path:
     return ensure_directory(Path(output_dir).expanduser().resolve() / "feedback")
 
 
+def feedback_root(output_dir: str | Path) -> Path:
+    """Return the feedback directory, creating it when needed."""
+    return _feedback_root(output_dir)
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -95,6 +100,11 @@ def _write_csv(path: Path, rows: Iterable[dict[str, Any]], fieldnames: list[str]
         writer.writeheader()
         for row in rows:
             writer.writerow({field: row.get(field, "") for field in fieldnames})
+
+
+def read_feedback_manifest(feedback_root: str | Path) -> list[dict[str, str]]:
+    """Read the feedback manifest from a feedback root directory."""
+    return _read_csv(Path(feedback_root).expanduser().resolve() / "manifest.csv")
 
 
 def _source_image_path(report: dict[str, Any]) -> Path | None:
@@ -184,6 +194,12 @@ def _annotation_payload(
         },
         "correction": correction,
         "final": final,
+        "images": {
+            "predicted_molecule": (report.get("images") or {}).get("predicted_molecule"),
+            "corrected_molecule": (report.get("images") or {}).get("corrected_molecule"),
+            "redrawn_molecule": (report.get("images") or {}).get("redrawn_molecule"),
+        },
+        "history": report.get("correction_events") or report.get("audit") or [],
         "feedback": {
             "correction_type": correction_type,
             "review_status": review_status,
@@ -310,6 +326,66 @@ def _load_annotation(feedback_root: Path, row: dict[str, str]) -> dict[str, Any]
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def load_feedback_annotation(feedback_root: str | Path, row: dict[str, str]) -> dict[str, Any] | None:
+    """Load a feedback annotation referenced by a manifest row."""
+    return _load_annotation(Path(feedback_root).expanduser().resolve(), row)
+
+
+def update_feedback_review(
+    feedback_root: str | Path,
+    analysis_id: str,
+    review_status: str,
+    feedback_action: str | None = None,
+    include_in_training: bool | None = None,
+    reviewer_notes: str = "",
+    duplicate_of: str | None = None,
+    source_license: str | None = None,
+) -> dict[str, Any]:
+    """Update one feedback item after independent review."""
+    root = Path(feedback_root).expanduser().resolve()
+    manifest_path = root / "manifest.csv"
+    rows = _read_csv(manifest_path)
+    target = next((row for row in rows if row.get("analysis_id") == analysis_id), None)
+    if target is None:
+        raise FileNotFoundError(f"未找到待审核反馈：{analysis_id}")
+    review_status = _normalize_choice(review_status, REVIEW_STATUSES, "pending")
+    if feedback_action is not None:
+        feedback_action = _normalize_choice(feedback_action, FEEDBACK_ACTIONS, "correction_only")
+    if include_in_training is None:
+        include_in_training = review_status == "verified" and feedback_action == "accepted_for_dataset"
+    annotation = _load_annotation(root, target)
+    if annotation is None:
+        raise FileNotFoundError(f"无法读取反馈标注：{target.get('annotation_path')}")
+
+    feedback = annotation.setdefault("feedback", {})
+    feedback["review_status"] = review_status
+    feedback["feedback_action"] = feedback_action or feedback.get("feedback_action") or "correction_only"
+    feedback["include_in_training"] = bool(include_in_training)
+    feedback["reviewed_at"] = _utc_now_iso()
+    if reviewer_notes:
+        feedback["reviewer_notes"] = reviewer_notes
+    if duplicate_of is not None:
+        feedback["duplicate_image"] = True
+        feedback["duplicate_of"] = duplicate_of
+    if source_license is not None:
+        feedback["source_license"] = source_license
+
+    annotation_path = Path(target.get("annotation_path") or "")
+    if not annotation_path.is_absolute():
+        annotation_path = root / annotation_path
+    save_json(annotation, annotation_path)
+    manifest_row = _manifest_row(annotation, root, annotation_path)
+    _upsert_manifest_row(manifest_path, manifest_row)
+    return {
+        "analysis_id": analysis_id,
+        "review_status": review_status,
+        "feedback_action": manifest_row.get("feedback_action"),
+        "include_in_training": bool(manifest_row.get("include_in_training")),
+        "annotation_path": str(annotation_path.resolve()),
+        "manifest_path": str(manifest_path.resolve()),
+    }
 
 
 def export_feedback_manifest(

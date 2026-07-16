@@ -33,6 +33,33 @@ def test_app_mode_loads_demo_or_production(monkeypatch) -> None:
     assert config.load_settings().app_mode == "demo"
 
 
+def test_default_fallback_image_strategy_order(monkeypatch) -> None:
+    monkeypatch.delenv("OCSR_FALLBACK_IMAGE_STRATEGIES", raising=False)
+    assert config.load_settings().ocsr_fallback_image_strategies == (
+        "original",
+        "normalized",
+        "grayscale",
+        "binary",
+    )
+
+
+def test_production_health_settings_load_from_env(monkeypatch, tmp_path: Path) -> None:
+    warmup = tmp_path / "warmup.png"
+    monkeypatch.setenv("PRODUCTION_HEALTH_CACHE_ENABLED", "false")
+    monkeypatch.setenv("PRODUCTION_HEALTH_LOAD_MODEL", "false")
+    monkeypatch.setenv("PRODUCTION_HEALTH_WARMUP", "false")
+    monkeypatch.setenv("PRODUCTION_HEALTH_CACHE_TTL_SECONDS", "5")
+    monkeypatch.setenv("PRODUCTION_HEALTH_WARMUP_INPUT", str(warmup))
+
+    settings = config.load_settings()
+
+    assert settings.production_health_cache_enabled is False
+    assert settings.production_health_load_model is False
+    assert settings.production_health_warmup is False
+    assert settings.production_health_cache_ttl_seconds == 5
+    assert settings.production_health_warmup_input == warmup.resolve()
+
+
 def test_import_config_does_not_create_document_output_dir(tmp_path: Path) -> None:
     target = tmp_path / "not_created_on_import"
     code = "import config, os; print(config.DOCUMENT_OUTPUT_DIR)"

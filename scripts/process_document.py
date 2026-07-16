@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import config
 from src.documents.input_loader import DocumentInputError, OptionalDependencyError
 from src.documents.processor import DocumentOCSRProcessor
+from src.storage.analysis_repository import record_result_payload
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +39,7 @@ def main() -> int:
         }
         processor = DocumentOCSRProcessor(backend=args.backend, output_dir=args.output, runtime_config=runtime_config)
         result = processor.process(args.input, run_ocsr=not args.detect_only)
+        record_result_payload(result, result.get("exports", {}).get("json"))
     except OptionalDependencyError as exc:
         print(json.dumps({"status": "unavailable", "message": str(exc)}, ensure_ascii=False, indent=2))
         return 2

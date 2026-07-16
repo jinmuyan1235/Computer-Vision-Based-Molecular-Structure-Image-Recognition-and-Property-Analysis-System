@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from src.analysis.correction import (
+    apply_strategy_attempt_result,
     apply_smiles_correction,
     restore_original_prediction,
     save_correction_feedback,
@@ -69,6 +70,29 @@ def test_restore_original_prediction_keeps_prediction_trace(tmp_path: Path) -> N
     assert restored["final"]["source"] == "ocsr"
     assert restored["final"]["canonical_smiles"] == report["final"]["canonical_smiles"]
     assert restored["ocsr"]["predicted_smiles"] == report["ocsr"]["predicted_smiles"]
+
+
+def test_cached_strategy_attempt_can_be_applied_as_final_result(tmp_path: Path) -> None:
+    image = _copy_sample(tmp_path, "aspirin.png")
+    report = MoleculeReportGenerator("demo", tmp_path).generate(image_path=image)
+    report["ocsr"]["strategy_attempts"] = [{
+        "strategy": "binary",
+        "status": "success",
+        "smiles": "CCO",
+        "canonical_smiles": "CCO",
+        "valid_smiles": True,
+        "confidence": 0.88,
+        "message": "binary done",
+    }]
+
+    selected = apply_strategy_attempt_result(report, "binary", tmp_path)
+
+    assert selected["status"] == "success"
+    assert selected["final"]["source"] == "strategy_selection"
+    assert selected["final"]["smiles"] == "CCO"
+    assert selected["ocsr"]["selected_strategy"] == "binary"
+    assert selected["strategy_selection"]["applied"] is True
+    assert Path(selected["images"]["predicted_molecule"]).is_file()
 
 
 def test_json_and_pdf_include_correction_fields(tmp_path: Path) -> None:

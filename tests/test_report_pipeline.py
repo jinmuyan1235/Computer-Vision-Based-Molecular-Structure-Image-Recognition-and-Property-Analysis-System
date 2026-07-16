@@ -39,6 +39,9 @@ def test_demo_image_pipeline_and_pdf_export(tmp_path: Path) -> None:
     report = MoleculeReportGenerator("demo", tmp_path).generate(image_path=sample)
     assert report["status"] == "success"
     assert report["ocsr"]["backend"] == "demo"
+    assert report["ocsr"]["selected_strategy"] == "original"
+    assert report["ocsr"]["strategy_attempt_count"] >= 1
+    assert report["ocsr"]["strategy_attempts"][0]["strategy"] == "original"
     assert set(report["images"]["preprocessing"]) >= {
         "original", "gray", "denoised", "binary", "cropped", "deskewed", "normalized"
     }
@@ -61,6 +64,10 @@ def test_batch_pipeline_exports_success_and_failure(tmp_path: Path) -> None:
     assert Path(result["exports"]["csv"]).is_file()
     assert Path(result["exports"]["json"]).is_file()
     assert Path(result["exports"]["summary_chart"]).is_file()
+    assert Path(result["exports"]["merged_sdf"]).is_file()
+    assert Path(result["exports"]["successful_zip"]).is_file()
+    assert Path(result["exports"]["failed_csv"]).is_file()
+    assert Path(result["exports"]["review_csv"]).is_file()
     frame = pd.read_csv(result["exports"]["csv"])
     assert set(frame["status"]) == {"success", "failed"}
     exported = json.loads(Path(result["exports"]["json"]).read_text(encoding="utf-8"))

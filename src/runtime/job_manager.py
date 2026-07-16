@@ -91,6 +91,66 @@ def terminate_process_tree(process: subprocess.Popen[Any], grace_seconds: float 
                 process.kill()
 
 
+def is_process_alive(pid: int | None) -> bool:
+    """Return whether a process id appears to still be alive."""
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            return f'"{pid}"' in result.stdout or f",{pid}," in result.stdout
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def terminate_process_tree_by_pid(pid: int | None, grace_seconds: float = 3.0) -> None:
+    """Terminate a process group/session by pid when the Popen object is unavailable."""
+    if not is_process_alive(pid):
+        return
+    assert pid is not None
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=max(grace_seconds, 1.0),
+            )
+        except Exception:
+            return
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+        deadline = time.perf_counter() + grace_seconds
+        while time.perf_counter() < deadline:
+            if not is_process_alive(pid):
+                return
+            time.sleep(0.05)
+        if is_process_alive(pid):
+            os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            return
+
+
 def run_process(
     command: Sequence[str | os.PathLike[str]],
     *,

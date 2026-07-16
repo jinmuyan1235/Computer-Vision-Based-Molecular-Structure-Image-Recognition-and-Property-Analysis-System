@@ -9,7 +9,7 @@ from typing import Any
 
 from PIL import Image
 
-from src.analysis.correction import apply_smiles_correction
+from src.analysis.correction import apply_ensemble_candidate_result, apply_smiles_correction
 from src.evaluation.dataset import load_manifest
 from src.evaluation.evaluator import OCSREvaluator
 from src.ocsr.base import BaseOCSRAdapter, OCSRResult
@@ -162,6 +162,39 @@ def test_human_correction_overrides_ensemble_recommendation(tmp_path: Path) -> N
     assert corrected["final"]["source"] == "user_correction"
     assert corrected["final"]["canonical_smiles"] == "c1ccccc1"
     assert corrected["ocsr"]["candidates"][0]["backend"] == "molscribe"
+
+
+def test_user_can_apply_ensemble_candidate_as_final_result(tmp_path: Path) -> None:
+    result = EnsembleOCSRAdapter(
+        backends=["molscribe", "decimer"],
+        backend_priority=["molscribe", "decimer"],
+        adapter_factories={
+            "molscribe": _adapter_factory("molscribe", "CCO"),
+            "decimer": _adapter_factory("decimer", "c1ccccc1"),
+        },
+    ).recognize("image.png")
+    report = {
+        "analysis_id": "abc123",
+        "status": "failed",
+        "input": {"type": "image", "filename": "mol.png"},
+        "ocsr": result.to_dict(),
+        "correction": {"applied": False},
+        "final": {"smiles": None, "source": None},
+        "images": {},
+        "image_quality": {"quality_score": 0.9, "passed": True, "reason_codes": []},
+    }
+
+    selected = apply_ensemble_candidate_result(report, "decimer", tmp_path)
+
+    assert selected["status"] == "success"
+    assert selected["final"]["source"] == "user_selected_decimer_candidate"
+    assert selected["final"]["canonical_smiles"] == "c1ccccc1"
+    assert selected["candidate_selection"]["backend"] == "decimer"
+    assert selected["recognition_decision"]["decision"] == "accepted"
+    assert selected["ocsr"]["decision"] == "accepted"
+    assert selected["ocsr"]["selected_candidate_backend"] == "decimer"
+    assert selected["audit"][-1]["operation"] == "apply_ensemble_candidate"
+    assert Path(selected["images"]["predicted_molecule"]).is_file()
 
 
 def _image(path: Path) -> Path:

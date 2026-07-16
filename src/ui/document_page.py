@@ -16,6 +16,7 @@ import streamlit as st
 import config
 from src.documents.input_loader import DocumentInputError, OptionalDependencyError
 from src.documents.processor import DocumentOCSRProcessor
+from src.storage.analysis_repository import record_result_payload
 from src.ui.image_viewer import show_document_page
 from src.ui.labels import REGION_TYPE_LABELS, localize_region_rows
 from src.ui.records import render_records
@@ -77,11 +78,13 @@ def _run_demo_document(upload: Any, backend: str, run_ocsr: bool) -> None:
             progress_bar.progress(current / max(total, 1))
 
         with st.spinner("正在渲染页面并检测区域……"):
-            st.session_state["document_result"] = get_document_processor(backend).process(
+            result = get_document_processor(backend).process(
                 temporary_path,
                 run_ocsr=run_ocsr,
                 progress_callback=progress_callback if run_ocsr else None,
             )
+            record_result_payload(result, (result.get("exports") or {}).get("json"))
+            st.session_state["document_result"] = result
             remember_backend_status(backend)
         progress_text.empty()
         progress_bar.empty()
@@ -190,7 +193,9 @@ def _render_document_job_status() -> None:
     if not result_path.is_file():
         st.error(f"文档处理结果文件不存在：{result_path}")
         return
-    st.session_state["document_result"] = json.loads(result_path.read_text(encoding="utf-8"))
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    record_result_payload(result, result_path)
+    st.session_state["document_result"] = result
     st.session_state["document_job_logs"] = {
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
@@ -252,8 +257,11 @@ def _apply_document_edits_subprocess(
 def _apply_document_edits(document_result: dict, backend: str, edits: list[dict], rerun_ocsr: bool) -> dict:
     if backend == "demo":
         processor = get_document_processor(backend)
-        return processor.apply_edits(document_result, edits, rerun_ocsr=rerun_ocsr)
-    return _apply_document_edits_subprocess(document_result, backend, edits, rerun_ocsr)
+        updated = processor.apply_edits(document_result, edits, rerun_ocsr=rerun_ocsr)
+    else:
+        updated = _apply_document_edits_subprocess(document_result, backend, edits, rerun_ocsr)
+    record_result_payload(updated, (updated.get("exports") or {}).get("json"))
+    return updated
 
 
 def _extract_json_object(text: str) -> dict | None:

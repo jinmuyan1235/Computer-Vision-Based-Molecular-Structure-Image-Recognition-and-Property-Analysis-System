@@ -10,7 +10,7 @@ def test_streamlit_app_starts_without_exception() -> None:
     app = AppTest.from_file(str(app_path), default_timeout=30).run()
     assert not app.exception
     assert app.title[0].value == "分子结构识别与性质分析"
-    assert len(app.tabs) == 5
+    assert len(app.tabs) == 8
 
 
 def test_smiles_result_page_renders_without_exception(tmp_path: Path) -> None:
@@ -34,8 +34,9 @@ def test_streamlit_correction_widgets_are_present() -> None:
     source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "report_view.py").read_text(encoding="utf-8")
     assert "校验并应用修正" in source
     assert "恢复模型原始结果" in source
-    assert "仅保存纠错" in source
-    assert "确认进入训练集" in source
+    assert "保存为待审核" in source
+    assert "不保存" in source
+    assert "确认进入训练集" not in source
     assert "多后端候选与一致性" in source
 
 

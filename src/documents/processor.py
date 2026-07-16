@@ -23,6 +23,7 @@ from src.documents.models import DocumentPage, DocumentRegion, normalize_bbox, r
 from src.documents.region_editing import apply_region_edits, summarize_regions
 from src.export.csv_exporter import save_csv
 from src.export.json_exporter import save_json
+from src.export.structure_exporter import export_batch_structure_files
 from src.utils.file_utils import ensure_directory
 
 
@@ -380,6 +381,19 @@ class DocumentOCSRProcessor:
         csv_path = save_csv(rows, output_root / "regions.csv")
         failures = [row for row in rows if row.get("region_type") == "molecule" and row.get("status") not in {"recognized"}]
         failure_path = save_csv(failures, output_root / "failed_regions.csv")
+        structure_reports: list[dict[str, Any]] = []
+        structure_rows: list[dict[str, Any]] = []
+        for region, row in zip(document_result.get("regions", []), rows):
+            report = region.get("report") or {}
+            if report:
+                structure_reports.append(report)
+                structure_rows.append(row)
+        structure_exports = export_batch_structure_files(
+            structure_reports,
+            output_root / "structure_exports",
+            structure_rows,
+            file_prefix="document",
+        )
         annotated_paths = self._save_annotated_pages(document_result, output_root)
         redrawn_dir = ensure_directory(output_root / "redrawn")
         for region in document_result.get("regions", []):
@@ -393,6 +407,10 @@ class DocumentOCSRProcessor:
             "annotated_pages": ",".join(annotated_paths),
             "crops_dir": str((output_root / "crops").resolve()),
             "redrawn_dir": str(redrawn_dir.resolve()),
+            "structures_sdf": structure_exports["merged_sdf"],
+            "structures_zip": structure_exports["successful_zip"],
+            "structure_failed_csv": structure_exports["failed_csv"],
+            "structure_review_csv": structure_exports["review_csv"],
         }
         document_result["exports"] = exports
         json_path = save_json(document_result, output_root / "document_result.json")

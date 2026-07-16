@@ -89,7 +89,7 @@ def candidate_from_result(result: OCSRResult) -> dict[str, Any]:
         error = result.message
     elif not identity["valid"]:
         error = identity["error"]
-    return {
+    candidate = {
         "backend": result.backend,
         "raw_smiles": result.smiles,
         "canonical_smiles": identity["canonical_smiles"],
@@ -104,12 +104,38 @@ def candidate_from_result(result: OCSRResult) -> dict[str, Any]:
         "status": result.status,
         "message": result.message,
         "error": error,
+        "result_origin": result.result_origin,
+        "inference_strategy": result.result_origin or "backend_default",
         "inchikey": identity["inchikey"],
         "formula": identity["formula"],
         "atom_count": identity["atom_count"],
         "formal_charge": identity["formal_charge"],
         "raw_result": result.to_dict(),
     }
+    candidate["risk_hints"] = _candidate_risk_hints(candidate)
+    return candidate
+
+
+def _candidate_risk_hints(candidate: dict[str, Any]) -> list[str]:
+    hints: list[str] = []
+    if candidate.get("status") != "success":
+        hints.append("recognition_failed")
+    if not candidate.get("raw_smiles"):
+        hints.append("missing_smiles")
+    if candidate.get("raw_smiles") and not candidate.get("valid"):
+        hints.append("rdkit_invalid")
+    confidence = candidate.get("confidence")
+    if confidence is None:
+        hints.append("uncalibrated_or_missing_confidence")
+    else:
+        try:
+            if float(confidence) < config.DECISION_REVIEW_THRESHOLD:
+                hints.append("low_confidence")
+        except (TypeError, ValueError):
+            hints.append("invalid_confidence")
+    if candidate.get("formal_charge") not in {None, 0}:
+        hints.append("formal_charge_present")
+    return sorted(set(hints))
 
 
 def compare_candidates(candidate_a: dict[str, Any], candidate_b: dict[str, Any]) -> dict[str, Any]:

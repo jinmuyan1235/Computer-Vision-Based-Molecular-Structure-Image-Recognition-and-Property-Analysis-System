@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import config
 from src.documents.processor import DocumentOCSRProcessor
 from src.export.json_exporter import save_json
+from src.storage.analysis_repository import record_result_payload
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +48,7 @@ def main() -> int:
         result_path = Path(updated["exports"].get("json") or output_dir / "document_result.json")
         if not result_path.is_file():
             result_path = Path(save_json(updated, output_dir / "document_result.json"))
+        record_result_payload(updated, result_path)
     except Exception as exc:
         print(json.dumps({"status": "failed", "message": str(exc)}, ensure_ascii=False, indent=2))
         return 1

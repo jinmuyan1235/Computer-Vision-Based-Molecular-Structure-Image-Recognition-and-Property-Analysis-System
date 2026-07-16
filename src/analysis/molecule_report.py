@@ -11,6 +11,7 @@ import config
 from config import OUTPUT_DIR
 from src.runtime.metadata import report_runtime_metadata
 from src.analysis.image_quality import assess_image_quality
+from src.analysis.multi_strategy_recognition import recognize_with_fallback_strategies
 from src.analysis.recognition_decision import apply_recognition_decision
 from src.chem.descriptors import calculate_descriptors
 from src.chem.lipinski import evaluate_lipinski
@@ -108,9 +109,17 @@ class MoleculeReportGenerator:
         if self.recognizer is None:
             report["message"] = "手动 SMILES 分析器不能处理图片；请选择真实 OCSR 后端。"
             return apply_recognition_decision(report)
-        recognition_target = path if self.recognizer.preferred_image_stage == "original" else report["images"]["preprocessed"]
-        result = self.recognizer.recognize(recognition_target)
-        report["ocsr"] = normalize_ocsr_block(result.to_dict())
+        recognition = recognize_with_fallback_strategies(
+            self.recognizer,
+            path,
+            stages,
+            stage_paths,
+            report["image_quality"],
+        )
+        result = recognition.result
+        ocsr_block = result.to_dict()
+        ocsr_block.update(recognition.report_fields())
+        report["ocsr"] = normalize_ocsr_block(ocsr_block)
         if result.status != "success" or not result.smiles:
             report["message"] = result.message
             report["validation"]["error"] = "未获得可校验的 SMILES。"
