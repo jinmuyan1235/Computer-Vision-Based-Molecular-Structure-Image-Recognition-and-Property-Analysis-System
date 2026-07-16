@@ -9,17 +9,53 @@ import streamlit as st
 
 from config import DATA_DIR, OUTPUT_DIR
 from src.analysis.correction import (
+    apply_ensemble_candidate_result,
+    apply_strategy_attempt_result,
     apply_smiles_correction,
     restore_original_prediction,
     save_correction_feedback,
     structure_similarity,
 )
+from src.chem.mol_drawer import draw_molecule
 from src.export.json_exporter import to_json_text
 from src.export.pdf_exporter import save_pdf
+from src.export.structure_exporter import copyable_structure_fields, export_structure_files
 from src.runtime.run_store import mark_run_protected_from_report, report_output_dir, save_report_for_existing_run
+from src.storage.analysis_repository import AnalysisRepository, record_report
 from src.ui.image_viewer import show_preprocess_thumbnail, show_structure
 from src.ui.labels import backend_label, status_label
 from src.ui.records import render_records
+from src.utils.file_utils import safe_stem
+
+
+def _final_smiles(report: dict[str, Any]) -> str | None:
+    final = report.get("final") or {}
+    ocsr = report.get("ocsr") or {}
+    return final.get("smiles") or final.get("canonical_smiles") or ocsr.get("smiles")
+
+
+def _persist_report_update(
+    report: dict[str, Any],
+    previous_report: dict[str, Any] | None = None,
+    source: str | None = None,
+    notes: str = "",
+) -> None:
+    report_path = save_report_for_existing_run(report)
+    try:
+        record_report(report, report_path)
+        if previous_report is not None and source:
+            previous_smiles = _final_smiles(previous_report)
+            new_smiles = _final_smiles(report)
+            if previous_smiles != new_smiles:
+                AnalysisRepository().record_correction(
+                    str(report.get("analysis_id") or ""),
+                    previous_smiles,
+                    new_smiles,
+                    source,
+                    notes,
+                )
+    except Exception:
+        return
 
 
 def show_ensemble_details(ocsr: dict[str, Any]) -> None:
@@ -55,6 +91,147 @@ def show_ensemble_details(ocsr: dict[str, Any]) -> None:
                     "错误": candidate.get("error"),
                 })
             render_records(rows, title_keys=("后端",))
+
+
+def show_ensemble_candidate_actions(report: dict[str, Any]) -> dict[str, Any]:
+    ocsr = report.get("ocsr") or {}
+    candidates = ocsr.get("candidates") or []
+    if not candidates:
+        return report
+    with st.expander("候选结果一键确认", expanded=False):
+        current = report
+        for candidate in candidates:
+            current = _show_ensemble_candidate_card(current, candidate)
+        return current
+
+
+def _show_ensemble_candidate_card(report: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    backend = str(candidate.get("backend") or "unknown")
+    smiles = candidate.get("raw_smiles") or ""
+    canonical = candidate.get("canonical_smiles") or "-"
+    similarity = _candidate_similarity_notes(candidate, (report.get("ocsr") or {}).get("similarity_analysis") or [])
+    risk_hints = candidate.get("risk_hints") or []
+    st.markdown(f"**{backend_label(backend, short=True)}**")
+    left, right = st.columns([0.62, 0.38])
+    with left:
+        st.code(smiles or "-", language=None)
+        st.caption(f"canonical: {canonical}")
+        st.caption(
+            f"模型：{candidate.get('model_name') or '-'}；"
+            f"置信度：{candidate.get('confidence') if candidate.get('confidence') is not None else '模型未提供'}；"
+            f"策略：{candidate.get('inference_strategy') or '-'}；"
+            f"耗时(ms)：{candidate.get('inference_time_ms') or '-'}"
+        )
+        if similarity:
+            st.caption("候选相似性：" + "；".join(similarity))
+        if risk_hints:
+            st.warning("风险提示：" + ", ".join(str(item) for item in risk_hints))
+        if candidate.get("error"):
+            st.error(str(candidate.get("error")))
+    with right:
+        structure_path = _candidate_structure_path(report, candidate)
+        if structure_path:
+            show_structure(structure_path, f"{backend_label(backend, short=True)} 重绘结构")
+    if candidate.get("valid") and smiles:
+        analysis_id = report.get("analysis_id") or "image"
+        if st.button(f"采用 {backend_label(backend, short=True)} 结果", key=f"apply_candidate_{analysis_id}_{backend}"):
+            updated = apply_ensemble_candidate_result(report, backend, report_output_dir(report, OUTPUT_DIR))
+            error = (updated.get("correction") or {}).get("last_error")
+            if error:
+                st.warning(error)
+            else:
+                _persist_report_update(updated, report, f"user_selected_{backend}_candidate", f"采用 {backend} 候选结果")
+                st.session_state["image_report"] = updated
+                st.success(f"已采用 {backend_label(backend, short=True)} 候选结果。")
+                return updated
+    st.divider()
+    return report
+
+
+def _candidate_similarity_notes(candidate: dict[str, Any], similarity_analysis: list[dict[str, Any]]) -> list[str]:
+    backend = candidate.get("backend")
+    notes: list[str] = []
+    for item in similarity_analysis:
+        if backend not in {item.get("backend_a"), item.get("backend_b")}:
+            continue
+        other = item.get("backend_b") if item.get("backend_a") == backend else item.get("backend_a")
+        value = item.get("morgan_tanimoto")
+        equality = "canonical一致" if item.get("canonical_smiles_equal") else "canonical不一致"
+        notes.append(f"vs {other}: {equality}" if value is None else f"vs {other}: Tanimoto {value}, {equality}")
+    return notes
+
+
+def _candidate_structure_path(report: dict[str, Any], candidate: dict[str, Any]) -> str | None:
+    smiles = candidate.get("raw_smiles") or candidate.get("canonical_smiles")
+    if not smiles or not candidate.get("valid"):
+        return None
+    analysis_id = safe_stem(str(report.get("analysis_id") or "analysis"), "analysis")
+    backend = safe_stem(str(candidate.get("backend") or "candidate"), "candidate")
+    path = report_output_dir(report, OUTPUT_DIR) / "candidate_structures" / f"{analysis_id}_{backend}.png"
+    try:
+        if path.is_file():
+            return str(path.resolve())
+        return draw_molecule(str(smiles), path)
+    except Exception:
+        return None
+
+
+def show_strategy_attempts(report: dict[str, Any]) -> dict[str, Any]:
+    ocsr = report.get("ocsr") or {}
+    attempts = ocsr.get("strategy_attempts") or []
+    if not attempts:
+        return report
+    with st.expander("多预处理策略尝试", expanded=False):
+        selected = ocsr.get("selected_strategy") or "-"
+        agreement = ocsr.get("strategy_agreement")
+        agreement_label = "可比较成功结果不足" if agreement is None else ("一致" if agreement else "不一致")
+        st.caption(
+            f"selected_strategy: {selected}; "
+            f"strategy_agreement: {agreement_label}; "
+            f"attempt_count: {len(attempts)}"
+        )
+        rows = []
+        for attempt in attempts:
+            rows.append({
+                "strategy": attempt.get("strategy"),
+                "status": status_label(attempt.get("status")),
+                "smiles": attempt.get("smiles"),
+                "canonical_smiles": attempt.get("canonical_smiles"),
+                "valid_smiles": status_label(attempt.get("valid_smiles")),
+                "confidence": attempt.get("confidence"),
+                "retry_reason_codes": attempt.get("retry_reason_codes"),
+                "inference_time_ms": attempt.get("inference_time_ms"),
+                "message": attempt.get("message"),
+            })
+        render_records(
+            rows,
+            title_keys=("strategy",),
+            summary_keys=("status", "canonical_smiles", "confidence", "retry_reason_codes"),
+        )
+        valid_options = [
+            str(attempt.get("strategy"))
+            for attempt in attempts
+            if attempt.get("valid_smiles") and attempt.get("smiles")
+        ]
+        if valid_options:
+            analysis_id = report.get("analysis_id") or "image"
+            selected_option = st.selectbox(
+                "选择预处理策略结果",
+                valid_options,
+                index=valid_options.index(str(selected)) if str(selected) in valid_options else 0,
+                key=f"strategy_select_{analysis_id}",
+            )
+            if st.button("应用所选策略结果", key=f"apply_strategy_{analysis_id}"):
+                updated = apply_strategy_attempt_result(report, selected_option, report_output_dir(report, OUTPUT_DIR))
+                error = (updated.get("correction") or {}).get("last_error")
+                if error:
+                    st.warning(error)
+                else:
+                    _persist_report_update(updated, report, "strategy_selection", f"应用预处理策略 {selected_option}")
+                    st.session_state["image_report"] = updated
+                    st.success("已应用所选策略结果。")
+                    return updated
+    return report
 
 
 def show_chemical_identity(report: dict[str, Any]) -> None:
@@ -103,6 +280,47 @@ def show_recognition_decision(report: dict[str, Any]) -> None:
         st.caption("原因码：" + ", ".join(str(item) for item in reason_codes))
 
 
+def show_structure_exports(report: dict[str, Any], key_prefix: str) -> None:
+    """Render copyable chemistry identifiers and structure downloads."""
+    try:
+        fields = copyable_structure_fields(report)
+        export_dir = report_output_dir(report, OUTPUT_DIR) / "structure_exports"
+        exports = export_structure_files(report, export_dir, prefix=key_prefix)
+    except Exception as exc:
+        st.caption(f"化学格式导出不可用：{exc}")
+        return
+
+    labels = {
+        "original_smiles": "复制原始 SMILES",
+        "canonical_smiles": "复制 Canonical SMILES",
+        "inchi": "复制 InChI",
+        "inchikey": "复制 InChIKey",
+    }
+    columns = st.columns(2)
+    for index, (field, label) in enumerate(labels.items()):
+        with columns[index % 2]:
+            st.text_input(label, value=fields.get(field) or "", key=f"{key_prefix}_{field}_copy")
+
+    download_specs = [
+        ("下载 MOL", "mol", "chemical/x-mdl-molfile"),
+        ("下载 SDF", "sdf", "chemical/x-mdl-sdfile"),
+        ("下载 SVG", "svg", "image/svg+xml"),
+        ("下载 PNG", "png", "image/png"),
+        ("下载完整 ZIP", "zip", "application/zip"),
+    ]
+    buttons = st.columns(3)
+    for index, (label, field, mime) in enumerate(download_specs):
+        path = Path(exports[field])
+        with buttons[index % 3]:
+            st.download_button(
+                label,
+                path.read_bytes(),
+                file_name=path.name,
+                mime=mime,
+                key=f"{key_prefix}_{field}_download",
+            )
+
+
 def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bool, key_prefix: str) -> None:
     """Render a molecule analysis report in Streamlit."""
     if report.get("status") != "success":
@@ -118,6 +336,8 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
                 st.warning("这是演示后端，不会识别任意图片；请使用真实后端或手动输入 SMILES。")
             show_recognition_decision(report)
             show_ensemble_details(ocsr)
+            report = show_ensemble_candidate_actions(report)
+            show_strategy_attempts(report)
         return
 
     ocsr = report.get("ocsr") or {}
@@ -174,12 +394,20 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
             st.warning(lipinski.get("summary", "存在规则提示。"))
 
     show_ensemble_details(ocsr)
+    report = show_ensemble_candidate_actions(report)
+    ocsr = report.get("ocsr") or {}
+    report = show_strategy_attempts(report)
+    ocsr = report.get("ocsr") or {}
     show_chemical_identity(report)
 
     if show_preprocessing and report.get("input", {}).get("type") == "image":
         with st.expander("OpenCV 预处理过程", expanded=False):
+            if report.get("user_preprocessing"):
+                st.json({"user_preprocessing": report.get("user_preprocessing")})
             stage_paths = (report.get("images") or {}).get("preprocessing") or {}
             titles = {
+                "uploaded_original": "上传原图",
+                "user_adjusted": "人工调整图",
                 "original": "原图",
                 "gray": "灰度",
                 "denoised": "去噪",
@@ -189,7 +417,18 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
                 "normalized": "归一化",
             }
             columns = st.columns(3)
-            for index, name in enumerate(["original", "gray", "denoised", "binary", "cropped", "deskewed", "normalized"]):
+            stage_order = [
+                "uploaded_original",
+                "user_adjusted",
+                "original",
+                "gray",
+                "denoised",
+                "binary",
+                "cropped",
+                "deskewed",
+                "normalized",
+            ]
+            for index, name in enumerate(stage_order):
                 if name in stage_paths:
                     with columns[index % 3]:
                         show_preprocess_thumbnail(stage_paths[name], titles[name])
@@ -214,6 +453,7 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
                 )
             else:
                 st.caption(pdf_result["message"])
+        show_structure_exports(report, key_prefix)
         if report.get("run") and st.button("保留本次分析记录", key=f"protect_run_{key_prefix}"):
             mark_run_protected_from_report(report, "user_keep")
             st.success("已标记保留；自动清理不会删除该分析记录。")
@@ -266,7 +506,7 @@ def show_correction_panel(report: dict[str, Any]) -> dict[str, Any]:
             st.error(error)
         else:
             current_report = candidate
-            save_report_for_existing_run(current_report)
+            _persist_report_update(current_report, report, "user_correction", "用户手动修正 SMILES")
             st.session_state["image_report"] = current_report
             st.success("人工修正已应用，性质和结构图已重新生成。")
     if restore_col.button("恢复模型原始结果", key=f"restore_prediction_{analysis_id}"):
@@ -276,7 +516,7 @@ def show_correction_panel(report: dict[str, Any]) -> dict[str, Any]:
             st.warning(error)
         else:
             current_report = candidate
-            save_report_for_existing_run(current_report)
+            _persist_report_update(current_report, report, "restore_original_prediction", "恢复模型原始结果")
             st.session_state["image_report"] = current_report
             st.success("已恢复为模型原始预测。")
 
@@ -293,12 +533,6 @@ def show_correction_panel(report: dict[str, Any]) -> dict[str, Any]:
                 "other": "其他",
             }.get,
             key=f"feedback_type_{analysis_id}",
-        )
-        review_status = st.selectbox(
-            "二次审核状态",
-            ["pending", "verified", "rejected"],
-            format_func={"pending": "待审核", "verified": "已核验", "rejected": "已拒绝"}.get,
-            key=f"feedback_review_{analysis_id}",
         )
         source_col, license_col = st.columns(2)
         source_reference = source_col.text_input(
@@ -321,14 +555,14 @@ def show_correction_panel(report: dict[str, Any]) -> dict[str, Any]:
         )
         notes = st.text_area("反馈备注（可选）", value="", key=f"feedback_notes_{analysis_id}", height=70)
         can_save_feedback = bool((current_report.get("correction") or {}).get("applied"))
-        save_col, accept_col = st.columns(2)
-        if save_col.button("仅保存纠错", key=f"save_feedback_{analysis_id}", disabled=not can_save_feedback):
+        save_col, discard_col = st.columns(2)
+        if save_col.button("保存为待审核", key=f"save_feedback_{analysis_id}", disabled=not can_save_feedback):
             result = save_correction_feedback(
                 current_report,
                 DATA_DIR,
                 notes=notes,
                 correction_type=correction_type,
-                review_status=review_status,
+                review_status="pending",
                 feedback_action="correction_only",
                 include_in_training=False,
                 source_reference=source_reference,
@@ -337,27 +571,11 @@ def show_correction_panel(report: dict[str, Any]) -> dict[str, Any]:
             )
             st.session_state[f"feedback_result_{analysis_id}"] = result
             if result.get("duplicate_image"):
-                st.warning(f"已保存纠错；检测到重复图片，首次记录：{result.get('duplicate_of')}")
+                st.warning(f"已保存到审核队列；检测到重复图片，首次记录：{result.get('duplicate_of')}")
             else:
-                st.success(f"纠错已保存：{result.get('annotation_path')}")
-        if accept_col.button("确认进入训练集", key=f"accept_feedback_{analysis_id}", disabled=not can_save_feedback):
-            result = save_correction_feedback(
-                current_report,
-                DATA_DIR,
-                notes=notes,
-                correction_type=correction_type,
-                review_status="verified",
-                feedback_action="accepted_for_dataset",
-                include_in_training=True,
-                source_reference=source_reference,
-                source_license=source_license,
-                privacy_notes=privacy_notes,
-            )
-            st.session_state[f"feedback_result_{analysis_id}"] = result
-            if result.get("duplicate_image"):
-                st.warning(f"已确认入库；检测到重复图片，首次记录：{result.get('duplicate_of')}")
-            else:
-                st.success(f"已确认进入训练集：{result.get('manifest_path')}")
+                st.success(f"已保存到审核队列：{result.get('annotation_path')}")
+        if discard_col.button("不保存", key=f"discard_feedback_{analysis_id}", disabled=not can_save_feedback):
+            st.info("本次纠错未保存到审核队列，也不会进入训练数据。")
 
     images = current_report.get("images") or {}
     predicted_image = images.get("predicted_molecule")

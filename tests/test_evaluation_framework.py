@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +13,12 @@ from PIL import Image
 from src.evaluation.dataset import ManifestValidationError, load_manifest
 from src.evaluation.evaluator import OCSREvaluator
 from src.evaluation.metrics import compute_metrics, enrich_prediction, tanimoto_similarity
+from src.evaluation.release_compare import compare_release_dirs, write_comparison_report
+from src.evaluation.release_gate import evaluate_release_gates
 from src.evaluation.report_writer import create_run_directory, write_report_bundle
 from src.ocsr.base import BaseOCSRAdapter, OCSRResult
 from src.ocsr.recognizer import MoleculeRecognizer
+from scripts.run_release_acceptance import run_release_acceptance
 
 
 def _image(path: Path) -> Path:
@@ -27,6 +32,43 @@ def _manifest(path: Path, rows: list[dict[str, str]]) -> Path:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+    return path
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _real_manifest(path: Path, image_path: Path, **overrides: str) -> Path:
+    row = {
+        "sample_id": "ethanol_real",
+        "image_path": image_path.name,
+        "dataset_version": "v-test",
+        "image_sha256": _sha256(image_path),
+        "ground_truth_smiles": "CCO",
+        "ground_truth_inchikey": "LFQSCWFLJHTTHZ-UHFFFAOYSA-N",
+        "expected_action": "recognize",
+        "supported_scope": "single_molecule",
+        "category": "clear_single_molecule",
+        "source": "unit",
+        "source_document": "unit-doc",
+        "source_license": "internal-test",
+        "annotator": "unit-annotator",
+        "reviewer": "unit-reviewer",
+        "review_status": "verified",
+        "split": "test",
+        "scaffold_key": "alcohol",
+        "image_quality": "clean",
+        "complexity": "low",
+        "perturbation": "none",
+        "structure_features": "alcohol",
+        "notes": "strict manifest test",
+    }
+    row.update(overrides)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
     return path
 
 
@@ -90,6 +132,24 @@ def test_manifest_loads_recommended_acceptance_metadata(tmp_path: Path) -> None:
     sample = load_manifest(manifest, tmp_path)[0]
     assert sample.image_quality == "scanned"
     assert sample.scaffold_key == "benzene_carboxylate"
+
+
+def test_real_acceptance_manifest_requires_integrity_and_review_metadata(tmp_path: Path) -> None:
+    image = _image(tmp_path / "ethanol.png")
+    manifest = _real_manifest(tmp_path / "manifest.csv", image)
+    sample = load_manifest(manifest, tmp_path, require_real_metadata=True)[0]
+    assert sample.dataset_version == "v-test"
+    assert sample.image_sha256 == _sha256(image)
+    assert sample.review_status == "verified"
+    assert sample.ground_truth_inchikey == "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
+
+    bad_manifest = _real_manifest(tmp_path / "bad_manifest.csv", image, image_sha256="0" * 64)
+    try:
+        load_manifest(bad_manifest, tmp_path, require_real_metadata=True)
+    except ManifestValidationError as exc:
+        assert "image_sha256 mismatch" in str(exc)
+    else:
+        raise AssertionError("Expected checksum validation failure")
 
 
 def test_manifest_allows_reject_rows_without_ground_truth_smiles(tmp_path: Path) -> None:
@@ -330,6 +390,9 @@ def test_metrics_grouping_and_latency_statistics() -> None:
     assert metrics["overall"]["valid_smiles_count"] == 1
     assert metrics["overall"]["atom_count_error_rate"] == 0.0
     assert metrics["overall"]["rejection_coverage"] == 1.0
+    assert metrics["overall"]["false_accept_rate"] == 0.0
+    assert metrics["overall"]["review_needed_count"] == 0
+    assert metrics["overall"]["p50_latency_ms"] == 10.0
     assert metrics["overall"]["median_latency_ms"] == 20.0
     assert "clean" in metrics["groups"]["category"]
     assert "unknown" in metrics["groups"]["image_quality"]
@@ -371,3 +434,69 @@ def test_run_directories_do_not_overwrite_and_report_bundle(tmp_path: Path) -> N
     outputs = write_report_bundle(first, result, {"backend": "demo"})
     for key in ("config", "predictions", "metrics", "report", "failure_cases", "charts"):
         assert Path(outputs[key]).exists()
+
+
+def test_release_gates_and_fixed_release_bundle(monkeypatch, tmp_path: Path) -> None:
+    image = _image(tmp_path / "ethanol.png")
+    manifest = _real_manifest(tmp_path / "manifest.csv", image)
+    monkeypatch.setitem(MoleculeRecognizer.ADAPTERS, "fake_success", FakeSuccessAdapter)
+
+    result = run_release_acceptance(
+        release_version="v-test",
+        manifest=manifest,
+        dataset_root=tmp_path,
+        output_root=tmp_path / "releases",
+        backends=["fake_success"],
+        require_real_metadata=True,
+    )
+
+    release_dir = Path(result["release_dir"])
+    assert result["passed"] is True
+    assert (release_dir / "fake_success_metrics.json").is_file()
+    assert (release_dir / "fake_success_predictions.csv").is_file()
+    assert (release_dir / "errors.csv").is_file()
+    assert (release_dir / "report.md").is_file()
+    payload = json.loads((release_dir / "fake_success_metrics.json").read_text(encoding="utf-8"))
+    assert payload["gates"]["passed"] is True
+
+
+def test_release_gate_flags_threshold_failure() -> None:
+    gates = evaluate_release_gates({
+        "overall": {
+            "valid_smiles_rate": 0.90,
+            "canonical_exact_match_rate": 0.75,
+            "false_accept_rate": 0.10,
+            "high_risk_error_count": 1,
+            "high_risk_error_review_needed_rate": 0.0,
+            "p95_latency_ms": 20000,
+        }
+    })
+    assert gates["passed"] is False
+    assert {check["metric"] for check in gates["checks"] if not check["passed"]} == {
+        "valid_smiles_rate",
+        "canonical_exact_match_rate",
+        "false_accept_rate",
+        "high_risk_error_review_needed_rate",
+        "p95_latency_ms",
+    }
+
+
+def test_release_comparison_detects_regression_and_writes_report(tmp_path: Path) -> None:
+    previous = tmp_path / "releases" / "v1"
+    current = tmp_path / "releases" / "v2"
+    previous.mkdir(parents=True)
+    current.mkdir(parents=True)
+    (previous / "molscribe_metrics.json").write_text(json.dumps({
+        "metrics": {"overall": {"canonical_exact_match_rate": 0.90, "valid_smiles_rate": 0.98, "p95_latency_ms": 1000}}
+    }), encoding="utf-8")
+    (current / "molscribe_metrics.json").write_text(json.dumps({
+        "metrics": {"overall": {"canonical_exact_match_rate": 0.80, "valid_smiles_rate": 0.98, "p95_latency_ms": 1200}}
+    }), encoding="utf-8")
+
+    comparison = compare_release_dirs(current, previous)
+    report_path = current / "comparison.md"
+    write_comparison_report(report_path, comparison)
+
+    assert comparison["passed"] is False
+    assert any(row["metric"] == "canonical_exact_match_rate" and row["regressed"] for row in comparison["comparisons"])
+    assert report_path.is_file()

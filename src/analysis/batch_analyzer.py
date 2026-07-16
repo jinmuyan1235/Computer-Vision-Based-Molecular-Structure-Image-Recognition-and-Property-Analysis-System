@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections import Counter
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from uuid import uuid4
 
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
@@ -13,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 from config import OUTPUT_DIR
 from src.export.csv_exporter import save_csv
 from src.export.json_exporter import save_json
+from src.export.structure_exporter import export_batch_structure_files
 from src.utils.file_utils import ensure_directory, iter_image_files
 from .molecule_report import MoleculeReportGenerator
 
@@ -35,7 +37,9 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
     decision = report.get("recognition_decision") or {}
     image_quality = report.get("image_quality") or {}
     return {
+        "analysis_id": report.get("analysis_id"),
         "filename": input_data.get("filename"),
+        "image_sha256": input_data.get("image_sha256"),
         "status": report.get("status"),
         "message": report.get("message"),
         "recognition_decision": decision.get("decision"),
@@ -64,6 +68,10 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
         "device": ocsr.get("device"),
         "app_mode": runtime.get("app_mode"),
         "git_commit": ocsr.get("git_commit") or runtime.get("git_commit"),
+        "preprocessing_strategy": ocsr.get("selected_strategy") or ocsr.get("preprocessing_strategy"),
+        "strategy_attempt_count": ocsr.get("strategy_attempt_count"),
+        "strategy_agreement": ocsr.get("strategy_agreement"),
+        "strategy_attempts": json.dumps(ocsr.get("strategy_attempts") or [], ensure_ascii=False),
         "candidate_count": len(candidates),
         "consensus_status": consensus.get("status"),
         "consensus_decision": consensus.get("decision"),
@@ -108,24 +116,75 @@ class BatchAnalyzer:
         self.output_dir = ensure_directory(output_dir)
         self.generator = MoleculeReportGenerator(backend=backend, output_dir=self.output_dir, runtime_config=runtime_config)
 
-    def analyze_folder(self, input_dir: str | Path) -> dict[str, Any]:
+    def analyze_folder(
+        self,
+        input_dir: str | Path,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+        skip_requested: Callable[[Path], bool] | None = None,
+    ) -> dict[str, Any]:
         """Process a folder, export CSV/JSON, and return results plus statistics."""
         image_files = list(iter_image_files(input_dir))
         reports: list[dict[str, Any]] = []
-        for image_path in image_files:
+        cancelled = False
+        self._emit_progress(progress_callback, "running", image_files, reports)
+        for index, image_path in enumerate(image_files, start=1):
+            if cancel_requested is not None and cancel_requested():
+                cancelled = True
+                self._emit_progress(progress_callback, "cancelling", image_files, reports, current_file=image_path.name, current_index=index)
+                break
+            if skip_requested is not None and skip_requested(image_path):
+                reports.append(self._skipped_report(image_path, "用户跳过当前文件。"))
+                self._emit_progress(progress_callback, "running", image_files, reports, current_file=image_path.name, current_index=index)
+                continue
+            self._emit_progress(progress_callback, "running", image_files, reports, current_file=image_path.name, current_index=index)
             try:
                 reports.append(self.generator.generate(image_path=image_path))
             except Exception as exc:
                 reports.append({
+                    "analysis_id": uuid4().hex,
                     "status": "failed",
                     "message": f"未预期错误：{exc}",
                     "input": {"type": "image", "filename": image_path.name, "path": str(image_path)},
                 })
+            self._emit_progress(progress_callback, "running", image_files, reports, current_file=image_path.name, current_index=index)
         rows = [flatten_report(report) for report in reports]
+        summary = self._summary(rows, total=len(image_files), cancelled=cancelled)
+        csv_path = save_csv(rows, self.output_dir / "batch_results.csv")
+        json_path = save_json({"summary": summary, "results": reports}, self.output_dir / "batch_results.json")
+        chart_path = self._save_summary_chart(summary)
+        structure_exports = export_batch_structure_files(reports, self.output_dir / "structure_exports", rows)
+        result = {
+            "summary": summary,
+            "rows": rows,
+            "dataframe": pd.DataFrame(rows),
+            "reports": reports,
+            "exports": {
+                "csv": csv_path,
+                "json": json_path,
+                "summary_chart": chart_path,
+                **structure_exports,
+            },
+        }
+        self._emit_progress(
+            progress_callback,
+            "running",
+            image_files,
+            reports,
+            current_file=None,
+            current_index=len(reports),
+        )
+        return result
+
+    @staticmethod
+    def _summary(rows: list[dict[str, Any]], total: int | None = None, cancelled: bool = False) -> dict[str, Any]:
+        planned_total = len(rows) if total is None else total
         successful = sum(row["status"] == "success" for row in rows)
-        valid = sum(bool(row["valid"]) for row in rows)
-        total = len(rows)
-        failure_reasons = Counter(row["message"] for row in rows if row["status"] != "success")
+        valid = sum(bool(row.get("valid")) for row in rows)
+        failed = sum(row.get("status") not in {"success", "skipped"} for row in rows)
+        skipped = sum(row.get("status") == "skipped" for row in rows)
+        completed = len(rows)
+        failure_reasons = Counter(row.get("message") for row in rows if row.get("status") not in {"success"})
         canonical_counts = Counter(row.get("canonical_smiles") for row in rows if row.get("canonical_smiles"))
         inchikey_counts = Counter(row.get("inchikey") for row in rows if row.get("inchikey"))
         standardized_counts = Counter(row.get("standardized_smiles") for row in rows if row.get("standardized_smiles"))
@@ -134,14 +193,23 @@ class BatchAnalyzer:
             "inchikey": {key: value for key, value in inchikey_counts.items() if value > 1},
             "standardized_smiles": {key: value for key, value in standardized_counts.items() if value > 1},
         }
-        summary = {
-            "total": total,
+        review_needed = sum(row.get("recognition_decision") == "review_needed" for row in rows)
+        accepted = sum(row.get("recognition_decision") in {"accepted", "accepted_with_warning"} for row in rows)
+        rejected = sum(row.get("recognition_decision") == "rejected" for row in rows)
+        return {
+            "total": planned_total,
+            "completed": completed,
             "successful": successful,
-            "failed": total - successful,
+            "failed": failed,
+            "skipped": skipped,
+            "accepted": accepted,
+            "review_needed": review_needed,
+            "rejected": rejected,
             "valid_smiles": valid,
-            "success_rate": round(successful / total, 4) if total else 0.0,
-            "valid_rate": round(valid / total, 4) if total else 0.0,
+            "success_rate": round(successful / planned_total, 4) if planned_total else 0.0,
+            "valid_rate": round(valid / planned_total, 4) if planned_total else 0.0,
             "failure_reasons": dict(failure_reasons),
+            "cancelled": cancelled,
             "duplicates": {
                 "canonical_duplicate_count": sum(count - 1 for count in canonical_counts.values() if count > 1),
                 "inchikey_duplicate_count": sum(count - 1 for count in inchikey_counts.values() if count > 1),
@@ -149,15 +217,46 @@ class BatchAnalyzer:
                 "groups": duplicate_groups,
             },
         }
-        csv_path = save_csv(rows, self.output_dir / "batch_results.csv")
-        json_path = save_json({"summary": summary, "results": reports}, self.output_dir / "batch_results.json")
-        chart_path = self._save_summary_chart(summary)
-        return {
+
+    @classmethod
+    def _emit_progress(
+        cls,
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+        status: str,
+        image_files: list[Path],
+        reports: list[dict[str, Any]],
+        current_file: str | None = None,
+        current_index: int | None = None,
+        result_path: str | Path | None = None,
+        exports: dict[str, str] | None = None,
+    ) -> None:
+        if progress_callback is None:
+            return
+        rows = [flatten_report(report) for report in reports]
+        summary = cls._summary(rows, total=len(image_files), cancelled=status == "cancelled")
+        payload: dict[str, Any] = {
+            "status": status,
+            "total": len(image_files),
+            "completed": len(reports),
+            "current_file": current_file,
+            "current_index": current_index,
             "summary": summary,
-            "rows": rows,
-            "dataframe": pd.DataFrame(rows),
-            "reports": reports,
-            "exports": {"csv": csv_path, "json": json_path, "summary_chart": chart_path},
+        }
+        if result_path is not None:
+            payload["result_path"] = str(result_path)
+        if exports is not None:
+            payload["exports"] = exports
+        progress_callback(payload)
+
+    @staticmethod
+    def _skipped_report(image_path: Path, message: str) -> dict[str, Any]:
+        return {
+            "analysis_id": uuid4().hex,
+            "status": "skipped",
+            "message": message,
+            "input": {"type": "image", "filename": image_path.name, "path": str(image_path)},
+            "validation": {"valid": False},
+            "recognition_decision": {"decision": "skipped", "manual_review_recommended": False},
         }
 
     def _save_summary_chart(self, summary: dict[str, Any]) -> str:

@@ -27,6 +27,7 @@ from src.ocsr.ensemble import EnsembleOCSRAdapter
 from src.ocsr.molscribe_adapter import MolScribeAdapter
 from src.ocsr.recognizer import MoleculeRecognizer
 from src.runtime.gpu_manager import environment_status
+from src.runtime.health import run_production_health_check
 from src.runtime.metadata import dependency_versions, git_commit, sha256_file
 
 
@@ -129,32 +130,30 @@ def main() -> int:
     parser.add_argument("--warmup", action="store_true", help="Run one recognition pass on --warmup-input.")
     parser.add_argument("--warmup-input", default=str(PROJECT_ROOT / "data" / "samples" / "aspirin.png"))
     parser.add_argument("--no-load-model", action="store_true", help="Skip explicit model loading during diagnostics.")
+    parser.add_argument("--no-cache", action="store_true", help="Do not reuse cached health-check results.")
+    parser.add_argument("--force", action="store_true", help="Force a fresh health check even when a cache entry exists.")
+    parser.add_argument("--molscribe-device", default=None, help="MolScribe device override, e.g. cpu or cuda:0.")
+    parser.add_argument("--decimer-device", default=None, help="DECIMER device override: cpu, gpu or auto.")
+    parser.add_argument("--visible-gpu-index", default=None, help="CUDA_VISIBLE_DEVICES index for DECIMER/TensorFlow.")
     args = parser.parse_args()
     production_check = bool(args.production or config.APP_MODE == "production")
-    status = check_backend(args.backend, load_model=not args.no_load_model)
-    status["app_mode"] = config.APP_MODE
-    status["production_check"] = production_check
-    status["rdkit"] = _rdkit_self_check()
+    runtime_config = {
+        "molscribe_device": args.molscribe_device,
+        "decimer_device": args.decimer_device,
+        "visible_gpu_index": args.visible_gpu_index,
+    }
+    status = run_production_health_check(
+        args.backend,
+        runtime_config={key: value for key, value in runtime_config.items() if value is not None},
+        production=production_check,
+        warmup=bool(args.warmup or production_check),
+        load_model=not args.no_load_model,
+        warmup_input=args.warmup_input,
+        force=args.force,
+        use_cache=not args.no_cache,
+    )
     status["runtime"] = environment_status(run_matrix_test=False)
-    exit_code = 0
-    failures: list[str] = []
-    if production_check and args.backend == "demo":
-        failures.append("Production mode forbids the demo backend.")
-    if production_check and not status.get("available"):
-        failures.append(str(status.get("message") or "Selected backend is unavailable."))
-    if production_check and not status["rdkit"].get("available"):
-        failures.append(str(status["rdkit"].get("message") or "RDKit self-check failed."))
-    if args.warmup or production_check:
-        warmup = warmup_backend(args.backend, args.warmup_input)
-        status["warmup"] = warmup
-        if not warmup.get("ok"):
-            failures.append(str(warmup.get("message") or "Warm-up recognition failed."))
-    if failures:
-        status["ready"] = False
-        status["failures"] = failures
-        exit_code = 1
-    else:
-        status["ready"] = True
+    exit_code = 0 if status.get("ready") else 1
     print(json.dumps(status, ensure_ascii=False, indent=2))
     return exit_code
 

@@ -9,6 +9,7 @@ import numpy as np
 
 from config import DEFAULT_IMAGE_SIZE
 from .image_loader import load_image as read_image
+from .user_adjustments import apply_user_adjustments
 
 
 class ImagePreprocessor:
@@ -99,16 +100,17 @@ class ImagePreprocessor:
         canvas[y : y + resized_height, x : x + resized_width] = resized
         return canvas
 
-    def preprocess_pipeline(self, image_path: Any) -> dict[str, np.ndarray]:
+    def preprocess_pipeline(self, image_path: Any, user_adjustments: dict[str, Any] | None = None) -> dict[str, np.ndarray]:
         """Run the complete CV pipeline and return every visualizable stage."""
-        original = self.load_image(image_path)
+        uploaded_original = self.load_image(image_path)
+        original = apply_user_adjustments(uploaded_original, user_adjustments, self.default_size) if user_adjustments else uploaded_original
         gray = self.to_grayscale(original)
         denoised = self.denoise(gray)
         binary = self.binarize(denoised)
         cropped = self.crop_whitespace(binary)
         deskewed = self.deskew(cropped)
         normalized = self.resize_normalize(deskewed, self.default_size)
-        return {
+        stages = {
             "original": original,
             "gray": gray,
             "denoised": denoised,
@@ -117,3 +119,7 @@ class ImagePreprocessor:
             "deskewed": deskewed,
             "normalized": normalized,
         }
+        if user_adjustments:
+            stages["uploaded_original"] = uploaded_original
+            stages["user_adjusted"] = original
+        return stages

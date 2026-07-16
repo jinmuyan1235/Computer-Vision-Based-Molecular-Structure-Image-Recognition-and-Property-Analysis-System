@@ -88,6 +88,7 @@ class Settings:
     sample_dir: Path
     batch_input_dir: Path
     output_dir: Path
+    app_db_path: Path
     runs_dir: Path
     model_dir: Path
     document_output_dir: Path
@@ -138,6 +139,11 @@ class Settings:
     decision_review_threshold: float
     decision_min_image_quality: float
     decision_require_calibrated_confidence: bool
+    production_health_cache_enabled: bool
+    production_health_load_model: bool
+    production_health_warmup: bool
+    production_health_cache_ttl_seconds: int
+    production_health_warmup_input: Path
 
 
 def load_settings() -> Settings:
@@ -163,6 +169,7 @@ def load_settings() -> Settings:
         sample_dir=data_dir / "samples",
         batch_input_dir=data_dir / "batch_input",
         output_dir=output_dir,
+        app_db_path=_env_path("APP_DB_PATH", data_dir / "app.db"),
         runs_dir=_env_path("RUNS_DIR", data_dir / "runs"),
         model_dir=model_dir,
         document_output_dir=_env_path("DOCUMENT_OUTPUT_DIR", output_dir / "documents"),
@@ -177,7 +184,7 @@ def load_settings() -> Settings:
         ocsr_gpu_required=_env_bool("OCSR_GPU_REQUIRED", False),
         ocsr_gpu_max_concurrent_inference=_env_int("OCSR_GPU_MAX_CONCURRENT_INFERENCE", 1, minimum=1),
         ocsr_gpu_allow_parallel_models=_env_bool("OCSR_GPU_ALLOW_PARALLEL_MODELS", False),
-        ocsr_fallback_image_strategies=_csv_tuple("OCSR_FALLBACK_IMAGE_STRATEGIES", "original,grayscale,normalized"),
+        ocsr_fallback_image_strategies=_csv_tuple("OCSR_FALLBACK_IMAGE_STRATEGIES", "original,normalized,grayscale,binary"),
         enable_admet_model=_env_bool("ENABLE_ADMET_MODEL", False),
         admet_model_path=admet_model_path,
         molscribe_model_path=molscribe_model_path,
@@ -213,6 +220,11 @@ def load_settings() -> Settings:
         decision_review_threshold=_env_float("DECISION_REVIEW_THRESHOLD", 0.65, minimum=0.0),
         decision_min_image_quality=_env_float("DECISION_MIN_IMAGE_QUALITY", 0.55, minimum=0.0),
         decision_require_calibrated_confidence=_env_bool("DECISION_REQUIRE_CALIBRATED_CONFIDENCE", False),
+        production_health_cache_enabled=_env_bool("PRODUCTION_HEALTH_CACHE_ENABLED", True),
+        production_health_load_model=_env_bool("PRODUCTION_HEALTH_LOAD_MODEL", True),
+        production_health_warmup=_env_bool("PRODUCTION_HEALTH_WARMUP", True),
+        production_health_cache_ttl_seconds=_env_int("PRODUCTION_HEALTH_CACHE_TTL_SECONDS", 3600, minimum=0),
+        production_health_warmup_input=_env_path("PRODUCTION_HEALTH_WARMUP_INPUT", data_dir / "samples" / "aspirin.png"),
     )
 
 
@@ -251,6 +263,7 @@ IS_PRODUCTION_MODE = SETTINGS.app_mode == "production"
 SAMPLE_DIR = SETTINGS.sample_dir
 BATCH_INPUT_DIR = SETTINGS.batch_input_dir
 OUTPUT_DIR = SETTINGS.output_dir
+APP_DB_PATH = SETTINGS.app_db_path
 RUNS_DIR = SETTINGS.runs_dir
 RUN_RETENTION_DAYS = SETTINGS.run_retention_days
 RUN_MAX_STORAGE_GB = SETTINGS.run_max_storage_gb
@@ -301,3 +314,8 @@ DECISION_ACCEPT_THRESHOLD = SETTINGS.decision_accept_threshold
 DECISION_REVIEW_THRESHOLD = SETTINGS.decision_review_threshold
 DECISION_MIN_IMAGE_QUALITY = SETTINGS.decision_min_image_quality
 DECISION_REQUIRE_CALIBRATED_CONFIDENCE = SETTINGS.decision_require_calibrated_confidence
+PRODUCTION_HEALTH_CACHE_ENABLED = SETTINGS.production_health_cache_enabled
+PRODUCTION_HEALTH_LOAD_MODEL = SETTINGS.production_health_load_model
+PRODUCTION_HEALTH_WARMUP = SETTINGS.production_health_warmup
+PRODUCTION_HEALTH_CACHE_TTL_SECONDS = SETTINGS.production_health_cache_ttl_seconds
+PRODUCTION_HEALTH_WARMUP_INPUT = SETTINGS.production_health_warmup_input

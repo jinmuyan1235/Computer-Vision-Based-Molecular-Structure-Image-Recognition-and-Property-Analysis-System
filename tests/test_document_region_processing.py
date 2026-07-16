@@ -127,6 +127,10 @@ def test_single_page_pdf_processes_with_fake_renderer(tmp_path: Path) -> None:
     assert Path(first["crop_path"]).is_file()
     assert Path(result["exports"]["json"]).is_file()
     assert Path(result["exports"]["regions_csv"]).is_file()
+    assert Path(result["exports"]["structures_sdf"]).is_file()
+    assert Path(result["exports"]["structures_zip"]).is_file()
+    assert Path(result["exports"]["structure_failed_csv"]).is_file()
+    assert Path(result["exports"]["structure_review_csv"]).is_file()
     assert Path(result["exports"]["zip"]).is_file()
 
 

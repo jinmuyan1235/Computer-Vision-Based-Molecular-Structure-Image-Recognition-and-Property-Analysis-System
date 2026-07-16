@@ -101,4 +101,60 @@ Minimum acceptance coverage should include clean RDKit/CDK drawings, scanned lit
 
 The core report separates valid-SMILES rate from exact-match rate, and adds stereochemistry exact rate, atom-count error rate, formal-charge error rate, bond-type profile error rate, confidence calibration error and rejection coverage for distractor-like rows.
 
+## Fixed Release Acceptance
+
+Use `data/ocsr_real_acceptance/` for the release-only reviewed acceptance set:
+
+```text
+data/ocsr_real_acceptance/
+├── images/
+├── manifest.csv
+├── dataset_card.md
+└── checksums.sha256
+```
+
+Images may remain local and are ignored by Git by default. The release manifest must include reviewed source/license and integrity fields:
+
+```text
+dataset_version,image_sha256,source_document,source_license,annotator,reviewer,review_status,ground_truth_smiles,ground_truth_inchikey,expected_action,supported_scope
+```
+
+Run a fixed release gate:
+
+```bash
+python scripts/run_release_acceptance.py \
+  --release-version v0.1 \
+  --manifest data/ocsr_real_acceptance/manifest.csv \
+  --dataset-root data/ocsr_real_acceptance \
+  --backends molscribe,ensemble
+```
+
+This writes files such as:
+
+```text
+benchmark/releases/v0.1/
+├── molscribe_metrics.json
+├── ensemble_metrics.json
+├── errors.csv
+└── report.md
+```
+
+Default project-phase gates are:
+
+- valid SMILES rate >= 95%;
+- canonical exact match rate >= 80%;
+- false accept rate on reject/non-molecule samples <= 5%;
+- high-risk errors are routed to review;
+- P95 single-GPU latency <= 15 seconds.
+
+Compare a new release with the previous fixed baseline:
+
+```bash
+python scripts/compare_benchmark_runs.py \
+  --current benchmark/releases/v0.2 \
+  --previous benchmark/releases/v0.1
+```
+
+Do not train on, tune thresholds against, or repeatedly optimize prompts/models with the release acceptance set.
+
 Do not commit model weights, proprietary datasets, or benchmark results that cannot be reproduced from documented inputs.

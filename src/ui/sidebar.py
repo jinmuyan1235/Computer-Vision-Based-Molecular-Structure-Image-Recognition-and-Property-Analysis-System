@@ -15,6 +15,7 @@ from src.ui.labels import (
     runnable_backends,
     unavailable_backends,
 )
+from src.ui.health_page import render_sidebar_health_status
 from src.ui.state import current_runtime_key, get_backend_statuses, merged_backend_status, runtime_config_from_key
 
 
@@ -39,6 +40,8 @@ def render_sidebar() -> tuple[str, bool, bool]:
         else:
             st.info("当前运行模式：演示")
             st.caption("演示模式可显示内置 demo 后端；demo 结果不代表真实 OCSR。")
+
+        render_sidebar_health_status(st.session_state.get("production_health"))
 
         gpu_options = gpu_selection_options()
         gpu_values = [option["value"] for option in gpu_options]
@@ -83,18 +86,20 @@ def render_sidebar() -> tuple[str, bool, bool]:
             allow_demo_fallback=not production_mode,
         )
         if not options:
+            configured = config.OCSR_BACKEND if config.OCSR_BACKEND in {"demo", "molscribe", "decimer", "ensemble"} else "molscribe"
+            options = [configured]
             st.error("生产模式下没有可用的真实 OCSR 后端。请配置 MolScribe/DECIMER，或切换 APP_MODE=demo。")
             with st.expander("后端诊断", expanded=True):
                 for backend in ("molscribe", "decimer", "ensemble"):
                     item = statuses.get(backend, {})
                     st.caption(f"{backend_label(backend)}：{item.get('message') or '未配置'}")
-            st.stop()
         if st.session_state["selected_backend"] not in options:
-            st.session_state["selected_backend"] = default_backend(
+            fallback = default_backend(
                 statuses,
                 config.OCSR_BACKEND,
                 allow_demo_fallback=not production_mode,
             )
+            st.session_state["selected_backend"] = fallback if fallback in options else options[0]
 
         selected = st.selectbox(
             "当前识别后端",
