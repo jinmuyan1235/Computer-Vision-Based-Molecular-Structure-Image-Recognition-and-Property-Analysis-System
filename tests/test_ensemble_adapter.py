@@ -115,6 +115,18 @@ def test_ensemble_all_failed_and_serialization() -> None:
     assert payload["consensus"]["decision"] == "rejected"
 
 
+def test_serial_ensemble_releases_child_adapters_by_default() -> None:
+    adapter = _ensemble({
+        "molscribe": _adapter_factory("molscribe", "CCO"),
+        "decimer": _adapter_factory("decimer", "OCC"),
+    })
+
+    result = adapter.recognize("image.png")
+
+    assert result.status == "success"
+    assert adapter.adapters == {}
+
+
 def test_ensemble_parallel_timeout_records_backend_failure() -> None:
     class SlowAdapter(BaseOCSRAdapter):
         backend_name = "slow"

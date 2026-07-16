@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import MutableMapping
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -26,12 +28,15 @@ OUTPUT_STAGE_LABELS = {
     "binary": "二值化",
 }
 
+CROP_QUERY_KEYS = ("crop_editor_key", "crop_x", "crop_y", "crop_click_nonce")
+
 
 def render_image_editor(image_bytes: bytes, filename: str, key_prefix: str = "single_image") -> tuple[dict[str, Any], bytes, bool]:
     """Render lightweight preprocessing controls and return adjustments plus preview bytes."""
     dimensions = image_dimensions(image_bytes)
     default_bbox = [0, 0, dimensions["width"], dimensions["height"]]
-    _prepare_crop_state(key_prefix, dimensions, default_bbox)
+    image_identity = image_identity_from_bytes(image_bytes, dimensions)
+    _prepare_crop_state(key_prefix, image_identity, default_bbox)
     _consume_crop_click(key_prefix, dimensions)
     with st.expander("单图预处理编辑器", expanded=False):
         st.caption(f"{filename} | {dimensions['width']} × {dimensions['height']}")
@@ -101,43 +106,96 @@ def crop_bbox_from_points(points: list[tuple[int, int]], dimensions: dict[str, i
     return [x1, y1, x2, y2] if x2 > x1 and y2 > y1 else []
 
 
-def _prepare_crop_state(key_prefix: str, dimensions: dict[str, int], default_bbox: list[int]) -> None:
-    dimension_key = f"{key_prefix}_image_dimensions"
-    current_dimensions = (int(dimensions["width"]), int(dimensions["height"]))
-    if st.session_state.get(dimension_key) != current_dimensions:
-        st.session_state[dimension_key] = current_dimensions
-        st.session_state[f"{key_prefix}_crop_points"] = []
+def image_identity_from_bytes(image_bytes: bytes, dimensions: dict[str, int]) -> dict[str, Any]:
+    """Return a stable identity for an editor image, including content hash."""
+    return {
+        "width": int(dimensions["width"]),
+        "height": int(dimensions["height"]),
+        "sha256": hashlib.sha256(image_bytes).hexdigest(),
+    }
+
+
+def _prepare_crop_state(key_prefix: str, image_identity: dict[str, Any], default_bbox: list[int]) -> None:
+    _prepare_crop_state_context(st.session_state, st.query_params, key_prefix, image_identity, default_bbox)
+
+
+def _prepare_crop_state_context(
+    state: MutableMapping[str, Any],
+    params: MutableMapping[str, Any],
+    key_prefix: str,
+    image_identity: dict[str, Any],
+    default_bbox: list[int],
+) -> bool:
+    reset = _prepare_crop_state_values(state, key_prefix, image_identity, default_bbox)
+    if reset:
+        _clear_crop_query_params(params)
+    return reset
+
+
+def _prepare_crop_state_values(
+    state: MutableMapping[str, Any],
+    key_prefix: str,
+    image_identity: dict[str, Any],
+    default_bbox: list[int],
+) -> bool:
+    identity_key = f"{key_prefix}_image_identity"
+    if state.get(identity_key) != image_identity:
+        state[identity_key] = dict(image_identity)
+        state[f"{key_prefix}_crop_points"] = []
+        state.pop(f"{key_prefix}_last_crop_click_nonce", None)
         for key, value in zip(("x1", "y1", "x2", "y2"), default_bbox):
-            st.session_state[f"{key_prefix}_{key}"] = int(value)
-        return
+            state[f"{key_prefix}_{key}"] = int(value)
+        return True
     for key, value in zip(("x1", "y1", "x2", "y2"), default_bbox):
-        st.session_state.setdefault(f"{key_prefix}_{key}", int(value))
-    st.session_state.setdefault(f"{key_prefix}_crop_points", [])
+        state.setdefault(f"{key_prefix}_{key}", int(value))
+    state.setdefault(f"{key_prefix}_crop_points", [])
+    return False
 
 
 def _consume_crop_click(key_prefix: str, dimensions: dict[str, int]) -> None:
-    params = st.query_params
+    _consume_crop_click_from_params(st.session_state, st.query_params, key_prefix, dimensions)
+
+
+def _consume_crop_click_from_params(
+    state: MutableMapping[str, Any],
+    params: MutableMapping[str, Any],
+    key_prefix: str,
+    dimensions: dict[str, int],
+) -> bool:
     if params.get("crop_editor_key") != key_prefix:
-        return
-    nonce = str(params.get("crop_click_nonce") or "")
-    if not nonce or st.session_state.get(f"{key_prefix}_last_crop_click_nonce") == nonce:
-        return
+        return False
     try:
-        x = int(float(str(params.get("crop_x"))))
-        y = int(float(str(params.get("crop_y"))))
-    except (TypeError, ValueError):
-        return
-    width = int(dimensions["width"])
-    height = int(dimensions["height"])
-    point = (max(0, min(width, x)), max(0, min(height, y)))
-    points = list(st.session_state.get(f"{key_prefix}_crop_points") or [])
-    points = [point] if len(points) >= 2 else [*points, point]
-    st.session_state[f"{key_prefix}_crop_points"] = points
-    st.session_state[f"{key_prefix}_last_crop_click_nonce"] = nonce
-    bbox = crop_bbox_from_points(points, dimensions)
-    if bbox:
-        for key, value in zip(("x1", "y1", "x2", "y2"), bbox):
-            st.session_state[f"{key_prefix}_{key}"] = int(value)
+        nonce = str(params.get("crop_click_nonce") or "")
+        if not nonce or state.get(f"{key_prefix}_last_crop_click_nonce") == nonce:
+            return False
+        try:
+            x = int(float(str(params.get("crop_x"))))
+            y = int(float(str(params.get("crop_y"))))
+        except (TypeError, ValueError):
+            return False
+        width = int(dimensions["width"])
+        height = int(dimensions["height"])
+        point = (max(0, min(width, x)), max(0, min(height, y)))
+        points = list(state.get(f"{key_prefix}_crop_points") or [])
+        points = [point] if len(points) >= 2 else [*points, point]
+        state[f"{key_prefix}_crop_points"] = points
+        state[f"{key_prefix}_last_crop_click_nonce"] = nonce
+        bbox = crop_bbox_from_points(points, dimensions)
+        if bbox:
+            for key, value in zip(("x1", "y1", "x2", "y2"), bbox):
+                state[f"{key_prefix}_{key}"] = int(value)
+        return True
+    finally:
+        _clear_crop_query_params(params)
+
+
+def _clear_crop_query_params(params: MutableMapping[str, Any]) -> None:
+    for key in CROP_QUERY_KEYS:
+        try:
+            if key in params:
+                del params[key]
+        except KeyError:
+            continue
 
 
 def _render_crop_picker(

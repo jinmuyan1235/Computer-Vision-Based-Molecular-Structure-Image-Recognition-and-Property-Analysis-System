@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 from datetime import datetime, timezone
 import json
 import os
@@ -62,6 +63,9 @@ def run_production_health_check(
         cached = _read_cached_health(cache_key, ttl)
         if cached is not None:
             cached["cached"] = True
+            cached.setdefault("model_load_count", 0)
+            cached.setdefault("adapter_reused_for_warmup", False)
+            cached.setdefault("peak_memory_available", False)
             return cached
 
     started = time.perf_counter()
@@ -112,6 +116,9 @@ def run_production_health_check(
             "review_queue": True,
         },
         "backend_status": backend_status,
+        "model_load_count": int(heavy.get("model_load_count") or 0),
+        "adapter_reused_for_warmup": bool(heavy.get("adapter_reused_for_warmup")),
+        "peak_memory_available": bool(heavy.get("peak_memory_available")),
         "model_path": str(model_path) if model_path else None,
         "model_sha256": model_sha,
         "model_fingerprint": model_fingerprint,
@@ -184,6 +191,120 @@ def _backend_status(backend: str, runtime_config: Mapping[str, Any], load_model:
         return recognizer.status()
     except Exception as exc:
         return {"backend": backend, "available": False, "message": str(exc), "exception": exc.__class__.__name__}
+
+
+def _build_health_runtime(backend: str, runtime_config: Mapping[str, Any]) -> Any:
+    if backend == "demo":
+        from src.ocsr.demo_adapter import DemoOCSRAdapter
+
+        return DemoOCSRAdapter()
+    from src.ocsr.recognizer import MoleculeRecognizer
+
+    recognizer = MoleculeRecognizer(backend, runtime_config=dict(runtime_config))
+    _configure_health_adapter(backend, _runtime_adapter(recognizer))
+    return recognizer
+
+
+def _runtime_adapter(runtime: Any) -> Any:
+    return getattr(runtime, "adapter", runtime)
+
+
+def _configure_health_adapter(backend: str, adapter: Any) -> None:
+    if backend != "ensemble":
+        return
+    if hasattr(adapter, "parallel"):
+        adapter.parallel = False
+    setattr(adapter, "release_after_each_backend", True)
+
+
+def _backend_status_from_runtime(backend: str, runtime: Any, load_model: bool) -> dict[str, Any]:
+    try:
+        adapter = _runtime_adapter(runtime)
+        if backend == "demo":
+            status = adapter.status()
+            status.update({"package_installed": True, "package_version": "built-in", "model_loaded": True, "device": "cpu"})
+            return status
+        diagnose = getattr(adapter, "diagnose", None)
+        if callable(diagnose):
+            return dict(diagnose(load_model=load_model))
+        if hasattr(runtime, "status"):
+            status = dict(runtime.status())
+        elif hasattr(adapter, "status"):
+            status = dict(adapter.status())
+        else:
+            status = {"backend": backend, "available": False, "message": "Backend does not expose status()."}
+        status["load_model_requested"] = bool(load_model)
+        return status
+    except Exception as exc:
+        return {"backend": backend, "available": False, "message": str(exc), "exception": exc.__class__.__name__}
+
+
+def _status_model_loaded(status: Mapping[str, Any]) -> bool:
+    if status.get("model_loaded") or status.get("initialization_success"):
+        return True
+    for child in status.get("child_statuses") or []:
+        if isinstance(child, Mapping) and (child.get("model_loaded") or child.get("initialization_success")):
+            return True
+    return False
+
+
+def _reported_model_load_count(runtime: Any, status: Mapping[str, Any], fallback: int) -> int:
+    values: list[Any] = [status.get("health_model_load_count"), status.get("model_load_count")]
+    adapter = _runtime_adapter(runtime)
+    values.extend([getattr(adapter, "health_model_load_count", None), getattr(runtime, "health_model_load_count", None)])
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return int(fallback)
+
+
+def _release_cached_child_adapters(runtime: Any) -> None:
+    release = getattr(_runtime_adapter(runtime), "release_adapters", None)
+    if callable(release):
+        release()
+
+
+def _release_health_runtime(runtime: Any) -> None:
+    if runtime is None:
+        return
+    _release_cached_child_adapters(runtime)
+    adapter = _runtime_adapter(runtime)
+    seen: set[int] = set()
+    for target in (adapter, runtime):
+        ident = id(target)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        close = getattr(target, "close", None)
+        if callable(close):
+            close()
+    if hasattr(runtime, "adapter"):
+        runtime.adapter = None
+    gc.collect()
+    _cleanup_framework_caches_if_worker()
+
+
+def _cleanup_framework_caches_if_worker() -> None:
+    if os.environ.get("OCSR_HEALTH_WORKER_PROCESS") != "1":
+        return
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        cuda = getattr(torch, "cuda", None)
+        try:
+            if cuda is not None and callable(getattr(cuda, "is_available", None)) and cuda.is_available():
+                cuda.empty_cache()
+        except Exception:
+            pass
+    tensorflow = sys.modules.get("tensorflow")
+    if tensorflow is not None:
+        try:
+            tensorflow.keras.backend.clear_session()
+        except Exception:
+            pass
 
 
 def _backend_checks(backend: str, status: Mapping[str, Any], production: bool) -> list[dict[str, Any]]:
@@ -334,14 +455,12 @@ def _structure_export_check() -> dict[str, Any]:
         return _check("export.mol_sdf", CHECK_FAIL, f"MOL/SDF 导出自检失败：{exc}")
 
 
-def _warmup_check(backend: str, runtime_config: Mapping[str, Any], warmup_input: Path) -> dict[str, Any]:
+def _warmup_check(backend: str, runtime: Any, warmup_input: Path) -> dict[str, Any]:
     if not warmup_input.is_file():
         return _check("warmup", CHECK_FAIL, f"Warm-up 图片不存在：{warmup_input}", {"input": str(warmup_input)})
     started = time.perf_counter()
     try:
-        from src.ocsr.recognizer import MoleculeRecognizer
-
-        result = MoleculeRecognizer(backend, runtime_config=dict(runtime_config)).recognize(warmup_input)
+        result = runtime.recognize(warmup_input) if hasattr(runtime, "recognize") else _runtime_adapter(runtime).recognize(warmup_input)
         validation = validate_smiles(result.smiles)
         ok = result.status == "success" and bool(validation.get("valid"))
         return _check(
@@ -424,15 +543,47 @@ def run_heavy_health_checks(
     started = time.perf_counter()
     runtime = dict(runtime_config or {})
     checks: list[dict[str, Any]] = []
-    backend_status = _backend_status(backend, runtime, load_model=load_model)
+    backend_runtime = None
+    backend_status: dict[str, Any] = {"backend": backend, "available": False, "message": "Backend status was not collected."}
+    warmup_check: dict[str, Any] | None = None
+    model_load_count = 0
+    adapter_reused_for_warmup = False
+    try:
+        backend_runtime = _build_health_runtime(backend, runtime)
+        diagnose_load_model = bool(load_model and not warmup)
+        backend_status = _backend_status_from_runtime(backend, backend_runtime, load_model=diagnose_load_model)
+        if diagnose_load_model and _status_model_loaded(backend_status):
+            model_load_count = 1
+        if warmup:
+            warmup_input = Path(warmup_path or config.PRODUCTION_HEALTH_WARMUP_INPUT).expanduser().resolve()
+            _release_cached_child_adapters(backend_runtime)
+            warmup_check = _warmup_check(backend, backend_runtime, warmup_input)
+            adapter_reused_for_warmup = True
+            refreshed_status = _backend_status_from_runtime(backend, backend_runtime, load_model=False)
+            if not refreshed_status.get("exception"):
+                backend_status = refreshed_status
+            if _status_model_loaded(backend_status):
+                model_load_count = max(model_load_count, 1)
+        model_load_count = _reported_model_load_count(backend_runtime, backend_status, model_load_count)
+    except Exception as exc:
+        backend_status = {"backend": backend, "available": False, "message": str(exc), "exception": exc.__class__.__name__}
+        if warmup:
+            warmup_check = _check("warmup", CHECK_FAIL, f"Warm-up failed before inference started: {exc}")
+    finally:
+        _release_health_runtime(backend_runtime)
     checks.extend(_backend_checks(backend, backend_status, production))
     if warmup:
-        checks.append(_warmup_check(backend, runtime, Path(warmup_path or config.PRODUCTION_HEALTH_WARMUP_INPUT).expanduser().resolve()))
+        if warmup_check is None:
+            warmup_check = _check("warmup", CHECK_FAIL, "Warm-up failed before inference started.")
+        checks.append(warmup_check)
     else:
         checks.append(_check("warmup", CHECK_SKIP, "Warm-up 未启用，本次未执行真实模型推理。"))
     return {
         "backend_status": backend_status,
         "checks": checks,
+        "model_load_count": int(model_load_count),
+        "adapter_reused_for_warmup": bool(adapter_reused_for_warmup),
+        "peak_memory_available": False,
         "duration_ms": round((time.perf_counter() - started) * 1000, 3),
     }
 
@@ -520,6 +671,9 @@ def _run_heavy_health_worker(
     return {
         "backend_status": {"backend": backend, "available": False, "message": message},
         "checks": [_check("backend.worker", CHECK_FAIL, message, worker)],
+        "model_load_count": 0,
+        "adapter_reused_for_warmup": False,
+        "peak_memory_available": False,
         "worker": worker,
     }
 

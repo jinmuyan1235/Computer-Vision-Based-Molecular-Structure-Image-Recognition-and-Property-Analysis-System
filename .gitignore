@@ -14,6 +14,8 @@ data/batch_input/*
 !data/batch_input/.gitkeep
 data/ocsr_real_acceptance/images/*
 !data/ocsr_real_acceptance/images/.gitkeep
+data/ocsr_real_acceptance/.download_tmp/
+data/ocsr_real_acceptance/download_metadata.json
 data/health/*
 !data/health/.gitkeep
 data/app.db

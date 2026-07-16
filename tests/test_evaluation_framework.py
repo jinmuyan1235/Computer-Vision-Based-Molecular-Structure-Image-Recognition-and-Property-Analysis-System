@@ -151,6 +151,56 @@ def test_real_acceptance_manifest_requires_integrity_and_review_metadata(tmp_pat
     else:
         raise AssertionError("Expected checksum validation failure")
 
+    missing_reviewer = _real_manifest(tmp_path / "missing_reviewer.csv", image, reviewer="")
+    try:
+        load_manifest(missing_reviewer, tmp_path, require_real_metadata=True)
+    except ManifestValidationError as exc:
+        assert "reviewer" in str(exc)
+    else:
+        raise AssertionError("Expected missing reviewer validation failure")
+
+
+def test_real_acceptance_manifest_rejects_source_document_split_leakage(tmp_path: Path) -> None:
+    first = _image(tmp_path / "first.png")
+    second = _image(tmp_path / "second.png")
+    rows = []
+    for sample_id, image_path, split in (("first", first, "train"), ("second", second, "test")):
+        rows.append({
+            "sample_id": sample_id,
+            "image_path": image_path.name,
+            "dataset_version": "v-test",
+            "image_sha256": _sha256(image_path),
+            "ground_truth_smiles": "CCO",
+            "ground_truth_inchikey": "LFQSCWFLJHTTHZ-UHFFFAOYSA-N",
+            "expected_action": "recognize",
+            "supported_scope": "single_molecule",
+            "category": "clear_single_molecule",
+            "source": "unit",
+            "source_document": "shared-source-doc",
+            "source_license": "internal-test",
+            "annotator": "unit-annotator",
+            "reviewer": "unit-reviewer",
+            "review_status": "verified",
+            "split": split,
+            "scaffold_key": "alcohol",
+            "image_quality": "clean",
+            "complexity": "low",
+            "perturbation": "none",
+            "structure_features": "alcohol",
+            "notes": "split leakage test",
+        })
+    manifest = tmp_path / "manifest.csv"
+    with manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    try:
+        load_manifest(manifest, tmp_path, require_real_metadata=True)
+    except ManifestValidationError as exc:
+        assert "multiple splits" in str(exc)
+    else:
+        raise AssertionError("Expected source_document split validation failure")
+
 
 def test_manifest_allows_reject_rows_without_ground_truth_smiles(tmp_path: Path) -> None:
     _image(tmp_path / "table.png")
@@ -450,6 +500,136 @@ def test_rejection_metrics_distinguish_reviewed_hallucination_from_false_accept(
     assert reasons["negative_auto_accepted"] == "false_accept"
 
 
+def test_positive_metrics_exclude_correctly_rejected_negative_samples() -> None:
+    rows = [
+        enrich_prediction({
+            "sample_id": "positive_correct",
+            "expected_action": "recognize",
+            "ground_truth_smiles": "CCO",
+            "predicted_smiles": "OCC",
+            "recognition_success": True,
+            "recognition_decision": "accepted",
+            "manual_review_recommended": False,
+            "backend": "fake",
+            "preprocessing_strategy": "original",
+        }, 0.95),
+        enrich_prediction({
+            "sample_id": "negative_rejected",
+            "expected_action": "reject",
+            "ground_truth_smiles": "",
+            "predicted_smiles": None,
+            "recognition_success": False,
+            "recognition_decision": "rejected",
+            "manual_review_recommended": True,
+            "backend": "fake",
+            "preprocessing_strategy": "original",
+        }, 0.95),
+    ]
+    metrics = compute_metrics(rows)["overall"]
+    assert metrics["positive_sample_count"] == 1
+    assert metrics["negative_sample_count"] == 1
+    assert metrics["valid_smiles_rate"] == 1.0
+    assert metrics["canonical_exact_match_rate"] == 1.0
+    assert metrics["molecule_equivalent_rate"] == 1.0
+    assert metrics["rejection_coverage"] == 1.0
+
+
+def test_negative_hallucination_does_not_raise_positive_valid_rate() -> None:
+    rows = [
+        enrich_prediction({
+            "sample_id": "positive_failed",
+            "expected_action": "recognize",
+            "ground_truth_smiles": "CCO",
+            "predicted_smiles": None,
+            "recognition_success": False,
+            "recognition_decision": "rejected",
+            "backend": "fake",
+            "preprocessing_strategy": "original",
+        }, 0.95),
+        enrich_prediction({
+            "sample_id": "negative_hallucinated",
+            "expected_action": "reject",
+            "ground_truth_smiles": "",
+            "predicted_smiles": "CCO",
+            "recognition_success": True,
+            "recognition_decision": "accepted_with_warning",
+            "manual_review_recommended": True,
+            "backend": "fake",
+            "preprocessing_strategy": "original",
+        }, 0.95),
+    ]
+    metrics = compute_metrics(rows)["overall"]
+    assert metrics["valid_smiles_rate"] == 0.0
+    assert metrics["valid_smiles_count"] == 0
+    assert metrics["negative_hallucination_count"] == 1
+    assert metrics["negative_hallucination_rate"] == 1.0
+    assert metrics["false_accept_count"] == 0
+    assert metrics["false_accept_rate"] == 0.0
+
+
+def test_negative_auto_accept_counts_false_accept() -> None:
+    row = enrich_prediction({
+        "sample_id": "negative_auto_accepted",
+        "expected_action": "reject",
+        "ground_truth_smiles": "",
+        "predicted_smiles": "CCN",
+        "recognition_success": True,
+        "recognition_decision": "accepted",
+        "manual_review_recommended": False,
+        "backend": "fake",
+        "preprocessing_strategy": "original",
+    }, 0.95)
+    metrics = compute_metrics([row])["overall"]
+    assert metrics["negative_hallucination_count"] == 1
+    assert metrics["false_accept_count"] == 1
+    assert metrics["false_accept_rate"] == 1.0
+
+
+def test_all_negative_dataset_marks_positive_metrics_not_applicable() -> None:
+    rows = [
+        enrich_prediction({
+            "sample_id": "negative_rejected",
+            "expected_action": "reject",
+            "ground_truth_smiles": "",
+            "predicted_smiles": None,
+            "recognition_success": False,
+            "recognition_decision": "rejected",
+            "backend": "fake",
+            "preprocessing_strategy": "original",
+        }, 0.95)
+    ]
+    metrics = compute_metrics(rows)["overall"]
+    assert metrics["positive_sample_count"] == 0
+    assert metrics["valid_smiles_rate"] is None
+    assert metrics["canonical_exact_match_rate"] is None
+    assert metrics["molecule_equivalent_rate"] is None
+    assert metrics["similarity_above_threshold_rate"] is None
+    assert metrics["rejection_coverage"] == 1.0
+
+
+def test_all_positive_dataset_marks_rejection_metrics_not_applicable() -> None:
+    rows = [
+        enrich_prediction({
+            "sample_id": "positive_correct",
+            "expected_action": "recognize",
+            "ground_truth_smiles": "CCO",
+            "predicted_smiles": "CCO",
+            "recognition_success": True,
+            "recognition_decision": "accepted",
+            "manual_review_recommended": False,
+            "backend": "fake",
+            "preprocessing_strategy": "original",
+        }, 0.95)
+    ]
+    metrics = compute_metrics(rows)["overall"]
+    assert metrics["negative_sample_count"] == 0
+    assert metrics["valid_smiles_rate"] == 1.0
+    assert metrics["canonical_exact_match_rate"] == 1.0
+    assert metrics["rejection_coverage"] is None
+    assert metrics["negative_hallucination_rate"] is None
+    assert metrics["false_accept_rate"] is None
+
+
 def test_run_directories_do_not_overwrite_and_report_bundle(tmp_path: Path) -> None:
     first = create_run_directory(tmp_path, "demo", timestamp="20260711_153000")
     second = create_run_directory(tmp_path, "demo", timestamp="20260711_153000")
@@ -503,13 +683,16 @@ def test_release_gates_and_fixed_release_bundle(monkeypatch, tmp_path: Path) -> 
     )
 
     release_dir = Path(result["release_dir"])
-    assert result["passed"] is True
+    assert result["passed"] is False
     assert (release_dir / "fake_success_metrics.json").is_file()
     assert (release_dir / "fake_success_predictions.csv").is_file()
     assert (release_dir / "errors.csv").is_file()
     assert (release_dir / "report.md").is_file()
     payload = json.loads((release_dir / "fake_success_metrics.json").read_text(encoding="utf-8"))
-    assert payload["gates"]["passed"] is True
+    assert payload["gates"]["passed"] is False
+    failed_checks = {check["metric"] for check in payload["gates"]["checks"] if not check["passed"]}
+    assert "positive_sample_count" in failed_checks
+    assert payload["gates"]["data_sufficiency"]["not_release_qualified"] is True
 
 
 def test_release_gate_flags_threshold_failure() -> None:
@@ -524,13 +707,15 @@ def test_release_gate_flags_threshold_failure() -> None:
         }
     })
     assert gates["passed"] is False
-    assert {check["metric"] for check in gates["checks"] if not check["passed"]} == {
+    failed = {check["metric"] for check in gates["checks"] if not check["passed"]}
+    assert {
         "valid_smiles_rate",
         "canonical_exact_match_rate",
         "false_accept_rate",
         "high_risk_error_review_needed_rate",
         "p95_latency_ms",
-    }
+    }.issubset(failed)
+    assert "positive_sample_count" in failed
 
 
 def test_release_comparison_detects_regression_and_writes_report(tmp_path: Path) -> None:

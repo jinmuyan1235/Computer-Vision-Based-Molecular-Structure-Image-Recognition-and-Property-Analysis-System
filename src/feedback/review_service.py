@@ -24,6 +24,13 @@ REVIEW_ACTIONS = {
 }
 
 
+def _require_identity(value: str, field_name: str) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        raise ValueError(f"{field_name} is required")
+    return normalized
+
+
 class FeedbackReviewService:
     """List and update feedback samples that require independent review."""
 
@@ -67,6 +74,7 @@ class FeedbackReviewService:
     def mark_duplicate(self, analysis_id: str, duplicate_of: str = "", reviewer_notes: str = "", reviewer: str = "") -> dict[str, Any]:
         """Mark an item as a duplicate sample."""
         status, action, include = REVIEW_ACTIONS["duplicate"]
+        reviewer = _require_identity(reviewer, "reviewer")
         return update_feedback_review(
             self.root,
             analysis_id,
@@ -81,6 +89,7 @@ class FeedbackReviewService:
     def mark_license_unclear(self, analysis_id: str, reviewer_notes: str = "", reviewer: str = "") -> dict[str, Any]:
         """Mark an item as blocked by unclear license/source permission."""
         status, action, include = REVIEW_ACTIONS["license_unclear"]
+        reviewer = _require_identity(reviewer, "reviewer")
         return update_feedback_review(
             self.root,
             analysis_id,
@@ -100,6 +109,7 @@ class FeedbackReviewService:
         notes: str = "",
     ) -> dict[str, Any]:
         """Create a new correction revision and move the item back to pending review."""
+        revised_by = _require_identity(revised_by, "revised_by")
         return revise_feedback_correction(
             self.root,
             analysis_id,
@@ -114,6 +124,7 @@ class FeedbackReviewService:
 
     def _apply_action(self, analysis_id: str, action_name: str, reviewer_notes: str, reviewer: str = "") -> dict[str, Any]:
         status, action, include = REVIEW_ACTIONS[action_name]
+        reviewer = _require_identity(reviewer, "reviewer")
         return update_feedback_review(
             self.root,
             analysis_id,

@@ -13,21 +13,34 @@ from src.runtime.job_registry import load_batch_job_result, refresh_batch_job, s
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_batch_summary_keeps_warning_results_out_of_auto_accepted_count() -> None:
+def test_batch_summary_uses_mutually_exclusive_status_counts() -> None:
     summary = BatchAnalyzer._summary(
         [
             {"status": "success", "valid": True, "recognition_decision": "accepted"},
             {"status": "success", "valid": True, "recognition_decision": "accepted_with_warning"},
             {"status": "success", "valid": True, "recognition_decision": "review_needed"},
+            {"status": "success", "valid": False, "recognition_decision": "rejected", "message": "rejected input"},
             {"status": "failed", "valid": False, "recognition_decision": "rejected", "message": "bad input"},
+            {"status": "skipped", "valid": False, "recognition_decision": "skipped", "message": "skipped"},
         ],
-        total=4,
+        total=6,
     )
 
     assert summary["accepted"] == 1
     assert summary["accepted_with_warning"] == 1
-    assert summary["review_needed"] == 2
+    assert summary["review_needed"] == 1
     assert summary["rejected"] == 1
+    assert summary["failed"] == 1
+    assert summary["skipped"] == 1
+    assert summary["manual_review_total"] == 2
+    assert (
+        summary["accepted"]
+        + summary["accepted_with_warning"]
+        + summary["review_needed"]
+        + summary["rejected"]
+        + summary["failed"]
+        + summary["skipped"]
+    ) == summary["completed"]
 
 
 def test_batch_job_store_persists_progress_and_control_flags(tmp_path: Path) -> None:
@@ -49,22 +62,35 @@ def test_batch_job_store_persists_progress_and_control_flags(tmp_path: Path) -> 
     progress = store.update_progress("job1", {
         "status": "running",
         "total": 3,
-        "completed": 1,
+        "completed": 3,
         "current_file": "compound_001.png",
         "summary": {
+            "summary_schema_version": 2,
             "total": 3,
-            "completed": 1,
+            "completed": 3,
             "accepted": 1,
-            "accepted_with_warning": 0,
-            "review_needed": 0,
+            "accepted_with_warning": 1,
+            "review_needed": 1,
+            "manual_review_total": 2,
             "rejected": 0,
             "failed": 0,
+            "skipped": 0,
         },
     })
-    assert progress["completed"] == 1
+    assert progress["completed"] == 3
     assert progress["current_file"] == "compound_001.png"
     assert progress["accepted"] == 1
-    assert progress["accepted_with_warning"] == 0
+    assert progress["accepted_with_warning"] == 1
+    assert progress["review_needed"] == 1
+    assert progress["manual_review_total"] == 2
+    assert (
+        progress["accepted"]
+        + progress["accepted_with_warning"]
+        + progress["review_needed"]
+        + progress["rejected"]
+        + progress["failed"]
+        + progress["skipped"]
+    ) == progress["completed"]
 
     skip_state = store.request_skip_current("job1")
     assert "下一张未开始文件" in skip_state["message"]
@@ -74,6 +100,46 @@ def test_batch_job_store_persists_progress_and_control_flags(tmp_path: Path) -> 
     cancelling = store.request_cancel("job1")
     assert cancelling["status"] == "cancelling"
     assert store.cancel_requested("job1") is True
+
+
+def test_batch_job_store_reads_legacy_review_needed_as_manual_review_total(tmp_path: Path) -> None:
+    store = BatchJobStore(tmp_path / "jobs")
+    store.create(
+        "legacy",
+        backend="demo",
+        input_dir=tmp_path,
+        output_dir=tmp_path / "out",
+        total=3,
+        source="test",
+    )
+
+    state = store.update_progress("legacy", {
+        "status": "running",
+        "total": 3,
+        "completed": 3,
+        "summary": {
+            "total": 3,
+            "completed": 3,
+            "accepted": 1,
+            "accepted_with_warning": 1,
+            "review_needed": 2,
+            "rejected": 0,
+            "failed": 0,
+            "skipped": 0,
+        },
+    })
+
+    assert state["accepted_with_warning"] == 1
+    assert state["review_needed"] == 1
+    assert state["manual_review_total"] == 2
+    assert (
+        state["accepted"]
+        + state["accepted_with_warning"]
+        + state["review_needed"]
+        + state["rejected"]
+        + state["failed"]
+        + state["skipped"]
+    ) == state["completed"]
 
 
 def test_process_batch_writes_background_job_result(tmp_path: Path) -> None:
