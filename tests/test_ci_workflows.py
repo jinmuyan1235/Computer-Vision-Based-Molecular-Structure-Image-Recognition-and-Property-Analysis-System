@@ -28,7 +28,9 @@ def test_manual_gpu_workflow_is_dispatch_only_and_uploads_diagnostics() -> None:
     assert "workflow_dispatch:" in source
     assert "pull_request:" not in source
     assert "push:" not in source
-    assert 'default: \'["self-hosted","gpu"]\'' in source
+    assert "gpu_runner_label:" in source
+    assert "- self-hosted" in source
+    assert "- ${{ inputs.gpu_runner_label }}" in source
     assert "scripts/verify_gpu_environment.py --load-models --no-strict" in source
     assert "scripts/check_ocsr_backend.py" in source
     assert "--backend molscribe" in source
