@@ -166,6 +166,7 @@ Default project-phase gates are:
 - unique molecule count >= 100;
 - unique scaffold count >= 50;
 - verified sample rate = 100%;
+- license unclear row count = 0;
 - missing image count = 0;
 - checksum error count = 0.
 

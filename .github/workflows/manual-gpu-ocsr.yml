@@ -3,10 +3,10 @@ name: manual-gpu-ocsr
 on:
   workflow_dispatch:
     inputs:
-      runner_labels:
-        description: "JSON array for the GPU runner labels."
+      gpu_runner_label:
+        description: "Self-hosted GPU runner label."
         required: true
-        default: '["self-hosted","gpu"]'
+        default: "gpu"
       python_version:
         description: "Python version available on the GPU runner."
         required: true
@@ -38,7 +38,9 @@ on:
 
 jobs:
   gpu-health:
-    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    runs-on:
+      - self-hosted
+      - ${{ inputs.gpu_runner_label }}
     timeout-minutes: 120
     env:
       MPLBACKEND: Agg
