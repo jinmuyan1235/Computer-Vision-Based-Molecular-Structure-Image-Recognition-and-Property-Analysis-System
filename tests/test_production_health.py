@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from src.ocsr.base import BaseOCSRAdapter, OCSRResult
+from src.ocsr.recognizer import MoleculeRecognizer
 from src.runtime import health as health_module
 
 
@@ -131,6 +133,77 @@ def test_health_failure_disables_only_real_ocsr_workflows(monkeypatch: pytest.Mo
     assert result["capabilities"]["smiles_manual"] is True
     assert result["capabilities"]["history"] is True
     assert any(check["name"] == "backend.available" for check in result["checks"])
+
+
+def test_heavy_health_reuses_one_adapter_for_load_model_warmup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class CountingHealthAdapter(BaseOCSRAdapter):
+        backend_name = "fake_health"
+        instance_count = 0
+        load_count = 0
+        diagnose_load_requests: list[bool] = []
+
+        def __init__(self) -> None:
+            type(self).instance_count += 1
+            self.loaded = False
+
+        @property
+        def health_model_load_count(self) -> int:
+            return type(self).load_count
+
+        def _load_model(self) -> None:
+            if not self.loaded:
+                type(self).load_count += 1
+                self.loaded = True
+
+        def diagnose(self, load_model: bool = False) -> dict[str, object]:
+            type(self).diagnose_load_requests.append(bool(load_model))
+            if load_model:
+                self._load_model()
+            return self.status()
+
+        def status(self) -> dict[str, object]:
+            return {
+                "backend": self.backend_name,
+                "available": True,
+                "message": "ok",
+                "package_installed": True,
+                "package_version": "test",
+                "model_loaded": self.loaded,
+                "device": "cpu",
+                "health_model_load_count": type(self).load_count,
+            }
+
+        def recognize(self, image_path_or_array: object) -> OCSRResult:
+            self._load_model()
+            return OCSRResult(
+                smiles="CCO",
+                confidence=0.99,
+                backend=self.backend_name,
+                status="success",
+                message="fake warm-up",
+                inference_time_ms=1.0,
+            )
+
+    monkeypatch.setitem(MoleculeRecognizer.ADAPTERS, "fake_health", CountingHealthAdapter)
+    warmup_image = tmp_path / "warmup.png"
+    warmup_image.write_bytes(b"fake image bytes")
+
+    result = health_module.run_heavy_health_checks(
+        "fake_health",
+        production=True,
+        load_model=True,
+        warmup=True,
+        warmup_path=warmup_image,
+    )
+
+    assert CountingHealthAdapter.instance_count == 1
+    assert CountingHealthAdapter.load_count == 1
+    assert CountingHealthAdapter.diagnose_load_requests == [False, False]
+    assert result["model_load_count"] == 1
+    assert result["adapter_reused_for_warmup"] is True
+    assert result["peak_memory_available"] is False
+    assert any(check["name"] == "backend.model_load" and check["status"] == "pass" for check in result["checks"])
+    assert any(check["name"] == "warmup" and check["status"] == "pass" for check in result["checks"])
 
 
 def test_health_cache_key_uses_model_fingerprint_not_full_sha(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

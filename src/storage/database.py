@@ -9,7 +9,7 @@ from typing import Callable
 import config
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 Migration = Callable[[sqlite3.Connection], None]
 
 
@@ -105,6 +105,26 @@ def _migrate_v1(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+def _migrate_v2(connection: sqlite3.Connection) -> None:
+    """Add recoverable local-file deletion state to history rows."""
+    columns = _column_names(connection, "analyses")
+    additions = {
+        "delete_status": "TEXT NOT NULL DEFAULT ''",
+        "delete_errors": "TEXT NOT NULL DEFAULT ''",
+        "delete_requested_at": "TEXT",
+        "delete_updated_at": "TEXT",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE analyses ADD COLUMN {name} {definition}")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_analyses_delete_status ON analyses(delete_status)")
+
+
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
 MIGRATIONS: dict[int, Migration] = {
     1: _migrate_v1,
+    2: _migrate_v2,
 }

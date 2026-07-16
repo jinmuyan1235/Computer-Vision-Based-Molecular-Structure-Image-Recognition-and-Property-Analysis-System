@@ -254,6 +254,20 @@ python scripts/ingest_ocsr_labeled_images.py --labels data/raw_ocsr_real/labels.
 
 完整流程见 `docs/ocsr_dataset_curation.md`。真实验收集应记录来源、授权、scaffold/source split、图像质量、结构复杂度和拒识样本；不要把无授权论文截图或专有数据提交到公开仓库。
 
+仓库内的 `data/ocsr_real_acceptance/` 是 starter smoke benchmark，不是正式真实世界准确率验收集。图片文件由 `.gitignore` 排除，但可以从固定上游版本确定性重建：
+
+```bash
+python scripts/download_real_acceptance_set.py
+python scripts/validate_real_acceptance_set.py
+python scripts/run_release_acceptance.py \
+  --release-version starter-v0.1 \
+  --manifest data/ocsr_real_acceptance/manifest.csv \
+  --dataset-root data/ocsr_real_acceptance \
+  --backends molscribe,ensemble
+```
+
+`source_manifest.csv` 记录固定 URL、上游版本、来源 SHA-256、最终图片 SHA-256、许可说明和派生操作。该 starter 只有少量独立来源，扰动图不能作为独立样本统计，不能用于宣称真实世界准确率，也不能在阈值调优后再作为独立测试集；默认 release gate 失败是允许且应保留的事实。
+
 单图上传后会先进入持久运行目录，识别、纠错和反馈都复用该路径，不再依赖识别完成后即删除的临时文件：
 
 ```text
@@ -267,6 +281,8 @@ data/runs/<analysis_id>/
 ```
 
 `report["input"]["path"]` 会指向 `input/original.<ext>` 的持久路径。默认清理策略由 `RUN_RETENTION_DAYS=30` 和 `RUN_MAX_STORAGE_GB=10` 控制；进入反馈库、已审核或用户标记保留的 run 会在 `runtime.json` 中标记为 protected，不会被自动清理。
+
+历史页的数据库记录是索引，会保留普通历史记录；未保护的运行目录允许在到期或超过存储预算时被自动清理。历史列表会按运行时状态显示 `artifact_status=available|expired|missing`：`available` 表示报告文件仍可打开和重新导出，`expired` 表示报告属于可过期的运行目录且文件已被清理，`missing` 表示报告路径为空或文件缺失。报告文件不可用时，“打开旧报告”和“重新导出”会禁用；如果原始输入仍存在，仍可点击“重新识别”。收藏会添加 `favorite` 保护原因；取消收藏只移除 `favorite`，不会移除反馈、审核等其它保护原因。
 
 人工纠错也可以回流为数据集：单图识别页点击“仅保存纠错”会写入 `data/feedback/images`、`data/feedback/annotations` 和 `data/feedback/manifest.csv`；点击“确认进入训练集”会标记为已核验并可导出：
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import streamlit as st
@@ -42,6 +41,8 @@ DEFAULT_COLUMNS = [
     "message",
 ]
 
+RUNNING_BATCH_STATUSES = {"queued", "running", "cancelling"}
+
 
 def render_batch_page(backend: str) -> None:
     page_intro("批量处理", "批量任务在后台运行；页面刷新后可以恢复进度和下载结果。")
@@ -55,7 +56,7 @@ def render_batch_page(backend: str) -> None:
     )
 
     active_job = _active_job(store)
-    running = bool(active_job and active_job.get("status") in {"queued", "running", "cancelling"})
+    running = bool(active_job and _is_running_batch_status(active_job.get("status")))
     if st.button("开始后台批量任务", type="primary", key="analyze_batch", disabled=running):
         try:
             runtime = runtime_config_from_key(current_runtime_key())
@@ -78,7 +79,10 @@ def render_batch_page(backend: str) -> None:
     active_job = _active_job(store)
     if active_job:
         _index_job(active_job)
-        _render_job_status(active_job, store, backend)
+        if _is_running_batch_status(active_job.get("status")):
+            _render_live_job_status(str(active_job["job_id"]), backend)
+        else:
+            _render_job_status(active_job, store, backend)
         batch_result = load_batch_job_result(active_job["job_id"], store)
         if batch_result:
             record_result_payload(batch_result, active_job.get("result_path"))
@@ -125,14 +129,10 @@ def _render_job_status(job: dict, store: BatchJobStore, backend: str) -> None:
     completed = int(job.get("completed") or 0)
     st.subheader("后台任务状态")
     st.progress((completed / total) if total else 0.0)
-    metrics = st.columns(7)
+    metrics = st.columns(2)
     metrics[0].metric("总数", total)
     metrics[1].metric("已完成", completed)
-    metrics[2].metric("自动接受", int(job.get("accepted") or 0))
-    metrics[3].metric("警告待确认", int(job.get("accepted_with_warning") or 0))
-    metrics[4].metric("需要审核", int(job.get("review_needed") or 0))
-    metrics[5].metric("拒绝", int(job.get("rejected") or 0))
-    metrics[6].metric("失败", int(job.get("failed") or 0))
+    _render_batch_status_metrics(job)
     st.caption(
         f"状态：{_status_label(status)}；"
         f"当前文件：{job.get('current_file') or '-'}；"
@@ -141,7 +141,7 @@ def _render_job_status(job: dict, store: BatchJobStore, backend: str) -> None:
     col_refresh, col_cancel, col_skip, col_retry_failed, col_retry_review, col_clear = st.columns(6)
     if col_refresh.button("刷新状态", key="refresh_batch_job"):
         st.rerun()
-    if col_cancel.button("取消任务", key="cancel_batch_job", disabled=status not in {"queued", "running", "cancelling"}):
+    if col_cancel.button("取消任务", key="cancel_batch_job", disabled=not _is_running_batch_status(status)):
         cancel_batch_job(job["job_id"], store)
         st.rerun()
     if col_skip.button(
@@ -157,20 +157,37 @@ def _render_job_status(job: dict, store: BatchJobStore, backend: str) -> None:
         _start_retry_job(result, backend, "failed", store, job["job_id"])
     if col_retry_review.button("只重试待审核项", key="retry_review_batch", disabled=not result):
         _start_retry_job(result, backend, "review", store, job["job_id"])
-    if col_clear.button("清除任务", key="clear_batch_job", disabled=status in {"queued", "running", "cancelling"}):
+    if col_clear.button("清除任务", key="clear_batch_job", disabled=_is_running_batch_status(status)):
         clear_batch_job(job["job_id"], store)
         st.session_state.pop("batch_job_id", None)
         st.session_state.pop("batch_result", None)
         st.rerun()
-    _auto_refresh_running_job(status)
 
 
-def _auto_refresh_running_job(status: str) -> None:
-    if status not in {"queued", "running", "cancelling"}:
+@st.fragment(run_every="3s")
+def _render_live_job_status(job_id: str, backend: str) -> None:
+    store = BatchJobStore()
+    try:
+        job = refresh_batch_job(job_id, store)
+    except Exception as exc:
+        st.warning(f"恢复批量任务失败：{exc}")
+        if st.session_state.get("batch_job_id") == job_id:
+            st.session_state.pop("batch_job_id", None)
+        st.rerun()
+    _index_job(job)
+    if _is_running_batch_status(job.get("status")):
+        _render_job_status(job, store, backend)
+        st.caption("任务运行中，状态区域每 3 秒自动刷新。")
         return
-    st.caption("任务运行中，页面将在 3 秒后自动刷新。")
-    time.sleep(3)
+    result = load_batch_job_result(job_id, store)
+    if result:
+        record_result_payload(result, job.get("result_path"))
+        st.session_state["batch_result"] = result
     st.rerun()
+
+
+def _is_running_batch_status(status: object) -> bool:
+    return str(status or "") in RUNNING_BATCH_STATUSES
 
 
 def _start_retry_job(result: dict, backend: str, mode: str, store: BatchJobStore, parent_job_id: str) -> None:
@@ -204,6 +221,7 @@ def _render_batch_result(batch_result: dict) -> None:
     metrics[1].metric("已处理", summary.get("completed", summary["total"]))
     metrics[2].metric("有效 SMILES", summary["valid_smiles"])
     metrics[3].metric("成功率", f"{summary['success_rate']:.1%}")
+    _render_batch_status_metrics(summary)
 
     rows = batch_result["rows"]
     default_rows = [{key: row.get(key) for key in DEFAULT_COLUMNS} for row in rows]
@@ -249,6 +267,42 @@ def _download_export_if_present(exports: dict, field: str, label: str, mime: str
     if not path.is_file():
         return
     st.download_button(label, path.read_bytes(), path.name, mime, key=key)
+
+
+def _render_batch_status_metrics(summary: dict) -> None:
+    counts = _batch_status_counts(summary)
+    metrics = st.columns(7)
+    metrics[0].metric("自动接受", counts["accepted"])
+    metrics[1].metric("警告待确认", counts["accepted_with_warning"])
+    metrics[2].metric("明确需要审核", counts["review_needed"])
+    metrics[3].metric("拒绝", counts["rejected"])
+    metrics[4].metric("失败", counts["failed"])
+    metrics[5].metric("跳过", counts["skipped"])
+    metrics[6].metric("人工审核总数", counts["manual_review_total"])
+
+
+def _batch_status_counts(summary: dict) -> dict[str, int]:
+    accepted = int(summary.get("accepted") or 0)
+    accepted_with_warning = int(summary.get("accepted_with_warning") or 0)
+    review_needed = int(summary.get("review_needed") or 0)
+    rejected = int(summary.get("rejected") or 0)
+    failed = int(summary.get("failed") or 0)
+    skipped = int(summary.get("skipped") or 0)
+    schema_version = int(summary.get("summary_schema_version") or 0)
+    if "manual_review_total" in summary or schema_version >= 2:
+        manual_review_total = int(summary.get("manual_review_total") or (accepted_with_warning + review_needed))
+    else:
+        manual_review_total = review_needed
+        review_needed = max(0, review_needed - accepted_with_warning)
+    return {
+        "accepted": accepted,
+        "accepted_with_warning": accepted_with_warning,
+        "review_needed": review_needed,
+        "manual_review_total": manual_review_total,
+        "rejected": rejected,
+        "failed": failed,
+        "skipped": skipped,
+    }
 
 
 def default_batch_columns_chinese() -> list[str]:

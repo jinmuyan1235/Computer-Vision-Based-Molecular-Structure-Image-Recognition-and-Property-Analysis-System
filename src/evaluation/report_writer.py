@@ -50,7 +50,7 @@ def _bar_chart(path: Path, title: str, values: dict[str, int | float]) -> None:
         image.save(path)
         return
     labels = list(values.keys())
-    numbers = [float(value) for value in values.values()]
+    numbers = [0.0 if value is None else float(value) for value in values.values()]
     max_value = max(numbers + [1.0])
     bar_width = max(24, min(90, (width - margin * 2) // max(len(labels) * 2, 1)))
     gap = max(18, (width - margin * 2 - bar_width * len(labels)) // max(len(labels), 1))
@@ -186,6 +186,10 @@ def _write_report(run_dir: Path, metadata: dict[str, Any], metrics: dict[str, An
         "",
         _markdown_table([overall], [
             "total_samples",
+            "positive_sample_count",
+            "negative_sample_count",
+            "recognition_metric_denominator",
+            "rejection_metric_denominator",
             "recognition_success_count",
             "recognition_success_rate",
             "rdkit_valid_count",
@@ -210,6 +214,23 @@ def _write_report(run_dir: Path, metadata: dict[str, Any], metrics: dict[str, An
             "p50_latency_ms",
             "median_latency_ms",
             "p95_latency_ms",
+        ]),
+        "## Dataset Sufficiency",
+        "",
+        _markdown_table([overall], [
+            "total_samples",
+            "positive_sample_count",
+            "negative_sample_count",
+            "independent_source_document_count",
+            "independent_original_image_count",
+            "derived_perturbation_count",
+            "unique_molecule_count",
+            "unique_scaffold_count",
+            "verified_sample_count",
+            "verified_sample_rate",
+            "license_unclear_count",
+            "missing_image_count",
+            "checksum_error_count",
         ]),
         "## Category Metrics",
         "",

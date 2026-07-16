@@ -14,6 +14,7 @@ from src.analysis.correction import (
 from src.analysis.molecule_report import MoleculeReportGenerator
 from src.export.json_exporter import to_json_text
 from src.export.pdf_exporter import save_pdf
+from src.feedback.review_service import FeedbackReviewService
 from src.feedback.store import export_feedback_manifest
 
 
@@ -141,21 +142,24 @@ def test_feedback_detects_duplicate_images_and_exports_manifest(tmp_path: Path) 
         first_corrected,
         tmp_path,
         correction_type="other",
-        review_status="verified",
-        feedback_action="accepted_for_dataset",
-        include_in_training=True,
+        review_status="pending",
+        feedback_action="correction_only",
+        include_in_training=False,
     )
     second_result = save_correction_feedback(
         second_corrected,
         tmp_path,
         correction_type="other",
-        review_status="verified",
-        feedback_action="accepted_for_dataset",
-        include_in_training=True,
+        review_status="pending",
+        feedback_action="correction_only",
+        include_in_training=False,
     )
 
     assert first_result["duplicate_image"] is False
     assert second_result["duplicate_image"] is True
+    service = FeedbackReviewService(tmp_path)
+    service.approve_for_dataset(first_corrected["analysis_id"], reviewer="reviewer-a")
+    service.approve_for_dataset(second_corrected["analysis_id"], reviewer="reviewer-a")
     output_manifest = tmp_path / "feedback_train_manifest.csv"
     export = export_feedback_manifest(tmp_path / "feedback", output_manifest)
     assert export["exported_count"] == 1

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -30,6 +31,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    os.environ["OCSR_HEALTH_WORKER_PROCESS"] = "1"
+    os.environ.setdefault("MOLSCRIBE_CHILD_PROCESS", "1")
+    os.environ.setdefault("DECIMER_CHILD_PROCESS", "1")
     args = build_parser().parse_args()
     try:
         runtime_config = json.loads(args.runtime_json)

@@ -24,6 +24,8 @@ Rules enforced by the loader:
 - `sample_id` values must be unique.
 - `image_path` must exist and remain inside `--dataset-root`.
 - `ground_truth_smiles` must be parseable by RDKit.
+- Rows with `expected_action=reject` may omit `ground_truth_smiles`.
+- Strict real acceptance validation requires SHA-256 integrity, matching InChIKey values, reviewer/annotator metadata for verified rows, and no split leakage across a shared `source_document`.
 - Invalid rows are reported explicitly; they are not silently skipped.
 
 Recommended fields are optional for compatibility, but real acceptance reports should include them. The evaluator stratifies metrics by `source`, `image_quality`, `complexity`, `perturbation`, `structure_features`, `split`, backend and preprocessing strategy.
@@ -109,11 +111,21 @@ Use `data/ocsr_real_acceptance/` for the release-only reviewed acceptance set:
 data/ocsr_real_acceptance/
 ├── images/
 ├── manifest.csv
+├── source_manifest.csv
 ├── dataset_card.md
 └── checksums.sha256
 ```
 
-Images may remain local and are ignored by Git by default. The release manifest must include reviewed source/license and integrity fields:
+Images are ignored by Git, but they must be reproducible from fixed upstream sources. Rebuild and validate them before running release acceptance:
+
+```bash
+python scripts/download_real_acceptance_set.py
+python scripts/validate_real_acceptance_set.py
+```
+
+The downloader uses fixed raw URLs and expected SHA-256 values from `source_manifest.csv`, writes temporary downloads first, verifies source and final hashes, then atomically materializes images. Existing correct images are skipped; existing mismatched images fail the run.
+
+The release manifest must include reviewed source/license and integrity fields:
 
 ```text
 dataset_version,image_sha256,source_document,source_license,annotator,reviewer,review_status,ground_truth_smiles,ground_truth_inchikey,expected_action,supported_scope
@@ -122,8 +134,10 @@ dataset_version,image_sha256,source_document,source_license,annotator,reviewer,r
 Run a fixed release gate:
 
 ```bash
+python scripts/download_real_acceptance_set.py
+python scripts/validate_real_acceptance_set.py
 python scripts/run_release_acceptance.py \
-  --release-version v0.1 \
+  --release-version starter-v0.1 \
   --manifest data/ocsr_real_acceptance/manifest.csv \
   --dataset-root data/ocsr_real_acceptance \
   --backends molscribe,ensemble
@@ -132,7 +146,7 @@ python scripts/run_release_acceptance.py \
 This writes files such as:
 
 ```text
-benchmark/releases/v0.1/
+benchmark/releases/starter-v0.1/
 ├── molscribe_metrics.json
 ├── ensemble_metrics.json
 ├── errors.csv
@@ -146,13 +160,23 @@ Default project-phase gates are:
 - false accept rate on reject/non-molecule samples <= 5%;
 - high-risk errors are routed to review;
 - P95 single-GPU latency <= 15 seconds.
+- positive sample count >= 100;
+- negative sample count >= 20;
+- independent source document count >= 30;
+- unique molecule count >= 100;
+- unique scaffold count >= 50;
+- verified sample rate = 100%;
+- missing image count = 0;
+- checksum error count = 0.
+
+The bundled `starter-v0.1` set is a starter smoke benchmark only. It has too few independent sources, and perturbations of the same source image are not independent samples. It is not statistically meaningful, not release-qualified, and must not be used to claim real-world OCSR accuracy or tune thresholds before reporting it as an independent test set. Current backend gate failures are expected and should remain visible.
 
 Compare a new release with the previous fixed baseline:
 
 ```bash
 python scripts/compare_benchmark_runs.py \
   --current benchmark/releases/v0.2 \
-  --previous benchmark/releases/v0.1
+  --previous benchmark/releases/starter-v0.1
 ```
 
 Do not train on, tune thresholds against, or repeatedly optimize prompts/models with the release acceptance set.

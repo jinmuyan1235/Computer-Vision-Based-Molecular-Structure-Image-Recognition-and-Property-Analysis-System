@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -151,6 +152,7 @@ def load_manifest(
 
         for line_number, row in enumerate(reader, start=2):
             row_errors: list[str] = []
+            raw = {field: (row.get(field) or "").strip() for field in fieldnames}
             values = {field: (row.get(field) or "").strip() for field in REQUIRED_FIELDS}
             recommended = {
                 field: (row.get(field) or "").strip() or BenchmarkSample.__dataclass_fields__[field].default
@@ -191,11 +193,17 @@ def load_manifest(
                         continue
                     if field == "ground_truth_inchikey" and expected_action == "reject":
                         continue
-                    value = values.get(field) if field in values else recommended.get(field)
+                    value = raw.get(field, "")
                     if not str(value or "").strip():
                         row_errors.append(f"Line {line_number}: real acceptance field '{field}' is empty.")
                 if recommended.get("review_status") != "verified":
                     row_errors.append(f"Line {line_number}: review_status must be 'verified' for release acceptance.")
+                if recommended.get("review_status") == "verified":
+                    for field in ("annotator", "reviewer"):
+                        if not raw.get(field):
+                            row_errors.append(
+                                f"Line {line_number}: verified real acceptance row must include '{field}'."
+                            )
             validation = {"valid": False, "canonical_smiles": None, "error": None}
             if expected_action == "reject" and not values["ground_truth_smiles"]:
                 validation = {"valid": True, "canonical_smiles": None, "error": None}
@@ -250,4 +258,18 @@ def load_manifest(
 
     if errors:
         raise ManifestValidationError(errors)
+    if require_real_metadata:
+        split_by_source: dict[str, set[str]] = defaultdict(set)
+        for sample in samples:
+            source_document = str(sample.source_document or "").strip()
+            split = str(sample.split or "").strip() or "unspecified"
+            if source_document:
+                split_by_source[source_document].add(split)
+        split_errors = [
+            f"source_document '{source_document}' appears in multiple splits: {', '.join(sorted(splits))}"
+            for source_document, splits in sorted(split_by_source.items())
+            if len(splits) > 1
+        ]
+        if split_errors:
+            raise ManifestValidationError(split_errors)
     return samples

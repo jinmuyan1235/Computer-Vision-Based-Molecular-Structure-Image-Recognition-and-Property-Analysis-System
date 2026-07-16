@@ -13,6 +13,7 @@ from src.utils.file_utils import ensure_directory
 
 
 BATCH_JOB_STATUSES = {"queued", "running", "cancelling", "cancelled", "completed", "failed"}
+BATCH_SUMMARY_SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -70,6 +71,7 @@ class BatchJobStore:
             "accepted": 0,
             "accepted_with_warning": 0,
             "review_needed": 0,
+            "manual_review_total": 0,
             "rejected": 0,
             "failed": 0,
             "skipped": 0,
@@ -118,6 +120,7 @@ class BatchJobStore:
 
     def update_progress(self, job_id: str, progress: dict[str, Any]) -> dict[str, Any]:
         summary = progress.get("summary") or {}
+        counts = _batch_summary_counts(summary)
         status = str(progress.get("status") or "running")
         if status not in BATCH_JOB_STATUSES:
             status = "running"
@@ -125,12 +128,13 @@ class BatchJobStore:
             "status": status,
             "total": int(progress.get("total") or summary.get("total") or 0),
             "completed": int(progress.get("completed") or summary.get("completed") or 0),
-            "accepted": int(summary.get("accepted") or 0),
-            "accepted_with_warning": int(summary.get("accepted_with_warning") or 0),
-            "review_needed": int(summary.get("review_needed") or 0),
-            "rejected": int(summary.get("rejected") or 0),
-            "failed": int(summary.get("failed") or 0),
-            "skipped": int(summary.get("skipped") or 0),
+            "accepted": counts["accepted"],
+            "accepted_with_warning": counts["accepted_with_warning"],
+            "review_needed": counts["review_needed"],
+            "manual_review_total": counts["manual_review_total"],
+            "rejected": counts["rejected"],
+            "failed": counts["failed"],
+            "skipped": counts["skipped"],
             "current_file": progress.get("current_file"),
             "current_index": progress.get("current_index"),
             "summary": summary,
@@ -144,6 +148,7 @@ class BatchJobStore:
         return self.update(job_id, **fields)
 
     def complete(self, job_id: str, result_path: str | Path, exports: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
+        counts = _batch_summary_counts(summary)
         return self.update(
             job_id,
             status="completed",
@@ -152,12 +157,13 @@ class BatchJobStore:
             summary=summary,
             total=int(summary.get("total") or 0),
             completed=int(summary.get("completed") or summary.get("total") or 0),
-            accepted=int(summary.get("accepted") or 0),
-            accepted_with_warning=int(summary.get("accepted_with_warning") or 0),
-            review_needed=int(summary.get("review_needed") or 0),
-            rejected=int(summary.get("rejected") or 0),
-            failed=int(summary.get("failed") or 0),
-            skipped=int(summary.get("skipped") or 0),
+            accepted=counts["accepted"],
+            accepted_with_warning=counts["accepted_with_warning"],
+            review_needed=counts["review_needed"],
+            manual_review_total=counts["manual_review_total"],
+            rejected=counts["rejected"],
+            failed=counts["failed"],
+            skipped=counts["skipped"],
             current_file=None,
             finished_at=utc_now(),
         )
@@ -224,3 +230,36 @@ class BatchJobStore:
         temp = path.with_suffix(".tmp")
         temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(path)
+
+
+def _batch_summary_counts(summary: dict[str, Any]) -> dict[str, int]:
+    accepted = _int_value(summary.get("accepted"))
+    accepted_with_warning = _int_value(summary.get("accepted_with_warning"))
+    review_needed = _int_value(summary.get("review_needed"))
+    rejected = _int_value(summary.get("rejected"))
+    failed = _int_value(summary.get("failed"))
+    skipped = _int_value(summary.get("skipped"))
+    schema_version = _int_value(summary.get("summary_schema_version"))
+    if "manual_review_total" in summary or schema_version >= BATCH_SUMMARY_SCHEMA_VERSION:
+        manual_review_total = _int_value(summary.get("manual_review_total"), accepted_with_warning + review_needed)
+    else:
+        manual_review_total = review_needed
+        review_needed = max(0, review_needed - accepted_with_warning)
+    return {
+        "accepted": accepted,
+        "accepted_with_warning": accepted_with_warning,
+        "review_needed": review_needed,
+        "manual_review_total": manual_review_total,
+        "rejected": rejected,
+        "failed": failed,
+        "skipped": skipped,
+    }
+
+
+def _int_value(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default

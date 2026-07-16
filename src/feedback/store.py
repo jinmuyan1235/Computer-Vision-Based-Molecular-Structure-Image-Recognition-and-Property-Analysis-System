@@ -21,6 +21,7 @@ from src.utils.file_utils import ensure_directory, safe_stem
 CORRECTION_TYPES = {"atom", "bond", "charge", "stereo", "missing_fragment", "other"}
 REVIEW_STATUSES = {"pending", "verified", "rejected", "returned", "duplicate", "license_unclear"}
 FEEDBACK_ACTIONS = {"correction_only", "accepted_for_dataset"}
+REVIEWER_REQUIRED_STATUSES = {"verified", "rejected", "returned", "duplicate", "license_unclear"}
 
 FEEDBACK_MANIFEST_FIELDS = [
     "analysis_id",
@@ -153,6 +154,13 @@ def _duplicate_for(manifest_rows: list[dict[str, str]], image_sha256: str | None
 def _normalize_choice(value: str | None, allowed: set[str], default: str) -> str:
     normalized = (value or default).strip().lower()
     return normalized if normalized in allowed else default
+
+
+def _require_non_empty_identity(value: str | None, field_name: str) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        raise ValueError(f"{field_name} is required")
+    return normalized
 
 
 def _annotation_payload(
@@ -368,6 +376,11 @@ def update_feedback_review(
     if target is None:
         raise FileNotFoundError(f"未找到待审核反馈：{analysis_id}")
     review_status = _normalize_choice(review_status, REVIEW_STATUSES, "pending")
+    normalized_reviewer = (
+        _require_non_empty_identity(reviewer, "reviewer")
+        if review_status in REVIEWER_REQUIRED_STATUSES
+        else (reviewer or "").strip()
+    )
     if feedback_action is not None:
         feedback_action = _normalize_choice(feedback_action, FEEDBACK_ACTIONS, "correction_only")
     if include_in_training is None:
@@ -377,11 +390,13 @@ def update_feedback_review(
         raise FileNotFoundError(f"无法读取反馈标注：{target.get('annotation_path')}")
 
     feedback = annotation.setdefault("feedback", {})
+    previous_status = str(feedback.get("review_status") or target.get("review_status") or "")
+    now = _utc_now_iso()
     feedback["review_status"] = review_status
     feedback["feedback_action"] = feedback_action or feedback.get("feedback_action") or "correction_only"
     feedback["include_in_training"] = bool(include_in_training)
-    feedback["reviewed_at"] = _utc_now_iso()
-    feedback["reviewer"] = reviewer.strip() if reviewer.strip() else feedback.get("reviewer", "")
+    feedback["reviewed_at"] = now
+    feedback["reviewer"] = normalized_reviewer
     feedback.setdefault("revision", 1)
     if reviewer_notes:
         feedback["reviewer_notes"] = reviewer_notes
@@ -390,6 +405,24 @@ def update_feedback_review(
         feedback["duplicate_of"] = duplicate_of
     if source_license is not None:
         feedback["source_license"] = source_license
+    event = {
+        "source": "review_queue",
+        "operation": f"review_{review_status}",
+        "old_status": previous_status,
+        "new_status": review_status,
+        "previous_review_status": previous_status,
+        "new_review_status": review_status,
+        "reviewer": normalized_reviewer,
+        "reviewer_notes": reviewer_notes,
+        "feedback_action": feedback["feedback_action"],
+        "include_in_training": bool(include_in_training),
+        "created_at": now,
+    }
+    if duplicate_of is not None:
+        event["duplicate_of"] = duplicate_of
+    if source_license is not None:
+        event["source_license"] = source_license
+    annotation.setdefault("history", []).append(event)
 
     annotation_path = Path(target.get("annotation_path") or "")
     if not annotation_path.is_absolute():
@@ -424,6 +457,7 @@ def revise_feedback_correction(
     target = next((row for row in rows if row.get("analysis_id") == analysis_id), None)
     if target is None:
         raise FileNotFoundError(f"未找到待修订反馈：{analysis_id}")
+    normalized_reviser = _require_non_empty_identity(revised_by, "revised_by")
     annotation = _load_annotation(root, target)
     if annotation is None:
         raise FileNotFoundError(f"无法读取反馈标注：{target.get('annotation_path')}")
@@ -436,6 +470,7 @@ def revise_feedback_correction(
     now = _utc_now_iso()
     feedback = annotation.setdefault("feedback", {})
     correction = annotation.setdefault("correction", {})
+    previous_status = str(feedback.get("review_status") or target.get("review_status") or "")
     previous_revision = _revision_number(feedback.get("revision"))
     revision = previous_revision + 1
     annotation.setdefault("revision_history", []).append({
@@ -475,15 +510,23 @@ def revise_feedback_correction(
         "created_at": now,
         "notes": notes,
         "revision": revision,
+        "old_status": previous_status,
+        "new_status": "pending",
+        "previous_review_status": previous_status,
+        "new_review_status": "pending",
+        "revised_by": normalized_reviser,
     })
 
     feedback["review_status"] = "pending"
     feedback["feedback_action"] = "correction_only"
     feedback["include_in_training"] = False
     feedback["revision"] = revision
-    feedback["revised_by"] = revised_by.strip()
+    feedback["revised_by"] = normalized_reviser
     feedback["revised_at"] = now
     feedback["revision_notes"] = notes
+    feedback["reviewer"] = ""
+    feedback["reviewed_at"] = None
+    feedback.pop("reviewer_notes", None)
     if notes:
         feedback["notes"] = notes
 
@@ -540,10 +583,13 @@ def export_feedback_manifest(
     exported: list[dict[str, Any]] = []
     seen_hashes: set[str] = set()
     required_status = _normalize_choice(review_status, REVIEW_STATUSES, "verified")
-    skipped = {"review_status": 0, "not_training": 0, "duplicate": 0, "invalid_smiles": 0, "missing_image": 0}
+    skipped = {"review_status": 0, "missing_reviewer": 0, "not_training": 0, "duplicate": 0, "invalid_smiles": 0, "missing_image": 0}
     for row in manifest_rows:
         if row.get("review_status") != required_status:
             skipped["review_status"] += 1
+            continue
+        if required_status == "verified" and not str(row.get("reviewer") or "").strip():
+            skipped["missing_reviewer"] += 1
             continue
         if str(row.get("include_in_training")).lower() not in {"true", "1", "yes"}:
             skipped["not_training"] += 1

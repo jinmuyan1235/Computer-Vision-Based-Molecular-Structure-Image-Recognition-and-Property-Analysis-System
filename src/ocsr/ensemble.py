@@ -310,6 +310,7 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
         total_timeout_seconds: float | None = None,
         adapter_factories: Mapping[str, AdapterFactory] | None = None,
         runtime_config: Mapping[str, Any] | None = None,
+        release_after_each_backend: bool | None = None,
     ) -> None:
         factories = dict(adapter_factories or _default_factories(runtime_config))
         self.adapter_factories = factories
@@ -320,6 +321,7 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
         self.parallel = config.OCSR_ENSEMBLE_PARALLEL if parallel is None else parallel
         self.continue_on_error = config.OCSR_ENSEMBLE_CONTINUE_ON_ERROR if continue_on_error is None else continue_on_error
         self.total_timeout_seconds = float(total_timeout_seconds or config.OCSR_ENSEMBLE_TOTAL_TIMEOUT_SECONDS)
+        self.release_after_each_backend = (not self.parallel) if release_after_each_backend is None else bool(release_after_each_backend)
         self.adapters: dict[str, BaseOCSRAdapter] = {}
         self.last_inference_time_ms: float | None = None
 
@@ -327,6 +329,18 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
         if backend not in self.adapters:
             self.adapters[backend] = self.adapter_factories[backend]()
         return self.adapters[backend]
+
+    def release_adapter(self, backend: str) -> None:
+        """Drop one cached child adapter reference after serial health probing."""
+        adapter = self.adapters.pop(backend, None)
+        close = getattr(adapter, "close", None)
+        if callable(close):
+            close()
+
+    def release_adapters(self) -> None:
+        """Drop all cached child adapter references."""
+        for backend in list(self.adapters):
+            self.release_adapter(backend)
 
     def _failure_result(self, backend: str, message: str, elapsed_ms: float | None = None) -> OCSRResult:
         return OCSRResult(
@@ -355,7 +369,11 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
             if self.total_timeout_seconds > 0 and time.perf_counter() - started > self.total_timeout_seconds:
                 results.append(self._failure_result(backend, "ensemble 总任务超时，未启动该后端。", 0.0))
                 continue
-            results.append(self._run_backend(backend, image_path_or_array))
+            try:
+                results.append(self._run_backend(backend, image_path_or_array))
+            finally:
+                if self.release_after_each_backend:
+                    self.release_adapter(backend)
         return results
 
     def _run_parallel(self, image_path_or_array: Any) -> list[OCSRResult]:
@@ -450,6 +468,7 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
             "reliability_weights": self.reliability_weights,
             "reliability_weights_policy": "experimental_not_used_for_final_decision",
             "parallel": self.parallel,
+            "release_after_each_backend": self.release_after_each_backend,
             "continue_on_error": self.continue_on_error,
             "total_timeout_seconds": self.total_timeout_seconds,
             "device": "mixed",

@@ -52,8 +52,16 @@ def test_batch_skip_button_matches_worker_behavior_and_autorefresh() -> None:
     source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "batch_page.py").read_text(encoding="utf-8")
     assert "跳过下一张未开始文件" in source
     assert "跳过当前文件" not in source
-    assert "def _auto_refresh_running_job" in source
-    assert "time.sleep(3)" in source
+    assert "time.sleep" not in source
+    assert '@st.fragment(run_every="3s")' in source
+    assert "def _render_live_job_status" in source
+    assert "RUNNING_BATCH_STATUSES" in source
+    fragment_body = source.split("def _render_live_job_status", 1)[1].split("def _is_running_batch_status", 1)[0]
+    assert "start_batch_job" not in fragment_body
+    assert "uploaded_files" not in fragment_body
+    assert "明确需要审核" in source
+    assert "人工审核总数" in source
+    assert "def _batch_status_counts" in source
 
 
 def test_history_delete_actions_distinguish_index_and_files() -> None:
@@ -61,7 +69,11 @@ def test_history_delete_actions_distinguish_index_and_files() -> None:
     assert "从历史中移除" in source
     assert "删除记录及本地文件" in source
     assert "确认删除本地文件" in source
+    assert "重试删除残留文件" in source
     assert "报告文件和运行目录已保留" in source
+    assert "artifact_status" in source
+    assert "disabled=not report_available" in source
+    assert "报告文件已过期" in source
 
 
 def test_review_queue_supports_return_revision_loop() -> None:
@@ -70,6 +82,8 @@ def test_review_queue_supports_return_revision_loop() -> None:
     assert "打开原报告" in source
     assert "修订 SMILES" in source
     assert "重新提交审核" in source
+    assert "disabled=reviewer_missing" in source
+    assert "revised_by" in source
     assert "revise_and_resubmit" in source
 
 

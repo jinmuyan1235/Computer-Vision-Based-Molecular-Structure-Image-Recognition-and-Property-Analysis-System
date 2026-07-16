@@ -13,7 +13,13 @@ from src.preprocess.user_adjustments import (
     save_user_adjusted_image,
 )
 from src.runtime.run_store import create_image_run_from_bytes
-from src.ui.image_editor import crop_bbox_from_points
+from src.ui.image_editor import (
+    _consume_crop_click_from_params,
+    _prepare_crop_state_context,
+    _prepare_crop_state_values,
+    crop_bbox_from_points,
+    image_identity_from_bytes,
+)
 from src.ui.image_page import _attach_user_preprocessing, _prepare_effective_input
 
 
@@ -56,6 +62,129 @@ def test_visual_crop_points_create_clamped_bbox() -> None:
     assert crop_bbox_from_points([(90, 70), (10, 20)], dimensions) == [10, 20, 90, 70]
     assert crop_bbox_from_points([(-10, 5), (150, 999)], dimensions) == [0, 5, 120, 80]
     assert crop_bbox_from_points([(20, 20), (20, 60)], dimensions) == []
+
+
+def test_same_size_different_image_resets_crop_state() -> None:
+    dimensions = {"width": 120, "height": 80}
+    first_identity = image_identity_from_bytes(b"first-image", dimensions)
+    second_identity = image_identity_from_bytes(b"second-image", dimensions)
+    default_bbox = [0, 0, 120, 80]
+    state = {
+        "editor_image_identity": first_identity,
+        "editor_crop_points": [(90, 70), (10, 20)],
+        "editor_x1": 10,
+        "editor_y1": 20,
+        "editor_x2": 90,
+        "editor_y2": 70,
+        "editor_last_crop_click_nonce": "old-click",
+    }
+    params = {
+        "crop_editor_key": "editor",
+        "crop_x": "90",
+        "crop_y": "70",
+        "crop_click_nonce": "old-click",
+        "unrelated": "keep-me",
+    }
+
+    reset = _prepare_crop_state_context(state, params, "editor", second_identity, default_bbox)
+
+    assert reset is True
+    assert state["editor_image_identity"] == second_identity
+    assert state["editor_crop_points"] == []
+    assert [state["editor_x1"], state["editor_y1"], state["editor_x2"], state["editor_y2"]] == default_bbox
+    assert "editor_last_crop_click_nonce" not in state
+    assert params == {"unrelated": "keep-me"}
+
+
+def test_same_image_rerun_keeps_crop_state() -> None:
+    dimensions = {"width": 120, "height": 80}
+    identity = image_identity_from_bytes(b"same-image", dimensions)
+    default_bbox = [0, 0, 120, 80]
+    state = {
+        "editor_image_identity": identity,
+        "editor_crop_points": [(10, 20), (90, 70)],
+        "editor_x1": 10,
+        "editor_y1": 20,
+        "editor_x2": 90,
+        "editor_y2": 70,
+        "editor_last_crop_click_nonce": "click-2",
+    }
+
+    reset = _prepare_crop_state_values(state, "editor", identity, default_bbox)
+
+    assert reset is False
+    assert state["editor_crop_points"] == [(10, 20), (90, 70)]
+    assert [state["editor_x1"], state["editor_y1"], state["editor_x2"], state["editor_y2"]] == [10, 20, 90, 70]
+    assert state["editor_last_crop_click_nonce"] == "click-2"
+
+
+def test_different_size_image_resets_crop_state() -> None:
+    first_identity = image_identity_from_bytes(b"image", {"width": 120, "height": 80})
+    second_identity = image_identity_from_bytes(b"image", {"width": 240, "height": 160})
+    default_bbox = [0, 0, 240, 160]
+    state = {
+        "editor_image_identity": first_identity,
+        "editor_crop_points": [(10, 20), (90, 70)],
+        "editor_x1": 10,
+        "editor_y1": 20,
+        "editor_x2": 90,
+        "editor_y2": 70,
+        "editor_last_crop_click_nonce": "click-2",
+    }
+
+    reset = _prepare_crop_state_values(state, "editor", second_identity, default_bbox)
+
+    assert reset is True
+    assert state["editor_crop_points"] == []
+    assert [state["editor_x1"], state["editor_y1"], state["editor_x2"], state["editor_y2"]] == default_bbox
+
+
+def test_invalid_crop_click_is_not_applied_and_query_params_are_cleared() -> None:
+    state = {
+        "editor_crop_points": [(10, 20)],
+        "editor_x1": 10,
+        "editor_y1": 20,
+        "editor_x2": 90,
+        "editor_y2": 70,
+    }
+    params = {
+        "crop_editor_key": "editor",
+        "crop_x": "not-a-number",
+        "crop_y": "70",
+        "crop_click_nonce": "bad-click",
+    }
+
+    applied = _consume_crop_click_from_params(state, params, "editor", {"width": 120, "height": 80})
+
+    assert applied is False
+    assert state["editor_crop_points"] == [(10, 20)]
+    assert [state["editor_x1"], state["editor_y1"], state["editor_x2"], state["editor_y2"]] == [10, 20, 90, 70]
+    assert params == {}
+
+
+def test_reversed_crop_clicks_generate_sorted_bbox_and_clear_query_params() -> None:
+    state: dict[str, object] = {"editor_crop_points": []}
+    dimensions = {"width": 120, "height": 80}
+    first_params = {
+        "crop_editor_key": "editor",
+        "crop_x": "90",
+        "crop_y": "70",
+        "crop_click_nonce": "click-1",
+    }
+    second_params = {
+        "crop_editor_key": "editor",
+        "crop_x": "10",
+        "crop_y": "20",
+        "crop_click_nonce": "click-2",
+    }
+
+    assert _consume_crop_click_from_params(state, first_params, "editor", dimensions) is True
+    assert first_params == {}
+    assert _consume_crop_click_from_params(state, second_params, "editor", dimensions) is True
+
+    assert second_params == {}
+    assert state["editor_crop_points"] == [(90, 70), (10, 20)]
+    assert [state["editor_x1"], state["editor_y1"], state["editor_x2"], state["editor_y2"]] == [10, 20, 90, 70]
 
 
 def test_apply_user_adjustments_outputs_requested_versions(tmp_path: Path) -> None:

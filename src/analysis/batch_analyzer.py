@@ -19,6 +19,17 @@ from src.utils.file_utils import ensure_directory, iter_image_files
 from .molecule_report import MoleculeReportGenerator
 
 
+BATCH_SUMMARY_SCHEMA_VERSION = 2
+BATCH_MAIN_CATEGORIES = (
+    "accepted",
+    "accepted_with_warning",
+    "review_needed",
+    "rejected",
+    "failed",
+    "skipped",
+)
+
+
 def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
     """Flatten a nested molecule report into one tabular row."""
     input_data = report.get("input") or {}
@@ -193,11 +204,16 @@ class BatchAnalyzer:
             "inchikey": {key: value for key, value in inchikey_counts.items() if value > 1},
             "standardized_smiles": {key: value for key, value in standardized_counts.items() if value > 1},
         }
-        accepted = sum(row.get("recognition_decision") == "accepted" for row in rows)
-        accepted_with_warning = sum(row.get("recognition_decision") == "accepted_with_warning" for row in rows)
-        review_needed = sum(row.get("recognition_decision") in {"review_needed", "accepted_with_warning"} for row in rows)
-        rejected = sum(row.get("recognition_decision") == "rejected" for row in rows)
+        category_counts = Counter(_batch_main_category(row) for row in rows)
+        accepted = category_counts["accepted"]
+        accepted_with_warning = category_counts["accepted_with_warning"]
+        review_needed = category_counts["review_needed"]
+        rejected = category_counts["rejected"]
+        failed = category_counts["failed"]
+        skipped = category_counts["skipped"]
+        manual_review_total = accepted_with_warning + review_needed
         return {
+            "summary_schema_version": BATCH_SUMMARY_SCHEMA_VERSION,
             "total": planned_total,
             "completed": completed,
             "successful": successful,
@@ -207,6 +223,7 @@ class BatchAnalyzer:
             "accepted_with_warning": accepted_with_warning,
             "review_needed": review_needed,
             "rejected": rejected,
+            "manual_review_total": manual_review_total,
             "valid_smiles": valid,
             "success_rate": round(successful / planned_total, 4) if planned_total else 0.0,
             "valid_rate": round(valid / planned_total, 4) if planned_total else 0.0,
@@ -300,3 +317,17 @@ class BatchAnalyzer:
             if font_path.is_file():
                 return ImageFont.truetype(str(font_path), size=size)
         return ImageFont.load_default()
+
+
+def _batch_main_category(row: dict[str, Any]) -> str:
+    status = str(row.get("status") or "").lower()
+    if status == "skipped":
+        return "skipped"
+    if status != "success":
+        return "failed"
+    decision = str(row.get("recognition_decision") or "").lower()
+    if decision in {"accepted", "accepted_with_warning", "review_needed", "rejected"}:
+        return decision
+    if row.get("manual_review_recommended"):
+        return "review_needed"
+    return "accepted"

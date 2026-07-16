@@ -44,7 +44,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-incomplete-metadata", action="store_true")
     parser.add_argument("--allow-failed-gates", action="store_true")
     parser.add_argument("--force", action="store_true", help="Allow writing into a non-empty release directory.")
+    parser.add_argument("--positive-sample-count-min", type=int, default=None)
+    parser.add_argument("--negative-sample-count-min", type=int, default=None)
+    parser.add_argument("--independent-source-document-count-min", type=int, default=None)
+    parser.add_argument("--unique-molecule-count-min", type=int, default=None)
+    parser.add_argument("--unique-scaffold-count-min", type=int, default=None)
+    parser.add_argument("--verified-sample-rate-min", type=float, default=None)
+    parser.add_argument("--missing-image-count-max", type=int, default=None)
+    parser.add_argument("--checksum-error-count-max", type=int, default=None)
     return parser.parse_args()
+
+
+def gate_thresholds_from_args(args: argparse.Namespace) -> dict[str, float]:
+    """Return only release gate threshold overrides explicitly supplied on the CLI."""
+    mapping = {
+        "positive_sample_count_min": args.positive_sample_count_min,
+        "negative_sample_count_min": args.negative_sample_count_min,
+        "independent_source_document_count_min": args.independent_source_document_count_min,
+        "unique_molecule_count_min": args.unique_molecule_count_min,
+        "unique_scaffold_count_min": args.unique_scaffold_count_min,
+        "verified_sample_rate_min": args.verified_sample_rate_min,
+        "missing_image_count_max": args.missing_image_count_max,
+        "checksum_error_count_max": args.checksum_error_count_max,
+    }
+    return {key: value for key, value in mapping.items() if value is not None}
 
 
 def run_release_acceptance(
@@ -60,6 +83,7 @@ def run_release_acceptance(
     limit: int | None = None,
     require_real_metadata: bool = True,
     force: bool = False,
+    gate_thresholds: dict[str, float] | None = None,
 ) -> dict:
     """Run all requested backends and write a fixed release report bundle."""
     release_dir = Path(output_root).expanduser().resolve() / release_version
@@ -84,7 +108,7 @@ def run_release_acceptance(
             continue_on_error=True,
         )
         result = evaluator.run(samples)
-        gates = evaluate_release_gates(result["metrics"])
+        gates = evaluate_release_gates(result["metrics"], thresholds=gate_thresholds)
         payload = {"metadata": result["metadata"], "metrics": result["metrics"], "gates": gates}
         backend_payloads[backend] = payload
         (release_dir / f"{backend}_metrics.json").write_text(
@@ -106,6 +130,7 @@ def run_release_acceptance(
         "standardization_profile": standardization_profile,
         "limit": limit,
         "require_real_metadata": require_real_metadata,
+        "gate_thresholds": gate_thresholds or {},
     }
     (release_dir / "release_config.json").write_text(json.dumps(config_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     write_release_report(release_dir / "report.md", release_version, backend_payloads, all_errors)
@@ -134,6 +159,7 @@ def main() -> int:
             limit=args.limit,
             require_real_metadata=not args.allow_incomplete_metadata,
             force=args.force,
+            gate_thresholds=gate_thresholds_from_args(args),
         )
     except ManifestValidationError as exc:
         print(str(exc), file=sys.stderr)

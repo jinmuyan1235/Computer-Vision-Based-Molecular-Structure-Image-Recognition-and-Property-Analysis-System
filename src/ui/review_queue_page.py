@@ -54,6 +54,8 @@ def render_review_queue_page() -> None:
 
 def _render_review_item(service: FeedbackReviewService, item: dict[str, Any], reviewer: str = "") -> None:
     analysis_id = str(item.get("analysis_id") or "analysis")
+    reviewer_name = reviewer.strip()
+    reviewer_missing = not reviewer_name
     title = f"{analysis_id} | {item.get('review_status') or '-'} | {item.get('correction_type') or '-'}"
     with st.expander(title, expanded=False):
         image_columns = st.columns(3)
@@ -104,29 +106,31 @@ def _render_review_item(service: FeedbackReviewService, item: dict[str, Any], re
             render_records(history, title_keys=("source", "operation"), summary_keys=("previous_smiles", "new_smiles", "created_at"))
 
         _render_original_report_preview(analysis_id)
-        _render_revision_form(service, item, reviewer)
+        _render_revision_form(service, item, reviewer_name)
 
         reviewer_notes = st.text_area("审核备注", value="", key=f"review_notes_{analysis_id}", height=70)
         duplicate_of = st.text_input("重复来源 analysis_id（标记重复时可填）", value=item.get("duplicate_of") or "", key=f"duplicate_of_{analysis_id}")
+        if reviewer_missing:
+            st.info("请先填写审核人，才能执行通过、退回、拒绝、重复或许可不明操作。")
         actions = st.columns(5)
-        if actions[0].button("通过并进入数据集", key=f"approve_{analysis_id}"):
-            service.approve_for_dataset(analysis_id, reviewer_notes, reviewer=reviewer)
+        if actions[0].button("通过并进入数据集", key=f"approve_{analysis_id}", disabled=reviewer_missing):
+            service.approve_for_dataset(analysis_id, reviewer_notes, reviewer=reviewer_name)
             st.success("已通过审核，样本将进入训练集导出。")
             st.rerun()
-        if actions[1].button("退回修改", key=f"return_{analysis_id}"):
-            service.return_for_revision(analysis_id, reviewer_notes, reviewer=reviewer)
+        if actions[1].button("退回修改", key=f"return_{analysis_id}", disabled=reviewer_missing):
+            service.return_for_revision(analysis_id, reviewer_notes, reviewer=reviewer_name)
             st.warning("已退回修改。")
             st.rerun()
-        if actions[2].button("拒绝样本", key=f"reject_{analysis_id}"):
-            service.reject_sample(analysis_id, reviewer_notes, reviewer=reviewer)
+        if actions[2].button("拒绝样本", key=f"reject_{analysis_id}", disabled=reviewer_missing):
+            service.reject_sample(analysis_id, reviewer_notes, reviewer=reviewer_name)
             st.warning("已拒绝样本。")
             st.rerun()
-        if actions[3].button("标记重复", key=f"duplicate_{analysis_id}"):
-            service.mark_duplicate(analysis_id, duplicate_of=duplicate_of, reviewer_notes=reviewer_notes, reviewer=reviewer)
+        if actions[3].button("标记重复", key=f"duplicate_{analysis_id}", disabled=reviewer_missing):
+            service.mark_duplicate(analysis_id, duplicate_of=duplicate_of, reviewer_notes=reviewer_notes, reviewer=reviewer_name)
             st.warning("已标记为重复样本。")
             st.rerun()
-        if actions[4].button("标记许可不明", key=f"license_{analysis_id}"):
-            service.mark_license_unclear(analysis_id, reviewer_notes, reviewer=reviewer)
+        if actions[4].button("标记许可不明", key=f"license_{analysis_id}", disabled=reviewer_missing):
+            service.mark_license_unclear(analysis_id, reviewer_notes, reviewer=reviewer_name)
             st.warning("已标记为许可不明。")
             st.rerun()
 
@@ -161,6 +165,8 @@ def _render_revision_form(service: FeedbackReviewService, item: dict[str, Any], 
     if item.get("review_status") != "returned":
         return
     analysis_id = str(item.get("analysis_id") or "analysis")
+    revised_by = reviewer.strip()
+    reviewer_missing = not revised_by
     st.subheader("退回修改")
     revised_smiles = st.text_input(
         "修订 SMILES",
@@ -168,12 +174,14 @@ def _render_revision_form(service: FeedbackReviewService, item: dict[str, Any], 
         key=f"review_revision_smiles_{analysis_id}",
     )
     revision_notes = st.text_area("修订说明", value="", key=f"review_revision_notes_{analysis_id}", height=70)
-    if st.button("重新提交审核", key=f"resubmit_review_{analysis_id}", type="primary"):
+    if reviewer_missing:
+        st.info("请先填写审核人，重新提交时会记录为 revised_by。")
+    if st.button("重新提交审核", key=f"resubmit_review_{analysis_id}", type="primary", disabled=reviewer_missing):
         try:
             result = service.revise_and_resubmit(
                 analysis_id,
                 revised_smiles,
-                revised_by=reviewer,
+                revised_by=revised_by,
                 notes=revision_notes,
             )
             st.success(f"已保存第 {result['revision']} 版修订，并重新提交审核。")
