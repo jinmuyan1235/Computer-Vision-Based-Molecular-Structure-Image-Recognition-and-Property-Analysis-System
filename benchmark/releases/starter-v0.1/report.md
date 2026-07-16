@@ -6,9 +6,9 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
 
 | Backend | Gates | Valid SMILES | Canonical exact | False accept | Negative hallucination | High-risk review | P50 ms | P95 ms |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| molscribe | FAIL | 0.9 | 0.9 | 0 | 0.5 | 1 | 9477.48 | 9762.74 |
-| decimer | FAIL | 1 | 0.5 | 0 | 1 | 1 | 34342.4 | 35054.7 |
-| ensemble | FAIL | 0.5 | 0.5 | 0 | 0.5 | 1 | 42587.1 | 43438.8 |
+| molscribe | FAIL | 0.9 | 0.9 | 0 | 0.5 | 1 | 9167.34 | 9308.17 |
+| decimer | FAIL | 1 | 0.5 | 0 | 1 | 1 | 32108.3 | 33302.5 |
+| ensemble | FAIL | 0.5 | 0.5 | 0 | 0.5 | 1 | 40972.9 | 41120.1 |
 
 ## Dataset Sufficiency
 
@@ -51,6 +51,7 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
     "unique_molecule_count_min": 100,
     "unique_scaffold_count_min": 50,
     "verified_sample_rate_min": 1.0,
+    "license_unclear_count_max": 0,
     "missing_image_count_max": 0,
     "checksum_error_count_max": 0
   },
@@ -91,7 +92,7 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
       "metric": "p95_latency_ms",
       "operator": "<=",
       "threshold": 15000.0,
-      "value": 9762.738,
+      "value": 9308.172,
       "denominator": null,
       "passed": true
     },
@@ -144,6 +145,14 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
       "passed": true
     },
     {
+      "metric": "license_unclear_count",
+      "operator": "<=",
+      "threshold": 0,
+      "value": 12.0,
+      "denominator": null,
+      "passed": false
+    },
+    {
       "metric": "missing_image_count",
       "operator": "<=",
       "threshold": 0,
@@ -185,7 +194,8 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
       "negative_sample_count",
       "independent_source_document_count",
       "unique_molecule_count",
-      "unique_scaffold_count"
+      "unique_scaffold_count",
+      "license_unclear_count"
     ]
   }
 }
@@ -208,6 +218,7 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
     "unique_molecule_count_min": 100,
     "unique_scaffold_count_min": 50,
     "verified_sample_rate_min": 1.0,
+    "license_unclear_count_max": 0,
     "missing_image_count_max": 0,
     "checksum_error_count_max": 0
   },
@@ -248,7 +259,7 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
       "metric": "p95_latency_ms",
       "operator": "<=",
       "threshold": 15000.0,
-      "value": 35054.701,
+      "value": 33302.465,
       "denominator": null,
       "passed": false
     },
@@ -301,6 +312,14 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
       "passed": true
     },
     {
+      "metric": "license_unclear_count",
+      "operator": "<=",
+      "threshold": 0,
+      "value": 12.0,
+      "denominator": null,
+      "passed": false
+    },
+    {
       "metric": "missing_image_count",
       "operator": "<=",
       "threshold": 0,
@@ -342,7 +361,8 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
       "negative_sample_count",
       "independent_source_document_count",
       "unique_molecule_count",
-      "unique_scaffold_count"
+      "unique_scaffold_count",
+      "license_unclear_count"
     ]
   }
 }
@@ -365,6 +385,7 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
     "unique_molecule_count_min": 100,
     "unique_scaffold_count_min": 50,
     "verified_sample_rate_min": 1.0,
+    "license_unclear_count_max": 0,
     "missing_image_count_max": 0,
     "checksum_error_count_max": 0
   },
@@ -405,7 +426,7 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
       "metric": "p95_latency_ms",
       "operator": "<=",
       "threshold": 15000.0,
-      "value": 43438.829,
+      "value": 41120.083,
       "denominator": null,
       "passed": false
     },
@@ -458,6 +479,14 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
       "passed": true
     },
     {
+      "metric": "license_unclear_count",
+      "operator": "<=",
+      "threshold": 0,
+      "value": 12.0,
+      "denominator": null,
+      "passed": false
+    },
+    {
       "metric": "missing_image_count",
       "operator": "<=",
       "threshold": 0,
@@ -499,7 +528,8 @@ This report is generated from a fixed, reviewed acceptance manifest. Starter smo
       "negative_sample_count",
       "independent_source_document_count",
       "unique_molecule_count",
-      "unique_scaffold_count"
+      "unique_scaffold_count",
+      "license_unclear_count"
     ]
   }
 }
