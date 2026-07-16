@@ -33,6 +33,19 @@ def test_app_mode_loads_demo_or_production(monkeypatch) -> None:
     assert config.load_settings().app_mode == "demo"
 
 
+def test_production_requires_calibrated_confidence_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("DECISION_REQUIRE_CALIBRATED_CONFIDENCE", raising=False)
+    monkeypatch.setenv("APP_MODE", "production")
+    assert config.load_settings().decision_require_calibrated_confidence is True
+
+    monkeypatch.setenv("APP_MODE", "demo")
+    assert config.load_settings().decision_require_calibrated_confidence is False
+
+    monkeypatch.setenv("APP_MODE", "production")
+    monkeypatch.setenv("DECISION_REQUIRE_CALIBRATED_CONFIDENCE", "false")
+    assert config.load_settings().decision_require_calibrated_confidence is False
+
+
 def test_default_fallback_image_strategy_order(monkeypatch) -> None:
     monkeypatch.delenv("OCSR_FALLBACK_IMAGE_STRATEGIES", raising=False)
     assert config.load_settings().ocsr_fallback_image_strategies == (

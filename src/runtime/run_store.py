@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -216,6 +217,10 @@ def report_output_dir(report: dict[str, Any], default: str | Path = config.OUTPU
 
 
 def mark_run_protected_from_report(report: dict[str, Any], reason: str = "feedback") -> None:
+    set_run_protection_from_report(report, protected=True, reason=reason)
+
+
+def set_run_protection_from_report(report: dict[str, Any], protected: bool, reason: str = "manual") -> None:
     run_data = report.get("run") or {}
     run_dir = run_data.get("run_dir")
     analysis_id = report.get("analysis_id") or run_data.get("analysis_id")
@@ -236,9 +241,54 @@ def mark_run_protected_from_report(report: dict[str, Any], reason: str = "feedba
             original_filename=str((report.get("input") or {}).get("filename") or input_path.name),
             image_sha256=image_sha,
         )
-        write_runtime_metadata(loaded, {"protected": True, "protected_reason": reason, "protected_at": utc_now_iso()})
+        set_run_protection(loaded, protected=protected, reason=reason)
     except Exception:
         return
+
+
+def set_run_protection(run: ImageRun, protected: bool, reason: str = "manual") -> dict[str, Any]:
+    """Add or remove one protection reason from a run's runtime metadata."""
+    existing: dict[str, Any] = {}
+    if run.runtime_path.is_file():
+        try:
+            existing = json.loads(run.runtime_path.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+    reasons = _protection_reasons(existing)
+    normalized_reason = (reason or "manual").strip() or "manual"
+    if protected:
+        if normalized_reason not in reasons:
+            reasons.append(normalized_reason)
+    else:
+        reasons = [item for item in reasons if item != normalized_reason]
+    updates: dict[str, Any] = {
+        "protected": bool(reasons),
+        "protected_reasons": reasons,
+        "protected_reason": ", ".join(reasons) if reasons else None,
+        "protection_updated_at": utc_now_iso(),
+    }
+    if protected:
+        updates["protected_at"] = existing.get("protected_at") or utc_now_iso()
+    else:
+        updates["unprotected_at"] = utc_now_iso()
+    return write_runtime_metadata(run, updates)
+
+
+def _protection_reasons(runtime: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    raw_reasons = runtime.get("protected_reasons")
+    if isinstance(raw_reasons, list):
+        reasons.extend(str(item).strip() for item in raw_reasons if str(item).strip())
+    legacy_reason = str(runtime.get("protected_reason") or "").strip()
+    if legacy_reason:
+        reasons.extend(item.strip() for item in legacy_reason.split(",") if item.strip())
+    if runtime.get("protected") and not reasons:
+        reasons.append("manual")
+    deduped: list[str] = []
+    for item in reasons:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
 
 
 def cleanup_runs(
@@ -282,6 +332,93 @@ def cleanup_runs(
         freed += size
         total_size -= size
     return {"deleted_count": deleted, "kept_count": len(runs) - deleted, "freed_bytes": freed}
+
+
+def cleanup_runs_if_due(
+    runs_root: str | Path = config.RUNS_DIR,
+    retention_days: int = config.RUN_RETENTION_DAYS,
+    max_storage_gb: float = config.RUN_MAX_STORAGE_GB,
+    state_path: str | Path | None = None,
+    interval_hours: int = 24,
+    force: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Run cleanup at most once per interval and persist a tiny status file."""
+    marker = Path(state_path or (config.DATA_DIR / "health" / "run_cleanup.json")).expanduser().resolve()
+    current = now or datetime.now(timezone.utc)
+    interval = timedelta(hours=max(1, int(interval_hours)))
+    previous = _read_cleanup_state(marker)
+    last_attempt = _parse_datetime(previous.get("completed_at") or previous.get("started_at"))
+    if not force and last_attempt and current - last_attempt < interval:
+        next_run_after = last_attempt + interval
+        return {
+            "status": "skipped",
+            "reason": "not_due",
+            "last_completed_at": previous.get("completed_at"),
+            "next_run_after": next_run_after.isoformat(),
+            "deleted_count": 0,
+            "kept_count": previous.get("kept_count", 0),
+            "freed_bytes": 0,
+            "state_path": str(marker),
+        }
+
+    started = time.perf_counter()
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "running",
+        "started_at": current.isoformat(),
+        "runs_root": str(Path(runs_root).expanduser().resolve()),
+        "retention_days": int(retention_days),
+        "max_storage_gb": float(max_storage_gb),
+        "interval_hours": int(interval_hours),
+    }
+    try:
+        result = cleanup_runs(runs_root, retention_days=retention_days, max_storage_gb=max_storage_gb)
+        payload.update(result)
+        payload["status"] = "completed"
+    except Exception as exc:
+        payload.update(
+            {
+                "status": "failed",
+                "exception": exc.__class__.__name__,
+                "error": str(exc),
+                "deleted_count": 0,
+                "kept_count": previous.get("kept_count", 0),
+                "freed_bytes": 0,
+            }
+        )
+    payload["completed_at"] = datetime.now(timezone.utc).isoformat()
+    payload["duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+    _write_cleanup_state(marker, payload)
+    payload["state_path"] = str(marker)
+    return payload
+
+
+def _read_cleanup_state(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_cleanup_state(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def image_run_to_dict(run: ImageRun) -> dict[str, Any]:

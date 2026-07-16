@@ -411,7 +411,7 @@ python -m streamlit run app.py
 | `DECISION_ACCEPT_THRESHOLD` | `0.85` | 已校准置信度达到该值时，单模型结果才可自动接受 |
 | `DECISION_REVIEW_THRESHOLD` | `0.65` | 已校准置信度低于该值时进入人工确认 |
 | `DECISION_MIN_IMAGE_QUALITY` | `0.55` | 图像质量分低于该值时进入人工确认或拒绝 |
-| `DECISION_REQUIRE_CALIBRATED_CONFIDENCE` | `false` | 为 `true` 时，未校准置信度的单模型结果不能自动接受 |
+| `DECISION_REQUIRE_CALIBRATED_CONFIDENCE` | demo: `false`; production: `true` | 为 `true` 时，未校准置信度的单模型结果不能自动接受 |
 
 默认 `original` 更贴近 MolScribe 官方模型输入预期；不要默认假设二值化图片一定更好。只有在实验需要时再切换 `grayscale`、`normalized` 或 `binary`。
 

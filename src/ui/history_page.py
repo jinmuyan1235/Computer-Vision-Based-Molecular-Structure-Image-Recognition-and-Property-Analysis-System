@@ -31,6 +31,9 @@ STATUS_OPTIONS = {
 def render_history_page(backend: str, show_preprocessing: bool, export_pdf: bool) -> None:
     """Render local analysis history search and actions."""
     page_intro("分析历史", "按文件名、SMILES、InChIKey 或分析 ID 搜索本地历史记录。")
+    delete_notice = st.session_state.pop("history_delete_notice", None)
+    if delete_notice:
+        st.success(delete_notice)
     repository = AnalysisRepository()
     controls = st.columns([0.46, 0.24, 0.15, 0.15])
     query = controls[0].text_input("搜索", value="", placeholder="文件名 / SMILES / InChIKey / analysis_id")
@@ -93,7 +96,7 @@ def _render_history_row(repository: AnalysisRepository, row: dict, backend: str)
             "report_path": row.get("report_path"),
         }
         st.json(fields)
-        actions = st.columns(6)
+        actions = st.columns(7)
         if actions[0].button("打开旧报告", key=f"history_open_{analysis_id}"):
             report = repository.load_report(analysis_id)
             if report:
@@ -109,13 +112,30 @@ def _render_history_row(repository: AnalysisRepository, row: dict, backend: str)
         if actions[3].button(favorite_label, key=f"history_fav_{analysis_id}"):
             repository.set_favorite(analysis_id, not bool(row.get("is_favorite")))
             st.rerun()
-        if actions[4].button("删除记录", key=f"history_delete_{analysis_id}"):
+        if actions[4].button("从历史中移除", key=f"history_remove_{analysis_id}"):
             repository.delete_analysis(analysis_id)
-            if (st.session_state.get("history_report") or {}).get("analysis_id") == analysis_id:
-                st.session_state.pop("history_report", None)
+            _clear_open_history_report(analysis_id)
+            st.session_state["history_delete_notice"] = "已从历史中移除；报告文件和运行目录已保留。"
             st.rerun()
-        if actions[5].button("复制 ID", key=f"history_copy_{analysis_id}"):
+        confirm_key = f"history_delete_files_confirm_{analysis_id}"
+        if actions[5].button("删除记录及本地文件", key=f"history_delete_files_{analysis_id}"):
+            st.session_state[confirm_key] = True
+        if actions[6].button("复制 ID", key=f"history_copy_{analysis_id}"):
             st.code(analysis_id, language=None)
+        if st.session_state.get(confirm_key):
+            st.warning("确认后会从历史中移除，并删除该分析拥有的运行目录或单报告文件；共享批量结果和外部原图不会删除。")
+            confirm_actions = st.columns([0.24, 0.16, 0.60])
+            if confirm_actions[0].button("确认删除本地文件", key=f"history_delete_files_yes_{analysis_id}", type="primary"):
+                result = repository.delete_analysis_and_files(analysis_id)
+                _clear_open_history_report(analysis_id)
+                st.session_state.pop(confirm_key, None)
+                deleted = len(result.get("deleted_paths") or [])
+                errors = len(result.get("errors") or [])
+                st.session_state["history_delete_notice"] = f"已删除历史索引和 {deleted} 个本地路径；失败 {errors} 个。"
+                st.rerun()
+            if confirm_actions[1].button("取消", key=f"history_delete_files_no_{analysis_id}"):
+                st.session_state.pop(confirm_key, None)
+                st.rerun()
 
 
 def _rerun_analysis(repository: AnalysisRepository, row: dict, backend: str) -> None:
@@ -145,6 +165,11 @@ def _reexport_analysis(repository: AnalysisRepository, analysis_id: str) -> None
         st.success(f"已重新导出：{exports['zip']}")
     except Exception as exc:
         st.warning(f"重新导出失败：{exc}")
+
+
+def _clear_open_history_report(analysis_id: str) -> None:
+    if (st.session_state.get("history_report") or {}).get("analysis_id") == analysis_id:
+        st.session_state.pop("history_report", None)
 
 
 def _reports_zip(repository: AnalysisRepository, rows: list[dict]) -> bytes:

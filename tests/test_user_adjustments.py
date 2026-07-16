@@ -13,6 +13,7 @@ from src.preprocess.user_adjustments import (
     save_user_adjusted_image,
 )
 from src.runtime.run_store import create_image_run_from_bytes
+from src.ui.image_editor import crop_bbox_from_points
 from src.ui.image_page import _attach_user_preprocessing, _prepare_effective_input
 
 
@@ -47,6 +48,14 @@ def test_normalize_user_adjustments_clamps_crop_and_values() -> None:
     assert normalized["contrast"] == 4
     assert normalized["output_stage"] == "original"
     assert has_user_adjustments(normalized) is True
+
+
+def test_visual_crop_points_create_clamped_bbox() -> None:
+    dimensions = {"width": 120, "height": 80}
+
+    assert crop_bbox_from_points([(90, 70), (10, 20)], dimensions) == [10, 20, 90, 70]
+    assert crop_bbox_from_points([(-10, 5), (150, 999)], dimensions) == [0, 5, 120, 80]
+    assert crop_bbox_from_points([(20, 20), (20, 60)], dimensions) == []
 
 
 def test_apply_user_adjustments_outputs_requested_versions(tmp_path: Path) -> None:

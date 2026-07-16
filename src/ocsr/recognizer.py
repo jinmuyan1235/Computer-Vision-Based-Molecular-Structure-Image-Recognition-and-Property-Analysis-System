@@ -33,7 +33,7 @@ class MoleculeRecognizer:
             raise ValueError(f"Unsupported OCSR backend: {self.backend}. Choose demo/molscribe/decimer/ensemble.")
         if config.APP_MODE == "production" and self.backend == "demo":
             raise ProductionModeError("APP_MODE=production 禁止使用 demo 图片识别后端；请配置 MolScribe/DECIMER。")
-        self.runtime_config = runtime_config or {}
+        self.runtime_config = _runtime_config_with_defaults(runtime_config)
         self.adapter = self._build_adapter()
 
     def _build_adapter(self) -> BaseOCSRAdapter:
@@ -69,3 +69,12 @@ class MoleculeRecognizer:
     def is_demo(self) -> bool:
         """Return whether the recognizer is using the demonstration backend."""
         return self.backend == "demo"
+
+
+def _runtime_config_with_defaults(runtime_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Use configured devices when non-UI entry points omit runtime_config."""
+    runtime = dict(runtime_config or {})
+    runtime.setdefault("molscribe_device", config.OCSR_DEVICE or "auto")
+    runtime.setdefault("decimer_device", config.DECIMER_DEVICE or "auto")
+    runtime.setdefault("visible_gpu_index", None)
+    return runtime

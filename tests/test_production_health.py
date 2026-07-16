@@ -37,27 +37,32 @@ def test_health_cache_reuses_successful_warmup(monkeypatch: pytest.MonkeyPatch, 
     _patch_health_paths(monkeypatch, tmp_path)
     warmup_image = tmp_path / "warmup.png"
     warmup_image.write_bytes(b"not-used-by-mock")
-    calls = {"warmup": 0}
+    calls = {"worker": 0}
 
-    monkeypatch.setattr(
-        health_module,
-        "_backend_status",
-        lambda backend, runtime_config, load_model: {
-            "backend": backend,
-            "available": True,
-            "message": "ok",
-            "package_installed": True,
-            "package_version": "test",
-            "model_loaded": bool(load_model),
-            "device": "cpu",
-        },
-    )
+    def fake_worker(*args, **kwargs):
+        calls["worker"] += 1
+        return {
+            "backend_status": {
+                "backend": "decimer",
+                "available": True,
+                "message": "ok",
+                "package_installed": True,
+                "package_version": "test",
+                "model_loaded": bool(kwargs.get("load_model")),
+                "device": "cpu",
+            },
+            "checks": [
+                {"name": "backend.available", "status": "pass", "message": "ok", "details": {"backend": "decimer"}},
+                {"name": "backend.package", "status": "pass", "message": "package ok", "details": {}},
+                {"name": "backend.model_file", "status": "skip", "message": "no explicit model", "details": {}},
+                {"name": "backend.model_load", "status": "pass", "message": "loaded", "details": {}},
+                {"name": "runtime.device", "status": "pass", "message": "cpu", "details": {}},
+                {"name": "warmup", "status": "pass", "message": "mock warm-up", "details": {"input": str(warmup_image)}},
+            ],
+            "worker": {"mock": True},
+        }
 
-    def fake_warmup(backend: str, runtime_config: dict, warmup_input: Path) -> dict:
-        calls["warmup"] += 1
-        return {"name": "warmup", "status": "pass", "message": "mock warm-up", "details": {"input": str(warmup_input)}}
-
-    monkeypatch.setattr(health_module, "_warmup_check", fake_warmup)
+    monkeypatch.setattr(health_module, "_run_heavy_health_worker", fake_worker)
 
     first = health_module.run_production_health_check(
         "decimer",
@@ -83,21 +88,32 @@ def test_health_cache_reuses_successful_warmup(monkeypatch: pytest.MonkeyPatch, 
     assert first["ready"] is True
     assert second["ready"] is True
     assert second["cached"] is True
-    assert calls["warmup"] == 1
+    assert calls["worker"] == 1
 
 
 def test_health_failure_disables_only_real_ocsr_workflows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _patch_health_paths(monkeypatch, tmp_path)
     monkeypatch.setattr(
         health_module,
-        "_backend_status",
-        lambda backend, runtime_config, load_model: {
-            "backend": backend,
-            "available": False,
-            "message": "missing model",
-            "package_installed": True,
-            "model_loaded": False,
-            "device": "cpu",
+        "_run_heavy_health_worker",
+        lambda *args, **kwargs: {
+            "backend_status": {
+                "backend": "molscribe",
+                "available": False,
+                "message": "missing model",
+                "package_installed": True,
+                "model_loaded": False,
+                "device": "cpu",
+            },
+            "checks": [
+                {"name": "backend.available", "status": "fail", "message": "missing model", "details": {"backend": "molscribe"}},
+                {"name": "backend.package", "status": "pass", "message": "package ok", "details": {}},
+                {"name": "backend.model_file", "status": "skip", "message": "no explicit model", "details": {}},
+                {"name": "backend.model_load", "status": "skip", "message": "not loaded", "details": {}},
+                {"name": "runtime.device", "status": "pass", "message": "cpu", "details": {}},
+                {"name": "warmup", "status": "skip", "message": "not enabled", "details": {}},
+            ],
+            "worker": {"mock": True},
         },
     )
 
@@ -115,3 +131,22 @@ def test_health_failure_disables_only_real_ocsr_workflows(monkeypatch: pytest.Mo
     assert result["capabilities"]["smiles_manual"] is True
     assert result["capabilities"]["history"] is True
     assert any(check["name"] == "backend.available" for check in result["checks"])
+
+
+def test_health_cache_key_uses_model_fingerprint_not_full_sha(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    model = tmp_path / "model.pth"
+    model.write_bytes(b"small model")
+    monkeypatch.setattr(health_module.config, "MOLSCRIBE_MODEL_PATH", model)
+
+    fingerprint = health_module._model_fingerprint_for_cache("molscribe")
+
+    assert fingerprint == {
+        "files": [
+            {
+                "path": str(model.resolve()),
+                "exists": True,
+                "size": model.stat().st_size,
+                "mtime_ns": model.stat().st_mtime_ns,
+            }
+        ]
+    }

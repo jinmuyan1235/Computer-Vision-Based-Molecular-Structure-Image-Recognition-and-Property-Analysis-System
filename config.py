@@ -161,10 +161,11 @@ def load_settings() -> Settings:
         "conservative",
     )
     compare_mode = _choice(_env_lower("CHEM_STANDARDIZATION_COMPARE_MODE", "raw"), {"raw", "standardized"}, "raw")
+    app_mode = _choice(_env_lower("APP_MODE", "demo"), {"demo", "production"}, "demo")
     supported_images = {".png", ".jpg", ".jpeg"}
     return Settings(
         project_root=PROJECT_ROOT,
-        app_mode=_choice(_env_lower("APP_MODE", "demo"), {"demo", "production"}, "demo"),  # type: ignore[arg-type]
+        app_mode=app_mode,  # type: ignore[arg-type]
         data_dir=data_dir,
         sample_dir=data_dir / "samples",
         batch_input_dir=data_dir / "batch_input",
@@ -219,7 +220,10 @@ def load_settings() -> Settings:
         decision_accept_threshold=_env_float("DECISION_ACCEPT_THRESHOLD", 0.85, minimum=0.0),
         decision_review_threshold=_env_float("DECISION_REVIEW_THRESHOLD", 0.65, minimum=0.0),
         decision_min_image_quality=_env_float("DECISION_MIN_IMAGE_QUALITY", 0.55, minimum=0.0),
-        decision_require_calibrated_confidence=_env_bool("DECISION_REQUIRE_CALIBRATED_CONFIDENCE", False),
+        decision_require_calibrated_confidence=_env_bool(
+            "DECISION_REQUIRE_CALIBRATED_CONFIDENCE",
+            app_mode == "production",
+        ),
         production_health_cache_enabled=_env_bool("PRODUCTION_HEALTH_CACHE_ENABLED", True),
         production_health_load_model=_env_bool("PRODUCTION_HEALTH_LOAD_MODEL", True),
         production_health_warmup=_env_bool("PRODUCTION_HEALTH_WARMUP", True),

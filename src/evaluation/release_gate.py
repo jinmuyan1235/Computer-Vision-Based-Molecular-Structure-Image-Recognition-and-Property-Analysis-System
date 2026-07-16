@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+from src.evaluation.metrics import is_automatic_accept
+
 
 DEFAULT_THRESHOLDS = {
     "valid_smiles_rate_min": 0.95,
@@ -63,9 +65,10 @@ def collect_release_error_rows(rows: Iterable[dict[str, Any]], backend: str) -> 
     errors: list[dict[str, Any]] = []
     for row in rows:
         expected_action = str(row.get("expected_action") or "recognize").lower()
-        false_accept = expected_action == "reject" and bool(row.get("recognition_success"))
+        negative_hallucination = expected_action == "reject" and bool(row.get("recognition_success"))
+        false_accept = negative_hallucination and is_automatic_accept(row)
         mismatch = expected_action != "reject" and not bool(row.get("canonical_exact_match"))
-        if row.get("failure_reason") or false_accept or mismatch:
+        if row.get("failure_reason") or negative_hallucination or mismatch:
             errors.append({
                 "backend": backend,
                 "sample_id": row.get("sample_id"),
@@ -78,7 +81,14 @@ def collect_release_error_rows(rows: Iterable[dict[str, Any]], backend: str) -> 
                 "recognition_status": row.get("recognition_status"),
                 "recognition_decision": row.get("recognition_decision"),
                 "canonical_exact_match": row.get("canonical_exact_match"),
-                "failure_reason": row.get("failure_reason") or ("false_accept" if false_accept else "mismatch"),
+                "failure_reason": row.get("failure_reason")
+                or (
+                    "false_accept"
+                    if false_accept
+                    else "negative_hallucination_review_required"
+                    if negative_hallucination
+                    else "mismatch"
+                ),
                 "inference_time_ms": row.get("inference_time_ms"),
             })
     return errors
@@ -129,8 +139,8 @@ def write_release_report(
         "",
         "## Gate Summary",
         "",
-        "| Backend | Gates | Valid SMILES | Canonical exact | False accept | High-risk review | P50 ms | P95 ms |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Backend | Gates | Valid SMILES | Canonical exact | False accept | Negative hallucination | High-risk review | P50 ms | P95 ms |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for backend, payload in backend_payloads.items():
         overall = _overall(payload["metrics"])
@@ -143,6 +153,7 @@ def write_release_report(
                 _fmt(overall.get("valid_smiles_rate")),
                 _fmt(overall.get("canonical_exact_match_rate")),
                 _fmt(overall.get("false_accept_rate")),
+                _fmt(overall.get("negative_hallucination_rate")),
                 _fmt(
                     1.0
                     if int(overall.get("high_risk_error_count") or 0) == 0

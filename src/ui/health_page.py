@@ -84,6 +84,7 @@ def render_health_page(health: Mapping[str, Any] | None) -> None:
         f"缓存：{'是' if health.get('cached') else '否'}；"
         f"生成时间：{health.get('created_at')}"
     )
+    _render_run_cleanup_summary(st.session_state.get("run_cleanup"))
 
     st.subheader("检查项")
     for check in health.get("checks") or []:
@@ -103,6 +104,9 @@ def render_health_page(health: Mapping[str, Any] | None) -> None:
                 "runtime_config": health.get("runtime_config"),
                 "model_path": health.get("model_path"),
                 "model_sha256": health.get("model_sha256"),
+                "model_fingerprint": health.get("model_fingerprint"),
+                "config_warnings": health.get("config_warnings"),
+                "worker": health.get("worker"),
                 "dependency_versions": health.get("dependency_versions"),
                 "git_commit": health.get("git_commit"),
                 "capabilities": health.get("capabilities"),
@@ -119,6 +123,24 @@ def _render_failed_checks(health: Mapping[str, Any]) -> None:
     st.subheader("失败项")
     for check in failed:
         st.write(f"- **{check.get('name')}**：{check.get('message')}")
+
+
+def _render_run_cleanup_summary(cleanup: Mapping[str, Any] | None) -> None:
+    if not cleanup:
+        return
+    status = str(cleanup.get("status") or "unknown")
+    if status == "completed":
+        message = (
+            f"运行目录自动清理已执行；删除 {cleanup.get('deleted_count', 0)} 个，"
+            f"释放 {cleanup.get('freed_bytes', 0)} 字节。"
+        )
+    elif status == "skipped":
+        message = f"运行目录自动清理未到期；下次最早执行时间：{cleanup.get('next_run_after') or '-'}。"
+    else:
+        message = f"运行目录自动清理状态：{status}。"
+    st.caption(message)
+    with st.expander("运行目录自动清理", expanded=False):
+        st.json(dict(cleanup))
 
 
 def _render_check(check: Mapping[str, Any]) -> None:

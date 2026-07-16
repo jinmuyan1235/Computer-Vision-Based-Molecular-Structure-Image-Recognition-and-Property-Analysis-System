@@ -26,6 +26,24 @@ def test_production_mode_blocks_demo_recognizer(monkeypatch) -> None:
         raise AssertionError("Expected demo backend to be blocked in production mode")
 
 
+def test_recognizer_uses_configured_molscribe_device_by_default(monkeypatch) -> None:
+    import config
+
+    monkeypatch.setattr(config, "OCSR_DEVICE", "cuda:0")
+    recognizer = MoleculeRecognizer("molscribe")
+    assert recognizer.adapter.device == "cuda:0"
+
+
+def test_recognizer_passes_default_devices_to_ensemble(monkeypatch) -> None:
+    import config
+
+    monkeypatch.setattr(config, "OCSR_DEVICE", "cuda:0")
+    monkeypatch.setattr(config, "DECIMER_DEVICE", "gpu")
+    recognizer = MoleculeRecognizer("ensemble")
+    assert recognizer.adapter.runtime_config["molscribe_device"] == "cuda:0"
+    assert recognizer.adapter.runtime_config["decimer_device"] == "gpu"
+
+
 def test_decimer_tuple_result_with_confidence(tmp_path: Path) -> None:
     image_path = tmp_path / "molecule.png"
     image_path.write_bytes(b"fake-image")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
@@ -11,10 +12,12 @@ from src.analysis.correction import apply_smiles_correction, save_correction_fee
 from src.analysis.molecule_report import MoleculeReportGenerator
 from src.runtime.run_store import (
     cleanup_runs,
+    cleanup_runs_if_due,
     create_image_run_from_bytes,
     report_output_dir,
     save_report_for_existing_run,
     save_run_report,
+    write_runtime_metadata,
 )
 
 
@@ -63,3 +66,44 @@ def test_uploaded_image_run_persists_original_report_and_feedback(tmp_path: Path
     cleanup = cleanup_runs(tmp_path / "runs", retention_days=1, max_storage_gb=0.000001)
     assert cleanup["deleted_count"] == 0
     assert image_run.input_path.is_file()
+
+
+def test_cleanup_runs_if_due_uses_interval_marker(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    state_path = tmp_path / "state" / "run_cleanup.json"
+    now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
+    old_created_at = (now - timedelta(days=5)).isoformat()
+
+    old_run = create_image_run_from_bytes(b"old-image", "old.png", runs_root=runs_root, analysis_id="old-run")
+    write_runtime_metadata(old_run, {"created_at": old_created_at})
+
+    first = cleanup_runs_if_due(
+        runs_root,
+        retention_days=1,
+        max_storage_gb=10,
+        state_path=state_path,
+        now=now,
+    )
+    assert first["status"] == "completed"
+    assert first["deleted_count"] == 1
+    assert not old_run.run_dir.exists()
+    assert state_path.is_file()
+
+    second_old_run = create_image_run_from_bytes(
+        b"another-old-image",
+        "old2.png",
+        runs_root=runs_root,
+        analysis_id="old-run-2",
+    )
+    write_runtime_metadata(second_old_run, {"created_at": old_created_at})
+
+    second = cleanup_runs_if_due(
+        runs_root,
+        retention_days=1,
+        max_storage_gb=10,
+        state_path=state_path,
+        now=now + timedelta(hours=1),
+    )
+    assert second["status"] == "skipped"
+    assert second["reason"] == "not_due"
+    assert second_old_run.run_dir.exists()

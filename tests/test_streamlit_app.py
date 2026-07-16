@@ -40,6 +40,47 @@ def test_streamlit_correction_widgets_are_present() -> None:
     assert "多后端候选与一致性" in source
 
 
+def test_candidate_and_strategy_updates_rerun_immediately() -> None:
+    source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "report_view.py").read_text(encoding="utf-8")
+    assert "def _apply_report_update_and_rerun" in source
+    assert "st.rerun()" in source
+    assert "user_selected_{backend}_candidate" in source
+    assert "strategy_selection" in source
+
+
+def test_batch_skip_button_matches_worker_behavior_and_autorefresh() -> None:
+    source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "batch_page.py").read_text(encoding="utf-8")
+    assert "跳过下一张未开始文件" in source
+    assert "跳过当前文件" not in source
+    assert "def _auto_refresh_running_job" in source
+    assert "time.sleep(3)" in source
+
+
+def test_history_delete_actions_distinguish_index_and_files() -> None:
+    source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "history_page.py").read_text(encoding="utf-8")
+    assert "从历史中移除" in source
+    assert "删除记录及本地文件" in source
+    assert "确认删除本地文件" in source
+    assert "报告文件和运行目录已保留" in source
+
+
+def test_review_queue_supports_return_revision_loop() -> None:
+    source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "review_queue_page.py").read_text(encoding="utf-8")
+    assert "审核人" in source
+    assert "打开原报告" in source
+    assert "修订 SMILES" in source
+    assert "重新提交审核" in source
+    assert "revise_and_resubmit" in source
+
+
+def test_image_editor_supports_visual_two_point_crop() -> None:
+    source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "image_editor.py").read_text(encoding="utf-8")
+    assert "components.html" in source
+    assert "crop_editor_key" in source
+    assert "点击两个角点" in source
+    assert "crop_bbox_from_points" in source
+
+
 def test_document_page_uses_chinese_mode_labels() -> None:
     source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "document_page.py").read_text(encoding="utf-8")
     assert "仅检测分子区域（速度快，不执行结构识别）" in source

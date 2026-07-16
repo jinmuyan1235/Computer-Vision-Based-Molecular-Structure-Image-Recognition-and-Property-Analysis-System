@@ -134,7 +134,7 @@ class BatchAnalyzer:
                 self._emit_progress(progress_callback, "cancelling", image_files, reports, current_file=image_path.name, current_index=index)
                 break
             if skip_requested is not None and skip_requested(image_path):
-                reports.append(self._skipped_report(image_path, "用户跳过当前文件。"))
+                reports.append(self._skipped_report(image_path, "用户请求跳过该未开始文件。"))
                 self._emit_progress(progress_callback, "running", image_files, reports, current_file=image_path.name, current_index=index)
                 continue
             self._emit_progress(progress_callback, "running", image_files, reports, current_file=image_path.name, current_index=index)
@@ -193,8 +193,9 @@ class BatchAnalyzer:
             "inchikey": {key: value for key, value in inchikey_counts.items() if value > 1},
             "standardized_smiles": {key: value for key, value in standardized_counts.items() if value > 1},
         }
-        review_needed = sum(row.get("recognition_decision") == "review_needed" for row in rows)
-        accepted = sum(row.get("recognition_decision") in {"accepted", "accepted_with_warning"} for row in rows)
+        accepted = sum(row.get("recognition_decision") == "accepted" for row in rows)
+        accepted_with_warning = sum(row.get("recognition_decision") == "accepted_with_warning" for row in rows)
+        review_needed = sum(row.get("recognition_decision") in {"review_needed", "accepted_with_warning"} for row in rows)
         rejected = sum(row.get("recognition_decision") == "rejected" for row in rows)
         return {
             "total": planned_total,
@@ -203,6 +204,7 @@ class BatchAnalyzer:
             "failed": failed,
             "skipped": skipped,
             "accepted": accepted,
+            "accepted_with_warning": accepted_with_warning,
             "review_needed": review_needed,
             "rejected": rejected,
             "valid_smiles": valid,

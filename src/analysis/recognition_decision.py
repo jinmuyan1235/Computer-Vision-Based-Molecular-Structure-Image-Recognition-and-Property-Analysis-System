@@ -11,9 +11,6 @@ RecognitionDecision = Literal["accepted", "accepted_with_warning", "review_neede
 RiskLevel = Literal["low", "medium", "high"]
 
 
-ACCEPTED_DECISIONS = {"accepted", "accepted_with_warning"}
-
-
 def _confidence_value(ocsr: dict[str, Any]) -> tuple[float | None, bool]:
     calibrated = ocsr.get("calibrated_confidence")
     if calibrated is not None:
@@ -212,7 +209,17 @@ def _decision_from_consensus(
             quality_score,
             "多个真实后端返回同一标准化分子，可低风险接受。",
         )
-    if decision in ACCEPTED_DECISIONS:
+    if decision == "accepted_with_warning" and config.DECISION_REQUIRE_CALIBRATED_CONFIDENCE:
+        return _decision_payload(
+            "review_needed",
+            "medium",
+            sorted(set(reasons + ["calibrated_confidence_missing", "single_backend_only"])),
+            True,
+            calibrated_confidence,
+            quality_score,
+            "只有一个有效候选且缺少已校准置信度，生产模式下需要人工确认。",
+        )
+    if decision in {"accepted", "accepted_with_warning"}:
         return _decision_payload(
             "accepted_with_warning",
             "medium",

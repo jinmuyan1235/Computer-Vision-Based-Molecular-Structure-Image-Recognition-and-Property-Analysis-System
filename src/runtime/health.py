@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -12,12 +14,9 @@ from typing import Any, Mapping
 import config
 from src.chem.smiles_validator import validate_smiles
 from src.export.structure_exporter import mol_text, sdf_text
-from src.ocsr.decimer_adapter import DECIMERAdapter
-from src.ocsr.ensemble import EnsembleOCSRAdapter
-from src.ocsr.molscribe_adapter import MolScribeAdapter
-from src.ocsr.recognizer import MoleculeRecognizer
 from src.runtime.gpu_manager import environment_status
-from src.runtime.metadata import dependency_versions, git_commit, sha256_file
+from src.runtime.job_manager import run_json_command
+from src.runtime.metadata import dependency_versions, git_commit
 from src.utils.file_utils import ensure_directory
 
 
@@ -25,6 +24,7 @@ CHECK_PASS = "pass"
 CHECK_WARN = "warn"
 CHECK_FAIL = "fail"
 CHECK_SKIP = "skip"
+HEALTH_WORKER_RESULT_MARKER = "HEALTH_WORKER_RESULT_JSON="
 
 
 def run_production_health_check(
@@ -49,14 +49,11 @@ def run_production_health_check(
     ttl = config.PRODUCTION_HEALTH_CACHE_TTL_SECONDS if cache_ttl_seconds is None else int(cache_ttl_seconds)
     warmup_path = Path(warmup_input or config.PRODUCTION_HEALTH_WARMUP_INPUT).expanduser().resolve()
 
-    shallow_status = _backend_status(selected_backend, runtime, load_model=False)
-    model_path = _primary_model_path(shallow_status)
-    model_sha = sha256_file(model_path) if model_path else None
+    model_fingerprint = _model_fingerprint_for_cache(selected_backend)
     cache_key = _cache_key(
         selected_backend,
         runtime,
-        model_path,
-        model_sha,
+        model_fingerprint,
         should_load_model,
         should_warmup,
         warmup_path,
@@ -70,18 +67,23 @@ def run_production_health_check(
     started = time.perf_counter()
     checks: list[dict[str, Any]] = []
     checks.append(_rdkit_check())
+    checks.append(_settings_warnings_check())
     checks.extend(_writable_directory_checks())
     checks.append(_structure_export_check())
 
-    backend_status = shallow_status
-    if should_load_model:
-        backend_status = _backend_status(selected_backend, runtime, load_model=True)
-    checks.extend(_backend_checks(selected_backend, backend_status, is_production))
-
-    if should_warmup:
-        checks.append(_warmup_check(selected_backend, runtime, warmup_path))
-    else:
-        checks.append(_check("warmup", CHECK_SKIP, "Warm-up 未启用，本次未执行真实模型推理。"))
+    heavy = _run_backend_health(
+        selected_backend,
+        runtime,
+        production=is_production,
+        load_model=should_load_model,
+        warmup=should_warmup,
+        warmup_path=warmup_path,
+    )
+    checks.extend(heavy.get("checks") or [])
+    backend_status = heavy.get("backend_status") or {}
+    worker = heavy.get("worker") or {}
+    model_path = _primary_model_path(backend_status)
+    model_sha = _model_sha_from_status(backend_status)
 
     failures = [check for check in checks if check["status"] == CHECK_FAIL]
     warnings = [check for check in checks if check["status"] == CHECK_WARN]
@@ -112,6 +114,9 @@ def run_production_health_check(
         "backend_status": backend_status,
         "model_path": str(model_path) if model_path else None,
         "model_sha256": model_sha,
+        "model_fingerprint": model_fingerprint,
+        "worker": worker,
+        "config_warnings": [check["message"] for check in checks if check.get("name") == "config.settings" and check.get("status") == CHECK_WARN],
         "dependency_versions": dependency_versions(),
         "git_commit": git_commit(),
         "repair_suggestions": _repair_suggestions(selected_backend, checks, is_production),
@@ -147,20 +152,34 @@ def health_summary(health: Mapping[str, Any]) -> dict[str, Any]:
 
 def _backend_status(backend: str, runtime_config: Mapping[str, Any], load_model: bool) -> dict[str, Any]:
     try:
+        if backend == "demo":
+            from src.ocsr.demo_adapter import DemoOCSRAdapter
+
+            status = DemoOCSRAdapter().status()
+            status.update({"package_installed": True, "package_version": "built-in", "model_loaded": True, "device": "cpu"})
+            return status
         if backend == "molscribe":
+            from src.ocsr.molscribe_adapter import MolScribeAdapter
+
             adapter = MolScribeAdapter(device=runtime_config.get("molscribe_device"))
             return adapter.diagnose(load_model=load_model)
         if backend == "decimer":
+            from src.ocsr.decimer_adapter import DECIMERAdapter
+
             adapter = DECIMERAdapter(
                 device=runtime_config.get("decimer_device"),
                 visible_gpu_index=runtime_config.get("visible_gpu_index"),
             )
             return adapter.diagnose(load_model=load_model)
         if backend == "ensemble":
+            from src.ocsr.ensemble import EnsembleOCSRAdapter
+
             adapter = EnsembleOCSRAdapter(runtime_config=runtime_config)
             status = adapter.status()
             status["load_model_requested"] = bool(load_model)
             return status
+        from src.ocsr.recognizer import MoleculeRecognizer
+
         recognizer = MoleculeRecognizer(backend, runtime_config=dict(runtime_config))
         return recognizer.status()
     except Exception as exc:
@@ -197,7 +216,11 @@ def _backend_checks(backend: str, status: Mapping[str, Any], production: bool) -
                 "backend.model_file",
                 CHECK_PASS if exists else CHECK_FAIL,
                 f"模型文件存在：{model_path}" if exists else f"模型文件不存在：{model_path}",
-                {"model_path": str(model_path), "model_sha256": sha256_file(model_path) if exists else None},
+                {
+                    "model_path": str(model_path),
+                    "model_sha256": status.get("model_sha256"),
+                    "model_fingerprint": _path_fingerprint(model_path) if exists else None,
+                },
             )
         )
     elif backend in {"decimer", "demo", "ensemble"}:
@@ -263,6 +286,13 @@ def _rdkit_check() -> dict[str, Any]:
         return _check("rdkit", CHECK_FAIL, f"RDKit 自检失败：{exc}")
 
 
+def _settings_warnings_check() -> dict[str, Any]:
+    warnings = config.validate_settings(config.SETTINGS)
+    if warnings:
+        return _check("config.settings", CHECK_WARN, "；".join(warnings), {"warnings": warnings})
+    return _check("config.settings", CHECK_PASS, "配置未发现非致命告警。")
+
+
 def _writable_directory_checks() -> list[dict[str, Any]]:
     return [
         _writable_directory_check("output_dir", config.OUTPUT_DIR),
@@ -309,6 +339,8 @@ def _warmup_check(backend: str, runtime_config: Mapping[str, Any], warmup_input:
         return _check("warmup", CHECK_FAIL, f"Warm-up 图片不存在：{warmup_input}", {"input": str(warmup_input)})
     started = time.perf_counter()
     try:
+        from src.ocsr.recognizer import MoleculeRecognizer
+
         result = MoleculeRecognizer(backend, runtime_config=dict(runtime_config)).recognize(warmup_input)
         validation = validate_smiles(result.smiles)
         ok = result.status == "success" and bool(validation.get("valid"))
@@ -345,11 +377,157 @@ def _primary_model_path(status: Mapping[str, Any]) -> Path | None:
     return None
 
 
+def _model_sha_from_status(status: Mapping[str, Any]) -> str | None:
+    value = status.get("model_sha256")
+    if value:
+        return str(value)
+    for child in status.get("child_statuses") or []:
+        if isinstance(child, Mapping) and child.get("model_sha256"):
+            return str(child["model_sha256"])
+    return None
+
+
+def _model_fingerprint_for_cache(backend: str) -> dict[str, Any] | None:
+    paths: list[Path] = []
+    if backend in {"molscribe", "ensemble"}:
+        paths.append(Path(config.MOLSCRIBE_MODEL_PATH).expanduser().resolve())
+    fingerprints = [_path_fingerprint(path) for path in paths]
+    fingerprints = [item for item in fingerprints if item is not None]
+    if not fingerprints:
+        return None
+    return {"files": fingerprints}
+
+
+def _path_fingerprint(path: Path) -> dict[str, Any] | None:
+    try:
+        stat = path.expanduser().resolve().stat()
+    except OSError:
+        return {"path": str(path.expanduser().resolve()), "exists": False}
+    return {
+        "path": str(path.expanduser().resolve()),
+        "exists": True,
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def run_heavy_health_checks(
+    backend: str,
+    runtime_config: Mapping[str, Any] | None = None,
+    *,
+    production: bool = False,
+    load_model: bool = False,
+    warmup: bool = False,
+    warmup_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Run backend diagnostics that may import or load model frameworks."""
+    started = time.perf_counter()
+    runtime = dict(runtime_config or {})
+    checks: list[dict[str, Any]] = []
+    backend_status = _backend_status(backend, runtime, load_model=load_model)
+    checks.extend(_backend_checks(backend, backend_status, production))
+    if warmup:
+        checks.append(_warmup_check(backend, runtime, Path(warmup_path or config.PRODUCTION_HEALTH_WARMUP_INPUT).expanduser().resolve()))
+    else:
+        checks.append(_check("warmup", CHECK_SKIP, "Warm-up 未启用，本次未执行真实模型推理。"))
+    return {
+        "backend_status": backend_status,
+        "checks": checks,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+    }
+
+
+def _run_backend_health(
+    backend: str,
+    runtime_config: Mapping[str, Any],
+    *,
+    production: bool,
+    load_model: bool,
+    warmup: bool,
+    warmup_path: Path,
+) -> dict[str, Any]:
+    if backend == "demo":
+        return run_heavy_health_checks(
+            backend,
+            runtime_config,
+            production=production,
+            load_model=False,
+            warmup=False,
+            warmup_path=warmup_path,
+        )
+    return _run_heavy_health_worker(
+        backend,
+        runtime_config,
+        production=production,
+        load_model=load_model,
+        warmup=warmup,
+        warmup_path=warmup_path,
+    )
+
+
+def _run_heavy_health_worker(
+    backend: str,
+    runtime_config: Mapping[str, Any],
+    *,
+    production: bool,
+    load_model: bool,
+    warmup: bool,
+    warmup_path: Path,
+) -> dict[str, Any]:
+    command = [
+        sys.executable,
+        "-m",
+        "src.runtime.health_worker",
+        "--backend",
+        backend,
+        "--runtime-json",
+        json.dumps(dict(runtime_config), ensure_ascii=False),
+        "--warmup-input",
+        str(warmup_path),
+    ]
+    if production:
+        command.append("--production")
+    if load_model:
+        command.append("--load-model")
+    if warmup:
+        command.append("--warmup")
+    env = os.environ.copy()
+    env.setdefault("MOLSCRIBE_ISOLATED_SUBPROCESS", "true")
+    env.setdefault("DECIMER_ISOLATED_SUBPROCESS", "true")
+    timeout = max(
+        120.0,
+        float(config.OCSR_TIMEOUT_SECONDS) + 120.0,
+        float(config.OCSR_ENSEMBLE_TOTAL_TIMEOUT_SECONDS) + 120.0,
+    )
+    result = run_json_command(
+        command,
+        cwd=config.PROJECT_ROOT,
+        env=env,
+        timeout=timeout,
+        marker=HEALTH_WORKER_RESULT_MARKER,
+    )
+    worker = {
+        "command": command,
+        "returncode": result.returncode,
+        "timed_out": result.timed_out,
+        "elapsed_ms": result.elapsed_ms,
+        "stderr_tail": result.stderr.strip().splitlines()[-5:],
+    }
+    if result.payload and isinstance(result.payload, dict):
+        result.payload["worker"] = worker
+        return result.payload
+    message = "健康检查子进程超时，已终止进程树。" if result.timed_out else (result.last_output_line() or "健康检查子进程未返回 JSON。")
+    return {
+        "backend_status": {"backend": backend, "available": False, "message": message},
+        "checks": [_check("backend.worker", CHECK_FAIL, message, worker)],
+        "worker": worker,
+    }
+
+
 def _cache_key(
     backend: str,
     runtime_config: Mapping[str, Any],
-    model_path: Path | None,
-    model_sha: str | None,
+    model_fingerprint: Mapping[str, Any] | None,
     load_model: bool,
     warmup: bool,
     warmup_path: Path,
@@ -357,12 +535,12 @@ def _cache_key(
     payload = {
         "backend": backend,
         "runtime_config": dict(sorted((str(key), value) for key, value in runtime_config.items())),
-        "model_path": str(model_path) if model_path else None,
-        "model_sha256": model_sha,
+        "model_fingerprint": model_fingerprint,
         "dependency_versions": dependency_versions(),
         "load_model": load_model,
         "warmup": warmup,
         "warmup_path": str(warmup_path),
+        "warmup_input_fingerprint": _path_fingerprint(warmup_path),
         "app_mode": config.APP_MODE,
         "git_commit": git_commit(),
     }
