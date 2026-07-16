@@ -14,7 +14,7 @@ from src.evaluation.dataset import ManifestValidationError, load_manifest
 from src.evaluation.evaluator import OCSREvaluator
 from src.evaluation.metrics import compute_metrics, enrich_prediction, tanimoto_similarity
 from src.evaluation.release_compare import compare_release_dirs, write_comparison_report
-from src.evaluation.release_gate import evaluate_release_gates
+from src.evaluation.release_gate import collect_release_error_rows, evaluate_release_gates
 from src.evaluation.report_writer import create_run_directory, write_report_bundle
 from src.ocsr.base import BaseOCSRAdapter, OCSRResult
 from src.ocsr.recognizer import MoleculeRecognizer
@@ -396,6 +396,58 @@ def test_metrics_grouping_and_latency_statistics() -> None:
     assert metrics["overall"]["median_latency_ms"] == 20.0
     assert "clean" in metrics["groups"]["category"]
     assert "unknown" in metrics["groups"]["image_quality"]
+
+
+def test_rejection_metrics_distinguish_reviewed_hallucination_from_false_accept() -> None:
+    rows = [
+        enrich_prediction({
+            "sample_id": "document_context_recognize",
+            "expected_action": "recognize",
+            "ground_truth_smiles": "CCO",
+            "predicted_smiles": "CCO",
+            "recognition_success": True,
+            "recognition_decision": "accepted",
+            "manual_review_recommended": False,
+            "structure_features": "document_text",
+            "category": "real_document_full_crop",
+            "backend": "fake",
+            "preprocessing_strategy": "original",
+        }, 0.95),
+        enrich_prediction({
+            "sample_id": "negative_reviewed",
+            "expected_action": "reject",
+            "ground_truth_smiles": "",
+            "predicted_smiles": "CCO",
+            "recognition_success": True,
+            "recognition_decision": "accepted_with_warning",
+            "manual_review_recommended": True,
+            "category": "text_only_negative",
+            "backend": "fake",
+            "preprocessing_strategy": "original",
+        }, 0.95),
+        enrich_prediction({
+            "sample_id": "negative_auto_accepted",
+            "expected_action": "reject",
+            "ground_truth_smiles": "",
+            "predicted_smiles": "CCN",
+            "recognition_success": True,
+            "recognition_decision": "accepted",
+            "manual_review_recommended": False,
+            "category": "text_only_negative",
+            "backend": "fake",
+            "preprocessing_strategy": "original",
+        }, 0.95),
+    ]
+    metrics = compute_metrics(rows)["overall"]
+    assert metrics["rejection_target_count"] == 2
+    assert metrics["negative_hallucination_count"] == 2
+    assert metrics["false_accept_count"] == 1
+    assert metrics["false_accept_rate"] == 0.5
+
+    errors = collect_release_error_rows(rows, "fake")
+    reasons = {row["sample_id"]: row["failure_reason"] for row in errors}
+    assert reasons["negative_reviewed"] == "negative_hallucination_review_required"
+    assert reasons["negative_auto_accepted"] == "false_accept"
 
 
 def test_run_directories_do_not_overwrite_and_report_bundle(tmp_path: Path) -> None:

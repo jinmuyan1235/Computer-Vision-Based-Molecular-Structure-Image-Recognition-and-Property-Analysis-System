@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 from PIL import Image
 
+from src.chem.standardization import standardize_smiles
 from src.chem.smiles_validator import validate_smiles
 from src.export.json_exporter import save_json
 from src.runtime.run_store import mark_run_protected_from_report
@@ -46,6 +47,11 @@ FEEDBACK_MANIFEST_FIELDS = [
     "source_license",
     "privacy_notes",
     "notes",
+    "reviewer",
+    "reviewed_at",
+    "revision",
+    "revised_by",
+    "revised_at",
 ]
 
 EXPORT_MANIFEST_FIELDS = [
@@ -211,6 +217,11 @@ def _annotation_payload(
             "source_license": source_license,
             "privacy_notes": privacy_notes,
             "notes": notes,
+            "reviewer": "",
+            "reviewed_at": None,
+            "revision": 1,
+            "revised_by": "",
+            "revised_at": None,
         },
     }
     return annotation
@@ -245,6 +256,11 @@ def _manifest_row(annotation: dict[str, Any], feedback_root: Path, annotation_pa
         "source_license": feedback.get("source_license"),
         "privacy_notes": feedback.get("privacy_notes"),
         "notes": feedback.get("notes"),
+        "reviewer": feedback.get("reviewer"),
+        "reviewed_at": feedback.get("reviewed_at"),
+        "revision": feedback.get("revision") or 1,
+        "revised_by": feedback.get("revised_by"),
+        "revised_at": feedback.get("revised_at"),
     }
 
 
@@ -340,6 +356,7 @@ def update_feedback_review(
     feedback_action: str | None = None,
     include_in_training: bool | None = None,
     reviewer_notes: str = "",
+    reviewer: str = "",
     duplicate_of: str | None = None,
     source_license: str | None = None,
 ) -> dict[str, Any]:
@@ -364,6 +381,8 @@ def update_feedback_review(
     feedback["feedback_action"] = feedback_action or feedback.get("feedback_action") or "correction_only"
     feedback["include_in_training"] = bool(include_in_training)
     feedback["reviewed_at"] = _utc_now_iso()
+    feedback["reviewer"] = reviewer.strip() if reviewer.strip() else feedback.get("reviewer", "")
+    feedback.setdefault("revision", 1)
     if reviewer_notes:
         feedback["reviewer_notes"] = reviewer_notes
     if duplicate_of is not None:
@@ -383,9 +402,129 @@ def update_feedback_review(
         "review_status": review_status,
         "feedback_action": manifest_row.get("feedback_action"),
         "include_in_training": bool(manifest_row.get("include_in_training")),
+        "reviewer": manifest_row.get("reviewer"),
+        "reviewed_at": manifest_row.get("reviewed_at"),
+        "revision": int(manifest_row.get("revision") or 1),
         "annotation_path": str(annotation_path.resolve()),
         "manifest_path": str(manifest_path.resolve()),
     }
+
+
+def revise_feedback_correction(
+    feedback_root: str | Path,
+    analysis_id: str,
+    corrected_smiles: str,
+    revised_by: str = "",
+    notes: str = "",
+) -> dict[str, Any]:
+    """Save a returned item as a new pending correction revision."""
+    root = Path(feedback_root).expanduser().resolve()
+    manifest_path = root / "manifest.csv"
+    rows = _read_csv(manifest_path)
+    target = next((row for row in rows if row.get("analysis_id") == analysis_id), None)
+    if target is None:
+        raise FileNotFoundError(f"未找到待修订反馈：{analysis_id}")
+    annotation = _load_annotation(root, target)
+    if annotation is None:
+        raise FileNotFoundError(f"无法读取反馈标注：{target.get('annotation_path')}")
+
+    attempted = (corrected_smiles or "").strip()
+    validation = validate_smiles(attempted)
+    if not validation["valid"]:
+        raise ValueError(str(validation.get("error") or "SMILES 无效"))
+
+    now = _utc_now_iso()
+    feedback = annotation.setdefault("feedback", {})
+    correction = annotation.setdefault("correction", {})
+    previous_revision = _revision_number(feedback.get("revision"))
+    revision = previous_revision + 1
+    annotation.setdefault("revision_history", []).append({
+        "revision": previous_revision,
+        "saved_at": now,
+        "correction": dict(correction),
+        "feedback": dict(feedback),
+    })
+
+    standardized = standardize_smiles(attempted)
+    identity = standardized.get("chemical_identity") or {}
+    canonical = identity.get("canonical_smiles") or validation.get("canonical_smiles")
+    standardized_smiles = identity.get("standardized_smiles") or canonical
+    previous_smiles = correction.get("corrected_smiles")
+    correction.update({
+        "applied": True,
+        "corrected_smiles": attempted,
+        "corrected_canonical_smiles": canonical,
+        "corrected_standardized_smiles": standardized_smiles,
+        "corrected_at": now,
+        "source": "review_revision",
+        "last_error": None,
+    })
+    annotation["final"] = {
+        "smiles": standardized_smiles,
+        "raw_smiles": attempted,
+        "canonical_smiles": canonical,
+        "standardized_smiles": standardized_smiles,
+        "source": "review_revision",
+    }
+    annotation.setdefault("images", {})["corrected_molecule"] = _draw_revision_structure(root, analysis_id, revision, standardized_smiles)
+    annotation.setdefault("history", []).append({
+        "source": "review_queue",
+        "operation": "revise_and_resubmit",
+        "previous_smiles": previous_smiles,
+        "new_smiles": attempted,
+        "created_at": now,
+        "notes": notes,
+        "revision": revision,
+    })
+
+    feedback["review_status"] = "pending"
+    feedback["feedback_action"] = "correction_only"
+    feedback["include_in_training"] = False
+    feedback["revision"] = revision
+    feedback["revised_by"] = revised_by.strip()
+    feedback["revised_at"] = now
+    feedback["revision_notes"] = notes
+    if notes:
+        feedback["notes"] = notes
+
+    annotation_path = Path(target.get("annotation_path") or "")
+    if not annotation_path.is_absolute():
+        annotation_path = root / annotation_path
+    save_json(annotation, annotation_path)
+    manifest_row = _manifest_row(annotation, root, annotation_path)
+    _upsert_manifest_row(manifest_path, manifest_row)
+    return {
+        "analysis_id": analysis_id,
+        "review_status": "pending",
+        "feedback_action": "correction_only",
+        "include_in_training": False,
+        "revision": revision,
+        "revised_by": feedback.get("revised_by"),
+        "revised_at": now,
+        "corrected_smiles": attempted,
+        "corrected_canonical_smiles": canonical,
+        "annotation_path": str(annotation_path.resolve()),
+        "manifest_path": str(manifest_path.resolve()),
+    }
+
+
+def _revision_number(value: Any) -> int:
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _draw_revision_structure(root: Path, analysis_id: str, revision: int, smiles: str | None) -> str | None:
+    if not smiles:
+        return None
+    from src.chem.mol_drawer import draw_molecule
+
+    output = root / "review_structures" / f"{safe_stem(analysis_id)}_revision_{revision}_corrected.png"
+    try:
+        return draw_molecule(str(smiles), output)
+    except Exception:
+        return None
 
 
 def export_feedback_manifest(

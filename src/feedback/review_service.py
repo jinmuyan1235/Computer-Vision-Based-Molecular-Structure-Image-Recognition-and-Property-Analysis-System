@@ -10,6 +10,7 @@ from src.feedback.store import (
     feedback_root,
     load_feedback_annotation,
     read_feedback_manifest,
+    revise_feedback_correction,
     update_feedback_review,
 )
 
@@ -51,19 +52,19 @@ class FeedbackReviewService:
                 return self._build_item(row, load_feedback_annotation(self.root, row))
         return None
 
-    def approve_for_dataset(self, analysis_id: str, reviewer_notes: str = "") -> dict[str, Any]:
+    def approve_for_dataset(self, analysis_id: str, reviewer_notes: str = "", reviewer: str = "") -> dict[str, Any]:
         """Mark an item verified and eligible for training export."""
-        return self._apply_action(analysis_id, "approve", reviewer_notes)
+        return self._apply_action(analysis_id, "approve", reviewer_notes, reviewer=reviewer)
 
-    def return_for_revision(self, analysis_id: str, reviewer_notes: str = "") -> dict[str, Any]:
+    def return_for_revision(self, analysis_id: str, reviewer_notes: str = "", reviewer: str = "") -> dict[str, Any]:
         """Return an item to correction without adding it to training data."""
-        return self._apply_action(analysis_id, "return", reviewer_notes)
+        return self._apply_action(analysis_id, "return", reviewer_notes, reviewer=reviewer)
 
-    def reject_sample(self, analysis_id: str, reviewer_notes: str = "") -> dict[str, Any]:
+    def reject_sample(self, analysis_id: str, reviewer_notes: str = "", reviewer: str = "") -> dict[str, Any]:
         """Reject an item without adding it to training data."""
-        return self._apply_action(analysis_id, "reject", reviewer_notes)
+        return self._apply_action(analysis_id, "reject", reviewer_notes, reviewer=reviewer)
 
-    def mark_duplicate(self, analysis_id: str, duplicate_of: str = "", reviewer_notes: str = "") -> dict[str, Any]:
+    def mark_duplicate(self, analysis_id: str, duplicate_of: str = "", reviewer_notes: str = "", reviewer: str = "") -> dict[str, Any]:
         """Mark an item as a duplicate sample."""
         status, action, include = REVIEW_ACTIONS["duplicate"]
         return update_feedback_review(
@@ -73,10 +74,11 @@ class FeedbackReviewService:
             feedback_action=action,
             include_in_training=include,
             reviewer_notes=reviewer_notes,
+            reviewer=reviewer,
             duplicate_of=duplicate_of,
         )
 
-    def mark_license_unclear(self, analysis_id: str, reviewer_notes: str = "") -> dict[str, Any]:
+    def mark_license_unclear(self, analysis_id: str, reviewer_notes: str = "", reviewer: str = "") -> dict[str, Any]:
         """Mark an item as blocked by unclear license/source permission."""
         status, action, include = REVIEW_ACTIONS["license_unclear"]
         return update_feedback_review(
@@ -86,14 +88,31 @@ class FeedbackReviewService:
             feedback_action=action,
             include_in_training=include,
             reviewer_notes=reviewer_notes,
+            reviewer=reviewer,
             source_license="unclear",
+        )
+
+    def revise_and_resubmit(
+        self,
+        analysis_id: str,
+        corrected_smiles: str,
+        revised_by: str = "",
+        notes: str = "",
+    ) -> dict[str, Any]:
+        """Create a new correction revision and move the item back to pending review."""
+        return revise_feedback_correction(
+            self.root,
+            analysis_id,
+            corrected_smiles,
+            revised_by=revised_by,
+            notes=notes,
         )
 
     def export_verified_manifest(self, output_manifest: str | Path, split: str = "train") -> dict[str, Any]:
         """Export only independently verified training samples."""
         return export_feedback_manifest(self.root, output_manifest, split=split, review_status="verified")
 
-    def _apply_action(self, analysis_id: str, action_name: str, reviewer_notes: str) -> dict[str, Any]:
+    def _apply_action(self, analysis_id: str, action_name: str, reviewer_notes: str, reviewer: str = "") -> dict[str, Any]:
         status, action, include = REVIEW_ACTIONS[action_name]
         return update_feedback_review(
             self.root,
@@ -102,6 +121,7 @@ class FeedbackReviewService:
             feedback_action=action,
             include_in_training=include,
             reviewer_notes=reviewer_notes,
+            reviewer=reviewer,
         )
 
     def _build_item(self, row: dict[str, str], annotation: dict[str, Any] | None) -> dict[str, Any]:
@@ -125,6 +145,11 @@ class FeedbackReviewService:
             "model_version": prediction.get("model_version") or row.get("model_version"),
             "source_reference": feedback.get("source_reference") or row.get("source_reference"),
             "source_license": feedback.get("source_license") or row.get("source_license"),
+            "reviewer": feedback.get("reviewer") or row.get("reviewer"),
+            "reviewed_at": feedback.get("reviewed_at") or row.get("reviewed_at"),
+            "revision": feedback.get("revision") or row.get("revision") or 1,
+            "revised_by": feedback.get("revised_by") or row.get("revised_by"),
+            "revised_at": feedback.get("revised_at") or row.get("revised_at"),
             "history": annotation.get("history") or [],
         }
         item["image_path_abs"] = self.resolve_path(row.get("image_path"))

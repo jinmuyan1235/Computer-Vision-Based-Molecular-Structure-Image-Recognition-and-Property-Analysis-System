@@ -58,6 +58,26 @@ def _persist_report_update(
         return
 
 
+def _remember_report_update(report: dict[str, Any]) -> None:
+    """Update matching report copies kept by Streamlit pages."""
+    analysis_id = str(report.get("analysis_id") or "")
+    matched = False
+    for key in ("image_report", "history_report", "smiles_report"):
+        existing = st.session_state.get(key)
+        if not isinstance(existing, dict):
+            continue
+        if analysis_id and str(existing.get("analysis_id") or "") == analysis_id:
+            st.session_state[key] = report
+            matched = True
+    if not matched:
+        st.session_state["image_report"] = report
+
+
+def _apply_report_update_and_rerun(report: dict[str, Any]) -> None:
+    _remember_report_update(report)
+    st.rerun()
+
+
 def show_ensemble_details(ocsr: dict[str, Any]) -> None:
     candidates = ocsr.get("candidates") or []
     consensus = ocsr.get("consensus") or {}
@@ -141,9 +161,7 @@ def _show_ensemble_candidate_card(report: dict[str, Any], candidate: dict[str, A
                 st.warning(error)
             else:
                 _persist_report_update(updated, report, f"user_selected_{backend}_candidate", f"采用 {backend} 候选结果")
-                st.session_state["image_report"] = updated
-                st.success(f"已采用 {backend_label(backend, short=True)} 候选结果。")
-                return updated
+                _apply_report_update_and_rerun(updated)
     st.divider()
     return report
 
@@ -228,9 +246,7 @@ def show_strategy_attempts(report: dict[str, Any]) -> dict[str, Any]:
                     st.warning(error)
                 else:
                     _persist_report_update(updated, report, "strategy_selection", f"应用预处理策略 {selected_option}")
-                    st.session_state["image_report"] = updated
-                    st.success("已应用所选策略结果。")
-                    return updated
+                    _apply_report_update_and_rerun(updated)
     return report
 
 

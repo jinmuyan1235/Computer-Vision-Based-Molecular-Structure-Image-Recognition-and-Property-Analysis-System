@@ -19,6 +19,21 @@ def _rate(numerator: int | float, denominator: int | float) -> float:
     return round(float(numerator) / float(denominator), 6) if denominator else 0.0
 
 
+def _bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_automatic_accept(row: dict[str, Any]) -> bool:
+    """Return whether a prediction is accepted without human review."""
+    return str(row.get("recognition_decision") or "").lower() == "accepted" and not _bool_value(
+        row.get("manual_review_recommended")
+    )
+
+
 def percentile(values: list[float], percent: float) -> float | None:
     """Return a nearest-rank percentile for a non-empty sorted list."""
     if not values:
@@ -146,6 +161,7 @@ def enrich_prediction(
                 str(row.get("expected_action") or "").lower() == "reject"
                 and not bool(row.get("recognition_success"))
             ),
+            "automatic_accept": is_automatic_accept(row),
             "ground_truth_has_stereo": truth_profile["has_stereo"],
             "stereochemistry_exact_match": (
                 bool(
@@ -224,22 +240,33 @@ def _rejection_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     negative_markers = ("distractor", "non_molecule", "reaction", "text", "table")
     negatives = [
         row for row in rows
-        if str(row.get("expected_action") or "").lower() == "reject"
-        or any(
-            marker in str(row.get(field) or "").lower()
-            for field in ("category", "source", "structure_features", "notes")
-            for marker in negative_markers
-        )
+        if _is_rejection_target(row, negative_markers)
     ]
     rejected = sum(not bool(row.get("recognition_success")) for row in negatives)
-    false_accepts = sum(bool(row.get("recognition_success")) for row in negatives)
+    hallucinated = sum(bool(row.get("recognition_success")) for row in negatives)
+    false_accepts = sum(is_automatic_accept(row) for row in negatives)
     return {
         "rejection_target_count": len(negatives),
         "rejection_count": rejected,
         "rejection_coverage": _rate(rejected, len(negatives)),
+        "negative_hallucination_count": hallucinated,
+        "negative_hallucination_rate": _rate(hallucinated, len(negatives)),
         "false_accept_count": false_accepts,
         "false_accept_rate": _rate(false_accepts, len(negatives)),
     }
+
+
+def _is_rejection_target(row: dict[str, Any], negative_markers: tuple[str, ...]) -> bool:
+    expected = str(row.get("expected_action") or "").lower()
+    if expected == "reject":
+        return True
+    if expected == "recognize":
+        return False
+    return any(
+            marker in str(row.get(field) or "").lower()
+            for field in ("category", "source", "structure_features", "notes")
+            for marker in negative_markers
+    )
 
 
 def _review_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:

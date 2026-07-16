@@ -8,9 +8,12 @@ import csv
 import io
 import json
 from pathlib import Path
+import shutil
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
+import config
+from src.runtime.run_store import set_run_protection_from_report
 from src.storage.database import connect
 
 
@@ -119,6 +122,7 @@ class AnalysisRepository:
             "completed": job.get("completed"),
             "current_file": job.get("current_file"),
             "accepted": job.get("accepted"),
+            "accepted_with_warning": job.get("accepted_with_warning"),
             "review_needed": job.get("review_needed"),
             "failed": job.get("failed"),
         }
@@ -222,12 +226,47 @@ class AnalysisRepository:
                 (1 if favorite else 0, utc_now(), analysis_id),
             )
             connection.commit()
+        self._set_run_favorite_protection(analysis_id, favorite)
 
     def delete_analysis(self, analysis_id: str) -> None:
         """Delete an analysis index row and correction rows; report files are left untouched."""
         with closing(connect(self.db_path)) as connection:
             connection.execute("DELETE FROM analyses WHERE analysis_id = ?", (analysis_id,))
             connection.commit()
+
+    def delete_analysis_and_files(self, analysis_id: str) -> dict[str, Any]:
+        """Delete a history row and locally owned report/run artifacts."""
+        row = self.get_analysis(analysis_id)
+        report = self.load_report(analysis_id) if row else None
+        candidates = _owned_file_candidates(analysis_id, row, report)
+        self.delete_analysis(analysis_id)
+        result: dict[str, Any] = {
+            "analysis_id": analysis_id,
+            "deleted_paths": [],
+            "skipped_paths": [],
+            "errors": [],
+        }
+        deleted_roots: list[Path] = []
+        for path in candidates:
+            resolved = path.expanduser().resolve()
+            if any(resolved == root or _is_relative_to(resolved, root) for root in deleted_roots):
+                continue
+            if not resolved.exists():
+                result["skipped_paths"].append({"path": str(resolved), "reason": "missing"})
+                continue
+            try:
+                if resolved.is_dir():
+                    shutil.rmtree(resolved)
+                    deleted_roots.append(resolved)
+                elif resolved.is_file():
+                    resolved.unlink()
+                else:
+                    result["skipped_paths"].append({"path": str(resolved), "reason": "unsupported"})
+                    continue
+                result["deleted_paths"].append(str(resolved))
+            except Exception as exc:
+                result["errors"].append({"path": str(resolved), "error": str(exc)})
+        return result
 
     def export_rows_csv(self, rows: Iterable[Mapping[str, Any]]) -> str:
         """Return selected history rows as UTF-8 CSV text."""
@@ -251,6 +290,12 @@ class AnalysisRepository:
         writer.writeheader()
         writer.writerows(rows)
         return buffer.getvalue()
+
+    def _set_run_favorite_protection(self, analysis_id: str, favorite: bool) -> None:
+        report = self.load_report(analysis_id)
+        if not report:
+            return
+        set_run_protection_from_report(report, protected=favorite, reason="favorite")
 
 
 def record_report(report: Mapping[str, Any], report_path: str | Path | None = None) -> dict[str, Any]:
@@ -328,3 +373,121 @@ def _row_dict(row: Any) -> dict[str, Any]:
     if "is_favorite" in data:
         data["is_favorite"] = bool(data["is_favorite"])
     return data
+
+
+def _owned_file_candidates(
+    analysis_id: str,
+    row: Mapping[str, Any] | None,
+    report: Mapping[str, Any] | None,
+) -> list[Path]:
+    candidates: list[Path] = []
+    run_dir = _run_dir_from_report(report)
+    if run_dir is not None and _is_owned_run_dir(run_dir, analysis_id):
+        candidates.append(run_dir)
+
+    report_path = _report_path_from_row_or_report(row, report)
+    if report_path is not None and _is_direct_report_file(report_path, analysis_id):
+        if run_dir is None or not _is_relative_to(report_path.expanduser().resolve(), run_dir.expanduser().resolve()):
+            candidates.append(report_path)
+
+    if report is not None:
+        for path in _report_asset_paths(report):
+            resolved = path.expanduser().resolve()
+            if run_dir is not None and _is_relative_to(resolved, run_dir.expanduser().resolve()):
+                continue
+            if _is_generated_asset_path(resolved, analysis_id):
+                candidates.append(resolved)
+    return _dedupe_paths(candidates)
+
+
+def _run_dir_from_report(report: Mapping[str, Any] | None) -> Path | None:
+    if not report:
+        return None
+    run_data = report.get("run") if isinstance(report.get("run"), Mapping) else {}
+    run_dir = run_data.get("run_dir") if isinstance(run_data, Mapping) else None
+    return Path(str(run_dir)).expanduser().resolve() if run_dir else None
+
+
+def _report_path_from_row_or_report(row: Mapping[str, Any] | None, report: Mapping[str, Any] | None) -> Path | None:
+    value = row.get("report_path") if row else None
+    if not value and report:
+        run_data = report.get("run") if isinstance(report.get("run"), Mapping) else {}
+        value = run_data.get("report_path") if isinstance(run_data, Mapping) else None
+    return Path(str(value)).expanduser().resolve() if value else None
+
+
+def _is_owned_run_dir(path: Path, analysis_id: str) -> bool:
+    if not path.is_dir():
+        return False
+    for metadata_path in (path / "runtime.json", path / "report.json"):
+        if not metadata_path.is_file():
+            continue
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(payload, Mapping) and str(payload.get("analysis_id") or "") == analysis_id:
+            return True
+    return False
+
+
+def _is_direct_report_file(path: Path, analysis_id: str) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return isinstance(payload, Mapping) and str(payload.get("analysis_id") or "") == analysis_id
+
+
+def _report_asset_paths(report: Mapping[str, Any]) -> list[Path]:
+    paths: list[Path] = []
+    _collect_existing_paths(report.get("images"), paths)
+    return paths
+
+
+def _collect_existing_paths(value: Any, paths: list[Path]) -> None:
+    if isinstance(value, Mapping):
+        for nested in value.values():
+            _collect_existing_paths(nested, paths)
+        return
+    if isinstance(value, list):
+        for nested in value:
+            _collect_existing_paths(nested, paths)
+        return
+    if not isinstance(value, str) or not value.strip():
+        return
+    path = Path(value).expanduser()
+    if path.is_file():
+        paths.append(path.resolve())
+
+
+def _is_generated_asset_path(path: Path, analysis_id: str) -> bool:
+    if not path.is_file():
+        return False
+    roots = [Path(config.OUTPUT_DIR).expanduser().resolve(), Path(config.RUNS_DIR).expanduser().resolve()]
+    if not any(path == root or _is_relative_to(path, root) for root in roots):
+        return False
+    token = analysis_id[:8]
+    return analysis_id in path.name or (bool(token) and token in path.name)
+
+
+def _dedupe_paths(paths: Iterable[Path]) -> list[Path]:
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path.expanduser().resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(Path(key))
+    return deduped
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False

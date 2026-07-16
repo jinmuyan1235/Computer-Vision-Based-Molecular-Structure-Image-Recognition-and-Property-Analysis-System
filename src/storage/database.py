@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Callable
 
 import config
 
 
 SCHEMA_VERSION = 1
+Migration = Callable[[sqlite3.Connection], None]
 
 
 def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
@@ -24,8 +26,32 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
 
 
 def initialize(connection: sqlite3.Connection) -> None:
+    """Apply all pending schema migrations."""
+    current_version = _user_version(connection)
+    if current_version > SCHEMA_VERSION:
+        raise RuntimeError(f"数据库 schema 版本过新：{current_version} > {SCHEMA_VERSION}")
+    try:
+        connection.execute("BEGIN")
+        for version in range(current_version + 1, SCHEMA_VERSION + 1):
+            migration = MIGRATIONS.get(version)
+            if migration is None:
+                raise RuntimeError(f"缺少数据库迁移：v{version}")
+            migration(connection)
+            connection.execute(f"PRAGMA user_version = {version}")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _user_version(connection: sqlite3.Connection) -> int:
+    row = connection.execute("PRAGMA user_version").fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _migrate_v1(connection: sqlite3.Connection) -> None:
     """Create all history tables and indexes idempotently."""
-    connection.executescript(
+    statements = [
         """
         CREATE TABLE IF NOT EXISTS analyses (
             analysis_id TEXT PRIMARY KEY,
@@ -42,8 +68,9 @@ def initialize(connection: sqlite3.Connection) -> None:
             inchikey TEXT,
             report_path TEXT,
             is_favorite INTEGER NOT NULL DEFAULT 0
-        );
-
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS corrections (
             correction_id TEXT PRIMARY KEY,
             analysis_id TEXT NOT NULL,
@@ -53,8 +80,9 @@ def initialize(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             notes TEXT,
             FOREIGN KEY (analysis_id) REFERENCES analyses(analysis_id) ON DELETE CASCADE
-        );
-
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS jobs (
             job_id TEXT PRIMARY KEY,
             job_type TEXT,
@@ -63,16 +91,20 @@ def initialize(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             result_path TEXT
-        );
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_analyses_created_at ON analyses(created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_analyses_filename ON analyses(filename)",
+        "CREATE INDEX IF NOT EXISTS idx_analyses_final_smiles ON analyses(final_smiles)",
+        "CREATE INDEX IF NOT EXISTS idx_analyses_inchikey ON analyses(inchikey)",
+        "CREATE INDEX IF NOT EXISTS idx_analyses_status ON analyses(status)",
+        "CREATE INDEX IF NOT EXISTS idx_analyses_decision ON analyses(decision)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)",
+    ]
+    for statement in statements:
+        connection.execute(statement)
 
-        CREATE INDEX IF NOT EXISTS idx_analyses_created_at ON analyses(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_analyses_filename ON analyses(filename);
-        CREATE INDEX IF NOT EXISTS idx_analyses_final_smiles ON analyses(final_smiles);
-        CREATE INDEX IF NOT EXISTS idx_analyses_inchikey ON analyses(inchikey);
-        CREATE INDEX IF NOT EXISTS idx_analyses_status ON analyses(status);
-        CREATE INDEX IF NOT EXISTS idx_analyses_decision ON analyses(decision);
-        CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-        PRAGMA user_version = 1;
-        """
-    )
-    connection.commit()
+
+MIGRATIONS: dict[int, Migration] = {
+    1: _migrate_v1,
+}

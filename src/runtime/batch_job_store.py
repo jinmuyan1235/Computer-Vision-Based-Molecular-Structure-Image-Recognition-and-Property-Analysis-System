@@ -68,6 +68,7 @@ class BatchJobStore:
             "total": total,
             "completed": 0,
             "accepted": 0,
+            "accepted_with_warning": 0,
             "review_needed": 0,
             "rejected": 0,
             "failed": 0,
@@ -125,6 +126,7 @@ class BatchJobStore:
             "total": int(progress.get("total") or summary.get("total") or 0),
             "completed": int(progress.get("completed") or summary.get("completed") or 0),
             "accepted": int(summary.get("accepted") or 0),
+            "accepted_with_warning": int(summary.get("accepted_with_warning") or 0),
             "review_needed": int(summary.get("review_needed") or 0),
             "rejected": int(summary.get("rejected") or 0),
             "failed": int(summary.get("failed") or 0),
@@ -151,6 +153,7 @@ class BatchJobStore:
             total=int(summary.get("total") or 0),
             completed=int(summary.get("completed") or summary.get("total") or 0),
             accepted=int(summary.get("accepted") or 0),
+            accepted_with_warning=int(summary.get("accepted_with_warning") or 0),
             review_needed=int(summary.get("review_needed") or 0),
             rejected=int(summary.get("rejected") or 0),
             failed=int(summary.get("failed") or 0),
@@ -177,7 +180,7 @@ class BatchJobStore:
 
     def request_skip_current(self, job_id: str) -> dict[str, Any]:
         self.skip_path(job_id).write_text(utc_now(), encoding="utf-8")
-        return self.update(job_id, message="已请求跳过当前文件。")
+        return self.update(job_id, message="已请求跳过下一张未开始文件；正在推理的图片不会被中断。")
 
     def consume_skip_request(self, job_id: str) -> bool:
         path = self.skip_path(job_id)

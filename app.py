@@ -6,6 +6,7 @@ import streamlit as st
 
 import config
 from src.runtime.health import image_workflows_enabled, run_production_health_check
+from src.runtime.run_store import cleanup_runs_if_due
 from src.ui.about_page import render_about_page
 from src.ui.batch_page import render_batch_page
 from src.ui.document_page import render_document_page
@@ -26,6 +27,7 @@ apply_styles()
 
 st.title("分子结构识别与性质分析")
 st.caption(f"图片/PDF → OpenCV 区域处理 → OCSR → SMILES → RDKit 校验与报告；当前模式：{config.APP_MODE}")
+st.session_state["run_cleanup"] = cleanup_runs_if_due()
 
 selected_backend, show_preprocessing, export_pdf = render_sidebar()
 health_force_refresh = bool(st.session_state.pop("health_force_refresh", False))

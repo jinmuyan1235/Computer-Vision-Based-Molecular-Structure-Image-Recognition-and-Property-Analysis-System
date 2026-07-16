@@ -1,45 +1,36 @@
-# Real OCSR Acceptance Dataset Card
+# OCSR Real Acceptance Starter v1
 
-This directory is the fixed, reviewed acceptance set used for release gates.
+## What is included
 
-Images in `images/` may be private or license-restricted and are ignored by Git by default. Commit only files that are legal to share. If images cannot be public, keep them locally and commit only this dataset card, the manifest schema, and reproducible release reports that do not expose restricted image content.
+This starter contains **14 image rows from 2 independent source images**:
 
-## Required Manifest Fields
+- **1 genuine patent/document crop** from the public OCMR repository. It contains `Formula II`, atom numbering, and surrounding document content. The molecule is benzene-1,2-dicarbonitrile (`N#Cc1ccccc1C#N`).
+- **1 independent official MolScribe example image** with the ground-truth SMILES published in the MolScribe README. Its upstream provenance is not stated, so it is classified as an external official example rather than a real literature crop.
+- Derived low-resolution, JPEG, rotated, thresholded, and scan-like variants.
+- Two real-document negative controls: text-only content and an incomplete molecular crop.
 
-- `dataset_version`
-- `image_sha256`
-- `source_document`
-- `source_license`
-- `annotator`
-- `reviewer`
-- `review_status`
-- `ground_truth_smiles`
-- `ground_truth_inchikey`
-- `expected_action`
-- `supported_scope`
+## Important limitation
 
-Release acceptance requires `review_status=verified`, matching image SHA-256, and matching `ground_truth_inchikey` for recognisable molecule rows. Reject rows may leave `ground_truth_smiles` and `ground_truth_inchikey` empty.
+This package fixes the repository's “zero real sample” problem, but it is **not a statistically meaningful benchmark**. It contains only one independently sourced real-document molecule. Perturbations of the same source must remain in the same evaluation group and must not be counted as independent evidence.
 
-## Split Policy
+Use `scripts/build_full_real_subset.py` to download a larger deterministic subset from CLEF, JPO, UOB, and USPTO benchmark archives.
 
-This acceptance set is release-only. Do not use it for training, prompt tuning, threshold tuning, or repeated manual model selection. Keep `split=test` unless a row is intentionally excluded from release gates.
+## Verification policy
 
-Avoid leakage by separating rows across:
+Rows in this starter are marked `verified` because:
 
-- molecule identity and InChIKey;
-- scaffold family;
-- source document or patent family;
-- perturbation variants of the same image;
-- highly similar structure families.
+- the OCMR patent image was visually checked against the SMILES printed by the upstream OCMR example;
+- the MolScribe image uses the ground-truth SMILES shown by the upstream MolScribe README;
+- negative controls were manually cropped and assigned `expected_action=reject`.
 
-## First-Phase Coverage Target
+For a release benchmark, manually review newly downloaded samples before changing their status from `pending` to `verified`.
 
-Aim for roughly 300 reviewed rows:
+## Leakage policy
 
-- 100-120 clear single-molecule images;
-- 70-80 real paper or patent crops;
-- 40-50 scanned, low-resolution, compressed, or rotated images;
-- 25-35 handwritten, charged, salt, or multi-fragment molecules;
-- 25-35 non-molecule and reaction distractors.
+All variants sharing a `source_document` belong to the same source group. Do not place variants of the same image in different train/dev/test splits.
 
-These are project-phase targets, not general industry claims.
+## Licensing
+
+- MolScribe repository: MIT license.
+- OCMR `test.png`: publicly accessible GitHub source, but no explicit repository license was found during packaging. Treat this item as local research/evaluation material and verify reuse terms before republishing it in a public release.
+- The full benchmark downloader preserves upstream source and license notes; users are responsible for complying with CLEF/UOB/JPO/USPTO terms.

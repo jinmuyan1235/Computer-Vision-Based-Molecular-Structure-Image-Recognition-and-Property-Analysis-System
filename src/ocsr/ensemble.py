@@ -29,7 +29,12 @@ DEFAULT_FACTORIES: dict[str, AdapterFactory] = {
 
 
 def _default_factories(runtime_config: Mapping[str, Any] | None = None) -> dict[str, AdapterFactory]:
-    runtime = dict(runtime_config or {})
+    runtime = {
+        "molscribe_device": config.OCSR_DEVICE or "auto",
+        "decimer_device": config.DECIMER_DEVICE or "auto",
+        "visible_gpu_index": None,
+        **dict(runtime_config or {}),
+    }
     return {
         "molscribe": lambda: MolScribeAdapter(device=runtime.get("molscribe_device")),
         "decimer": lambda: DECIMERAdapter(

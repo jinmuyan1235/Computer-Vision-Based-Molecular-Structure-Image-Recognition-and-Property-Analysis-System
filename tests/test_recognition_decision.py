@@ -33,6 +33,17 @@ def test_single_uncalibrated_model_is_accepted_with_warning() -> None:
     assert "single_backend_only" in decision["reason_codes"]
 
 
+def test_uncalibrated_single_model_requires_review_when_configured(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.analysis.recognition_decision.config.DECISION_REQUIRE_CALIBRATED_CONFIDENCE",
+        True,
+    )
+    decision = decide_recognition(_base_report())
+    assert decision["decision"] == "review_needed"
+    assert decision["manual_review_recommended"] is True
+    assert "calibrated_confidence_missing" in decision["reason_codes"]
+
+
 def test_multi_backend_agreement_can_be_accepted() -> None:
     report = _base_report()
     report["ocsr"] = {
@@ -46,6 +57,29 @@ def test_multi_backend_agreement_can_be_accepted() -> None:
     assert decision["decision"] == "accepted"
     assert decision["risk_level"] == "low"
     assert decision["manual_review_recommended"] is False
+
+
+def test_single_valid_ensemble_candidate_requires_review_when_configured(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.analysis.recognition_decision.config.DECISION_REQUIRE_CALIBRATED_CONFIDENCE",
+        True,
+    )
+    report = _base_report()
+    report["ocsr"] = {
+        "backend": "ensemble",
+        "status": "success",
+        "smiles": "CCO",
+        "predicted_smiles": "CCO",
+        "consensus": {
+            "status": "single_valid",
+            "decision": "accepted_with_warning",
+            "reason_codes": ["single_backend_only", "uncalibrated_confidence"],
+        },
+    }
+    decision = decide_recognition(report)
+    assert decision["decision"] == "review_needed"
+    assert decision["manual_review_recommended"] is True
+    assert "single_backend_only" in decision["reason_codes"]
 
 
 def test_backend_disagreement_requires_review() -> None:

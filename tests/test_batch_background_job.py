@@ -4,12 +4,30 @@ import sys
 import time
 from pathlib import Path
 
+from src.analysis.batch_analyzer import BatchAnalyzer
 from src.runtime.batch_job_store import BatchJobStore
 from src.runtime.job_manager import run_process
 from src.runtime.job_registry import load_batch_job_result, refresh_batch_job, start_batch_job
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_batch_summary_keeps_warning_results_out_of_auto_accepted_count() -> None:
+    summary = BatchAnalyzer._summary(
+        [
+            {"status": "success", "valid": True, "recognition_decision": "accepted"},
+            {"status": "success", "valid": True, "recognition_decision": "accepted_with_warning"},
+            {"status": "success", "valid": True, "recognition_decision": "review_needed"},
+            {"status": "failed", "valid": False, "recognition_decision": "rejected", "message": "bad input"},
+        ],
+        total=4,
+    )
+
+    assert summary["accepted"] == 1
+    assert summary["accepted_with_warning"] == 1
+    assert summary["review_needed"] == 2
+    assert summary["rejected"] == 1
 
 
 def test_batch_job_store_persists_progress_and_control_flags(tmp_path: Path) -> None:
@@ -33,13 +51,23 @@ def test_batch_job_store_persists_progress_and_control_flags(tmp_path: Path) -> 
         "total": 3,
         "completed": 1,
         "current_file": "compound_001.png",
-        "summary": {"total": 3, "completed": 1, "accepted": 1, "review_needed": 0, "rejected": 0, "failed": 0},
+        "summary": {
+            "total": 3,
+            "completed": 1,
+            "accepted": 1,
+            "accepted_with_warning": 0,
+            "review_needed": 0,
+            "rejected": 0,
+            "failed": 0,
+        },
     })
     assert progress["completed"] == 1
     assert progress["current_file"] == "compound_001.png"
     assert progress["accepted"] == 1
+    assert progress["accepted_with_warning"] == 0
 
-    store.request_skip_current("job1")
+    skip_state = store.request_skip_current("job1")
+    assert "下一张未开始文件" in skip_state["message"]
     assert store.consume_skip_request("job1") is True
     assert store.consume_skip_request("job1") is False
 

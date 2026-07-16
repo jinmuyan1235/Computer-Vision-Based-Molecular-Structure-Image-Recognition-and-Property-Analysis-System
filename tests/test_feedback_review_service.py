@@ -52,16 +52,23 @@ def test_pending_feedback_requires_review_before_training_export(tmp_path: Path)
     before = service.export_verified_manifest(manifest_path)
     assert before["exported_count"] == 0
 
-    approved = service.approve_for_dataset("review001", "looks correct")
+    approved = service.approve_for_dataset("review001", "looks correct", reviewer="chemist-a")
     assert approved["review_status"] == "verified"
     assert approved["include_in_training"] is True
+    assert approved["reviewer"] == "chemist-a"
+    assert approved["reviewed_at"]
+    assert approved["revision"] == 1
 
     rows = read_feedback_manifest(tmp_path / "feedback")
     assert rows[0]["review_status"] == "verified"
     assert rows[0]["feedback_action"] == "accepted_for_dataset"
     assert rows[0]["include_in_training"] == "True"
+    assert rows[0]["reviewer"] == "chemist-a"
+    assert rows[0]["reviewed_at"]
+    assert rows[0]["revision"] == "1"
     annotation = json.loads(Path(tmp_path / "feedback" / rows[0]["annotation_path"]).read_text(encoding="utf-8"))
     assert annotation["feedback"]["reviewer_notes"] == "looks correct"
+    assert annotation["feedback"]["reviewer"] == "chemist-a"
 
     after = service.export_verified_manifest(manifest_path)
     assert after["exported_count"] == 1
@@ -74,12 +81,42 @@ def test_review_service_non_approval_actions_do_not_enter_training(tmp_path: Pat
     _save_pending(tmp_path, "license001", "CCBr")
     service = FeedbackReviewService(tmp_path)
 
-    assert service.return_for_revision("return001", "fix source")["review_status"] == "returned"
-    assert service.reject_sample("reject001", "not a molecule")["review_status"] == "rejected"
-    assert service.mark_duplicate("dupe001", duplicate_of="return001")["review_status"] == "duplicate"
-    assert service.mark_license_unclear("license001")["review_status"] == "license_unclear"
+    assert service.return_for_revision("return001", "fix source", reviewer="reviewer-a")["review_status"] == "returned"
+    assert service.reject_sample("reject001", "not a molecule", reviewer="reviewer-a")["review_status"] == "rejected"
+    assert service.mark_duplicate("dupe001", duplicate_of="return001", reviewer="reviewer-a")["review_status"] == "duplicate"
+    assert service.mark_license_unclear("license001", reviewer_notes="check license", reviewer="reviewer-a")["review_status"] == "license_unclear"
 
     all_items = {item["analysis_id"]: item for item in service.list_items("all")}
     assert all_items["dupe001"]["feedback"]["duplicate_of"] == "return001"
     assert all_items["license001"]["feedback"]["source_license"] == "unclear"
     assert service.export_verified_manifest(tmp_path / "verified_manifest.csv")["exported_count"] == 0
+
+
+def test_returned_feedback_can_be_revised_and_resubmitted(tmp_path: Path) -> None:
+    _save_pending(tmp_path, "revise001", "CCN")
+    service = FeedbackReviewService(tmp_path)
+
+    returned = service.return_for_revision("revise001", "wrong atom count", reviewer="reviewer-a")
+    assert returned["review_status"] == "returned"
+
+    revised = service.revise_and_resubmit("revise001", "CCCO", revised_by="chemist-b", notes="fixed chain length")
+    assert revised["review_status"] == "pending"
+    assert revised["include_in_training"] is False
+    assert revised["revision"] == 2
+    assert revised["corrected_smiles"] == "CCCO"
+
+    item = service.get_item("revise001")
+    assert item is not None
+    assert item["review_status"] == "pending"
+    assert item["corrected_smiles"] == "CCCO"
+    assert item["revision"] == 2
+    assert item["revised_by"] == "chemist-b"
+
+    rows = read_feedback_manifest(tmp_path / "feedback")
+    row = next(row for row in rows if row["analysis_id"] == "revise001")
+    annotation = json.loads(Path(tmp_path / "feedback" / row["annotation_path"]).read_text(encoding="utf-8"))
+    assert annotation["feedback"]["revision"] == 2
+    assert annotation["feedback"]["revised_by"] == "chemist-b"
+    assert annotation["feedback"]["review_status"] == "pending"
+    assert annotation["revision_history"][0]["correction"]["corrected_smiles"] == "CCN"
+    assert annotation["history"][-1]["operation"] == "revise_and_resubmit"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -124,13 +125,14 @@ def _render_job_status(job: dict, store: BatchJobStore, backend: str) -> None:
     completed = int(job.get("completed") or 0)
     st.subheader("后台任务状态")
     st.progress((completed / total) if total else 0.0)
-    metrics = st.columns(6)
+    metrics = st.columns(7)
     metrics[0].metric("总数", total)
     metrics[1].metric("已完成", completed)
     metrics[2].metric("自动接受", int(job.get("accepted") or 0))
-    metrics[3].metric("需要审核", int(job.get("review_needed") or 0))
-    metrics[4].metric("拒绝", int(job.get("rejected") or 0))
-    metrics[5].metric("失败", int(job.get("failed") or 0))
+    metrics[3].metric("警告待确认", int(job.get("accepted_with_warning") or 0))
+    metrics[4].metric("需要审核", int(job.get("review_needed") or 0))
+    metrics[5].metric("拒绝", int(job.get("rejected") or 0))
+    metrics[6].metric("失败", int(job.get("failed") or 0))
     st.caption(
         f"状态：{_status_label(status)}；"
         f"当前文件：{job.get('current_file') or '-'}；"
@@ -142,7 +144,12 @@ def _render_job_status(job: dict, store: BatchJobStore, backend: str) -> None:
     if col_cancel.button("取消任务", key="cancel_batch_job", disabled=status not in {"queued", "running", "cancelling"}):
         cancel_batch_job(job["job_id"], store)
         st.rerun()
-    if col_skip.button("跳过当前文件", key="skip_batch_current", disabled=status != "running"):
+    if col_skip.button(
+        "跳过下一张未开始文件",
+        key="skip_batch_next_unstarted",
+        disabled=status != "running",
+        help="不会中断正在推理的图片；请求会在下一张图片开始前生效。",
+    ):
         request_skip_current(job["job_id"], store)
         st.rerun()
     result = load_batch_job_result(job["job_id"], store)
@@ -155,6 +162,15 @@ def _render_job_status(job: dict, store: BatchJobStore, backend: str) -> None:
         st.session_state.pop("batch_job_id", None)
         st.session_state.pop("batch_result", None)
         st.rerun()
+    _auto_refresh_running_job(status)
+
+
+def _auto_refresh_running_job(status: str) -> None:
+    if status not in {"queued", "running", "cancelling"}:
+        return
+    st.caption("任务运行中，页面将在 3 秒后自动刷新。")
+    time.sleep(3)
+    st.rerun()
 
 
 def _start_retry_job(result: dict, backend: str, mode: str, store: BatchJobStore, parent_job_id: str) -> None:
