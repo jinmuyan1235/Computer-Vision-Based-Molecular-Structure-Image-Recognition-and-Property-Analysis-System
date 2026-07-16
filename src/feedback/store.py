@@ -22,6 +22,7 @@ CORRECTION_TYPES = {"atom", "bond", "charge", "stereo", "missing_fragment", "oth
 REVIEW_STATUSES = {"pending", "verified", "rejected", "returned", "duplicate", "license_unclear"}
 FEEDBACK_ACTIONS = {"correction_only", "accepted_for_dataset"}
 REVIEWER_REQUIRED_STATUSES = {"verified", "rejected", "returned", "duplicate", "license_unclear"}
+DOCUMENT_REACTION_REGION_TYPES = {"reaction", "reaction_arrow", "reaction_condition", "reaction_like"}
 
 FEEDBACK_MANIFEST_FIELDS = [
     "analysis_id",
@@ -161,6 +162,19 @@ def _require_non_empty_identity(value: str | None, field_name: str) -> str:
     if not normalized:
         raise ValueError(f"{field_name} is required")
     return normalized
+
+
+def _is_document_region_confirmed(region: dict[str, Any]) -> bool:
+    return bool(region.get("confirmed")) or str(region.get("annotation_status") or "").lower() == "confirmed"
+
+
+def _document_detection_label(region_type: str | None) -> str:
+    normalized = str(region_type or "unknown").strip().lower()
+    if normalized in {"molecule", "text", "table"}:
+        return normalized
+    if normalized in DOCUMENT_REACTION_REGION_TYPES:
+        return "reaction"
+    return "ignore"
 
 
 def _annotation_payload(
@@ -338,6 +352,67 @@ def save_feedback_sample(
         "duplicate_of": duplicate_of,
         "include_in_training": bool(include_in_training),
         "review_status": review_status,
+    }
+
+
+def save_review_queue_item(
+    report: dict[str, Any],
+    output_dir: str | Path,
+    notes: str = "",
+    correction_type: str = "other",
+    source_reference: str = "",
+    source_license: str = "",
+    privacy_notes: str = "",
+) -> dict[str, Any]:
+    """Persist a report directly to the pending review queue without requiring a correction."""
+    traced = dict(report)
+    analysis_id = str(traced.get("analysis_id") or "analysis")
+    traced["analysis_id"] = analysis_id
+    correction_type = _normalize_choice(correction_type, CORRECTION_TYPES, "other")
+    feedback_root = _feedback_root(output_dir)
+    manifest_path = feedback_root / "manifest.csv"
+    existing_rows = _read_csv(manifest_path)
+    image_sha256, archived_image = _archive_image(traced, feedback_root)
+    duplicate_of = _duplicate_for(existing_rows, image_sha256, analysis_id)
+    annotation = _annotation_payload(
+        traced,
+        feedback_root,
+        image_sha256,
+        archived_image,
+        duplicate_of,
+        correction_type,
+        "pending",
+        "correction_only",
+        False,
+        notes,
+        source_reference,
+        source_license,
+        privacy_notes,
+    )
+    annotation.setdefault("history", []).append({
+        "source": "document_region",
+        "operation": "queued_for_review",
+        "created_at": _utc_now_iso(),
+        "reason": notes,
+        "status": traced.get("status"),
+        "message": traced.get("message"),
+    })
+    annotations_dir = ensure_directory(feedback_root / "annotations")
+    annotation_path = annotations_dir / f"{safe_stem(analysis_id)}.json"
+    save_json(annotation, annotation_path)
+    manifest_row = _manifest_row(annotation, feedback_root, annotation_path)
+    _upsert_manifest_row(manifest_path, manifest_row)
+    mark_run_protected_from_report(traced, "feedback")
+    return {
+        "feedback_root": str(feedback_root),
+        "annotation_path": str(annotation_path.resolve()),
+        "manifest_path": str(manifest_path.resolve()),
+        "image_path": str(archived_image.resolve()) if archived_image else None,
+        "image_sha256": image_sha256,
+        "duplicate_image": duplicate_of is not None,
+        "duplicate_of": duplicate_of,
+        "include_in_training": False,
+        "review_status": "pending",
     }
 
 
@@ -568,6 +643,80 @@ def _draw_revision_structure(root: Path, analysis_id: str, revision: int, smiles
         return draw_molecule(str(smiles), output)
     except Exception:
         return None
+
+
+def export_document_detection_annotations(
+    document_results: Iterable[dict[str, Any]],
+    output_path: str | Path,
+    root: str | Path | None = None,
+    include_unconfirmed: bool = False,
+) -> dict[str, Any]:
+    """Export confirmed document-region boxes as compact detection-training JSON."""
+    destination = Path(output_path).expanduser().resolve()
+    root_path = Path(root).expanduser().resolve() if root is not None else destination.parent
+    annotations: list[dict[str, Any]] = []
+    region_count = 0
+    skipped_unconfirmed = 0
+    skipped_deleted = 0
+    for document_result in document_results:
+        regions_by_page: dict[int, list[dict[str, Any]]] = {}
+        for region in document_result.get("regions", []):
+            if region.get("status") == "deleted":
+                skipped_deleted += 1
+                continue
+            if not include_unconfirmed and not _is_document_region_confirmed(region):
+                skipped_unconfirmed += 1
+                continue
+            try:
+                bbox = [int(value) for value in region.get("bbox", [])]
+                if len(bbox) != 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+                    continue
+            except Exception:
+                continue
+            page_number = int(region.get("page_number", 0))
+            regions_by_page.setdefault(page_number, []).append({
+                "region_id": region.get("region_id"),
+                "bbox": bbox,
+                "label": _document_detection_label(region.get("region_type")),
+                "region_type": region.get("region_type"),
+                "source": region.get("source"),
+                "confirmed": bool(_is_document_region_confirmed(region)),
+            })
+            region_count += 1
+        for page in document_result.get("pages", []):
+            page_number = int(page.get("page_number", 0))
+            page_regions = regions_by_page.get(page_number, [])
+            if not page_regions:
+                continue
+            image_path = Path(str(page.get("image_path") or ""))
+            image_value = _relative_or_absolute(image_path, root_path) if image_path else ""
+            annotations.append({
+                "document_id": document_result.get("document_id"),
+                "page_number": page_number,
+                "image": image_value,
+                "width": page.get("width"),
+                "height": page.get("height"),
+                "regions": page_regions,
+            })
+    payload = {
+        "schema_version": 1,
+        "generated_at": _utc_now_iso(),
+        "annotations": annotations,
+        "summary": {
+            "page_count": len(annotations),
+            "region_count": region_count,
+            "skipped_unconfirmed": skipped_unconfirmed,
+            "skipped_deleted": skipped_deleted,
+        },
+    }
+    save_json(payload, destination)
+    return {
+        "output_path": str(destination),
+        "page_count": len(annotations),
+        "region_count": region_count,
+        "skipped_unconfirmed": skipped_unconfirmed,
+        "skipped_deleted": skipped_deleted,
+    }
 
 
 def export_feedback_manifest(

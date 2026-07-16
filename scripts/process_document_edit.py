@@ -43,7 +43,12 @@ def main() -> int:
             "visible_gpu_index": args.visible_gpu_index,
         }
         output_dir = Path(document_result.get("output_dir") or config.DOCUMENT_OUTPUT_DIR).expanduser().resolve()
-        processor = DocumentOCSRProcessor(backend=args.backend, output_dir=output_dir, runtime_config=runtime_config)
+        processor = DocumentOCSRProcessor(
+            backend=args.backend,
+            output_dir=output_dir,
+            runtime_config=runtime_config,
+            review_output_dir=config.DATA_DIR,
+        )
         updated = processor.apply_edits(document_result, edits, rerun_ocsr=args.rerun_ocsr)
         result_path = Path(updated["exports"].get("json") or output_dir / "document_result.json")
         if not result_path.is_file():

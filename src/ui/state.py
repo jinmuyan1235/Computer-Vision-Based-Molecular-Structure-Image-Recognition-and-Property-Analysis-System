@@ -6,7 +6,7 @@ from typing import Any
 
 import streamlit as st
 
-from config import OUTPUT_DIR
+from config import DATA_DIR, OUTPUT_DIR
 from src.analysis.batch_analyzer import BatchAnalyzer
 from src.analysis.molecule_report import MoleculeReportGenerator
 from src.documents.processor import DocumentOCSRProcessor
@@ -63,7 +63,11 @@ def get_batch_analyzer(backend: str) -> BatchAnalyzer:
 
 @st.cache_resource(show_spinner=False)
 def _get_document_processor(backend: str, runtime_key: RuntimeKey) -> DocumentOCSRProcessor:
-    return DocumentOCSRProcessor(backend=backend, runtime_config=runtime_config_from_key(runtime_key))
+    return DocumentOCSRProcessor(
+        backend=backend,
+        runtime_config=runtime_config_from_key(runtime_key),
+        review_output_dir=DATA_DIR,
+    )
 
 
 def get_document_processor(backend: str) -> DocumentOCSRProcessor:

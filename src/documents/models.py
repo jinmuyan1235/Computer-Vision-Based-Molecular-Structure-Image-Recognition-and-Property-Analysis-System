@@ -8,12 +8,14 @@ from typing import Any, Literal
 
 RegionType = Literal[
     "molecule",
+    "reaction",
     "reaction_arrow",
     "reaction_condition",
     "reaction_like",
     "text",
     "table",
     "figure",
+    "ignore",
     "unknown",
     "non_molecule",
 ]
@@ -52,12 +54,14 @@ class DocumentRegion:
     source: str = "detector"
     detector_name: str | None = None
     status: str = "detected"
+    confirmed: bool = False
     message: str | None = None
     audit: list[dict[str, Any]] = field(default_factory=list)
     ocsr: dict[str, Any] = field(default_factory=dict)
     final_result: dict[str, Any] = field(default_factory=dict)
     report: dict[str, Any] | None = None
     screening: dict[str, Any] = field(default_factory=dict)
+    review: dict[str, Any] = field(default_factory=dict)
     processing_time_ms: float | None = None
 
     def to_dict(self) -> dict[str, Any]:

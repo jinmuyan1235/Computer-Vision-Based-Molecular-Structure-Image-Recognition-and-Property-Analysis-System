@@ -29,18 +29,21 @@ BACKEND_DESCRIPTIONS = {
 
 REGION_TYPE_LABELS = {
     "molecule": "分子结构",
+    "reaction": "反应式",
     "reaction_arrow": "反应箭头",
     "reaction_condition": "反应条件",
     "reaction_like": "疑似反应式",
     "text": "文本",
     "table": "表格",
     "figure": "普通图像/插图",
+    "ignore": "忽略",
     "unknown": "未知区域",
     "non_molecule": "非分子区域",
 }
 
 STATUS_LABELS = {
     "detected": "已检测",
+    "confirmed": "已确认",
     "recognized": "识别成功",
     "failed": "识别失败",
     "skipped": "已跳过",
@@ -89,6 +92,10 @@ DOCUMENT_COLUMN_LABELS = {
     "processing_time_ms": "区域耗时(ms)",
     "screening_passed": "通过二次筛选",
     "screening_reason": "筛选说明",
+    "confirmed": "已确认",
+    "annotation_status": "标注状态",
+    "review_queued": "已入审核队列",
+    "review_annotation_path": "审核标注",
 }
 
 

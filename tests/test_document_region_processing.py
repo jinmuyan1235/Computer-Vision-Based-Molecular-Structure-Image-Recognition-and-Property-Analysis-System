@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 import types
 import zipfile
@@ -91,6 +93,7 @@ class FakeDetector:
                 region_type=region.region_type,
                 detection_confidence=region.detection_confidence,
                 detector_name=self.name,
+                confirmed=region.confirmed,
             )
             for region in self.regions
         ]
@@ -112,6 +115,18 @@ class FakeReportGenerator:
         }
 
 
+class FailingReportGenerator(FakeReportGenerator):
+    def generate(self, image_path: str | Path) -> dict:
+        self.calls.append(Path(image_path))
+        return {
+            "status": "failed",
+            "message": "fake failure",
+            "input": {"path": str(image_path)},
+            "ocsr": {"backend": "demo", "status": "failed"},
+            "final": {},
+        }
+
+
 def test_single_page_pdf_processes_with_fake_renderer(tmp_path: Path) -> None:
     page = _make_page(tmp_path / "aspirin_page.png", ["aspirin"], text="single molecule")
     pdf = _make_pdf(tmp_path / "aspirin_doc.pdf")
@@ -120,11 +135,12 @@ def test_single_page_pdf_processes_with_fake_renderer(tmp_path: Path) -> None:
     result = processor.process(pdf)
     assert result["summary"]["page_count"] == 1
     assert result["summary"]["molecule_region_count"] >= 1
-    assert result["summary"]["recognized_region_count"] >= 1
+    assert result["summary"]["recognized_region_count"] == 0
     first = next(region for region in result["regions"] if region["region_type"] == "molecule")
     assert first["page_number"] == 1
     assert len(first["bbox"]) == 4
-    assert Path(first["crop_path"]).is_file()
+    assert first["confirmed"] is False
+    assert first["crop_path"] is None
     assert Path(result["exports"]["json"]).is_file()
     assert Path(result["exports"]["regions_csv"]).is_file()
     assert Path(result["exports"]["structures_sdf"]).is_file()
@@ -155,10 +171,11 @@ def test_real_pymupdf_pdf_rendering_when_available(tmp_path: Path) -> None:
 
     assert result["summary"]["page_count"] == 1
     assert result["summary"]["molecule_region_count"] >= 1
-    assert result["summary"]["recognized_region_count"] >= 1
+    assert result["summary"]["recognized_region_count"] == 0
     molecule_region = next(region for region in result["regions"] if region["region_type"] == "molecule")
     assert molecule_region["page_number"] == 1
     assert molecule_region["bbox"][2] > molecule_region["bbox"][0]
+    assert molecule_region["confirmed"] is False
     assert Path(result["exports"]["json"]).is_file()
 
 
@@ -189,6 +206,24 @@ def test_detect_only_mode_does_not_call_ocsr(tmp_path: Path) -> None:
     assert result["regions"][0]["status"] == "detected"
 
 
+def test_full_document_mode_does_not_recognize_unconfirmed_regions(tmp_path: Path) -> None:
+    page_path = _make_page(tmp_path / "aspirin_page.png", ["aspirin"])
+    detector = FakeDetector([
+        DocumentRegion("doc", 1, "p001_r001", (70, 120, 360, 380), "molecule", 0.9),
+    ])
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector)
+    fake_generator = FakeReportGenerator()
+    processor.report_generator = fake_generator
+
+    result = processor.process(page_path, run_ocsr=True)
+
+    assert fake_generator.calls == []
+    assert result["processing"]["candidate_region_count"] == 1
+    assert result["processing"]["confirmed_candidate_region_count"] == 0
+    assert result["regions"][0]["status"] == "detected"
+    assert "等待人工确认" in result["regions"][0]["message"]
+
+
 def test_default_processor_uses_hybrid_detector(tmp_path: Path) -> None:
     processor = DocumentOCSRProcessor("demo", tmp_path / "out")
     assert isinstance(processor.detector, HybridMoleculeRegionDetector)
@@ -198,8 +233,8 @@ def test_default_processor_uses_hybrid_detector(tmp_path: Path) -> None:
 def test_full_document_mode_only_recognizes_screened_molecule_regions(tmp_path: Path) -> None:
     page_path = _make_page(tmp_path / "aspirin_page.png", ["aspirin"], text="Aspirin")
     detector = FakeDetector([
-        DocumentRegion("doc", 1, "p001_r001", (70, 120, 360, 380), "molecule", 0.9),
-        DocumentRegion("doc", 1, "p001_r002", (45, 20, 340, 70), "molecule", 0.8),
+        DocumentRegion("doc", 1, "p001_r001", (70, 120, 360, 380), "molecule", 0.9, confirmed=True),
+        DocumentRegion("doc", 1, "p001_r002", (45, 20, 340, 70), "molecule", 0.8, confirmed=True),
         DocumentRegion("doc", 1, "p001_r003", (30, 480, 400, 540), "text", 0.8),
     ])
     processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector)
@@ -209,6 +244,7 @@ def test_full_document_mode_only_recognizes_screened_molecule_regions(tmp_path: 
     result = processor.process(page_path, run_ocsr=True)
 
     assert result["processing"]["mode"] == "detect_and_recognize"
+    assert result["processing"]["confirmed_candidate_region_count"] == 2
     assert len(fake_generator.calls) == 1
     statuses = {region["region_id"]: region for region in result["regions"]}
     assert statuses["p001_r001"]["status"] == "recognized"
@@ -220,7 +256,7 @@ def test_full_document_mode_only_recognizes_screened_molecule_regions(tmp_path: 
 def test_invalid_bbox_is_not_sent_to_ocsr(tmp_path: Path) -> None:
     page_path = _make_page(tmp_path / "aspirin_page.png", ["aspirin"])
     page = DocumentPage("doc", 1, str(page_path), 900, 600)
-    region = DocumentRegion("doc", 1, "p001_r001", (100, 100, 100, 120), "molecule", 0.9)
+    region = DocumentRegion("doc", 1, "p001_r001", (100, 100, 100, 120), "molecule", 0.9, confirmed=True)
     processor = DocumentOCSRProcessor("demo", tmp_path / "out")
     fake_generator = FakeReportGenerator()
     processor.report_generator = fake_generator
@@ -345,7 +381,7 @@ def test_multiline_text_block_is_filtered_before_ocsr(tmp_path: Path) -> None:
     page_image.save(page_path)
 
     page = DocumentPage("doc", 1, str(page_path), 900, 600)
-    region = DocumentRegion("doc", 1, "p001_r001", (50, 50, 820, 310), "molecule", 0.9)
+    region = DocumentRegion("doc", 1, "p001_r001", (50, 50, 820, 310), "molecule", 0.9, confirmed=True)
     processor = DocumentOCSRProcessor("demo", tmp_path / "out")
     fake_generator = FakeReportGenerator()
     processor.report_generator = fake_generator
@@ -410,6 +446,7 @@ def test_region_editing_records_audit_and_reruns(tmp_path: Path) -> None:
             "page_number": page["page_number"],
             "bbox": [70, 120, 360, 380],
             "region_type": "molecule",
+            "confirmed": True,
         }],
         rerun_ocsr=True,
     )
@@ -419,13 +456,111 @@ def test_region_editing_records_audit_and_reruns(tmp_path: Path) -> None:
     assert added["report"]["input"]["bbox"] == added["bbox"]
 
 
-def test_single_region_failure_does_not_stop_other_regions(tmp_path: Path) -> None:
+def test_region_merge_split_page_confirm_and_annotation_export(tmp_path: Path) -> None:
+    page_path = _make_page(tmp_path / "two_region_page.png", ["aspirin", "benzene"])
+    detector = FakeDetector([
+        DocumentRegion("doc", 1, "p001_r001", (70, 120, 330, 370), "molecule", 0.9),
+        DocumentRegion("doc", 1, "p001_r002", (490, 120, 790, 380), "text", 0.7),
+    ])
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector)
+    result = processor.process(page_path, run_ocsr=False)
+
+    confirmed = processor.apply_edits(
+        result,
+        [{"action": "confirm_page", "page_number": 1}],
+        rerun_ocsr=False,
+    )
+    assert confirmed["summary"]["confirmed_region_count"] == 2
+
+    merged = processor.apply_edits(
+        confirmed,
+        [{
+            "action": "merge",
+            "region_ids": ["p001_r001", "p001_r002"],
+            "region_type": "molecule",
+            "confirmed": True,
+        }],
+        rerun_ocsr=False,
+    )
+    active = [region for region in merged["regions"] if region["status"] != "deleted"]
+    assert len(active) == 1
+    assert active[0]["bbox"] == [70, 120, 790, 380]
+    assert active[0]["confirmed"] is True
+    assert any(event["operation"] == "merge" for event in active[0]["audit"])
+
+    split = processor.apply_edits(
+        merged,
+        [{
+            "action": "split",
+            "region_id": active[0]["region_id"],
+            "direction": "vertical",
+            "split_at": 0.5,
+            "region_type": "molecule",
+            "confirmed": True,
+        }],
+        rerun_ocsr=False,
+    )
+    active_split = [region for region in split["regions"] if region["status"] != "deleted"]
+    assert len(active_split) == 2
+    assert all(region["confirmed"] for region in active_split)
+    assert split["summary"]["confirmed_region_count"] == 2
+
+    annotations_path = Path(split["exports"]["detection_annotations_json"])
+    payload = json.loads(annotations_path.read_text(encoding="utf-8"))
+    assert payload["summary"]["region_count"] == 2
+    assert [region["label"] for region in payload["annotations"][0]["regions"]] == ["molecule", "molecule"]
+
+
+def test_document_detection_annotation_export_script(tmp_path: Path) -> None:
+    page_path = _make_page(tmp_path / "export_page.png", ["aspirin"])
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=FakeDetector([
+        DocumentRegion("doc", 1, "p001_r001", (70, 120, 360, 380), "molecule", 0.9),
+    ]))
+    result = processor.process(page_path, run_ocsr=False)
+    result = processor.apply_edits(result, [{"action": "confirm_page", "page_number": 1}], rerun_ocsr=False)
+    output = tmp_path / "annotations.json"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "export_document_detection_annotations.py"),
+            "--document-result",
+            result["exports"]["json"],
+            "--output",
+            str(output),
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["summary"]["region_count"] == 1
+    assert payload["annotations"][0]["regions"][0]["bbox"] == [70, 120, 360, 380]
+
+
+def test_single_region_failure_does_not_stop_other_regions_and_enters_review_queue(tmp_path: Path) -> None:
     page_path = _make_page(tmp_path / "unknown_page.png", ["aspirin", "benzene"])
-    result = DocumentOCSRProcessor("demo", tmp_path / "out").process(page_path)
+    detector = FakeDetector([
+        DocumentRegion("doc", 1, "p001_r001", (70, 120, 360, 380), "molecule", 0.9, confirmed=True),
+        DocumentRegion("doc", 1, "p001_r002", (490, 120, 780, 380), "molecule", 0.9, confirmed=True),
+    ])
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector, review_output_dir=tmp_path / "data")
+    failing_generator = FailingReportGenerator()
+    processor.report_generator = failing_generator
+
+    result = processor.process(page_path)
+
     molecule_regions = [region for region in result["regions"] if region["region_type"] == "molecule"]
-    assert len(molecule_regions) >= 2
+    assert len(molecule_regions) == 2
     assert all(region["status"] == "failed" for region in molecule_regions)
+    assert all((region.get("review") or {}).get("queued") for region in molecule_regions)
+    assert len(failing_generator.calls) == 2
+    assert result["summary"]["review_queue_count"] == 2
     assert Path(result["exports"]["failure_cases_csv"]).is_file()
+    assert Path(tmp_path / "data" / "feedback" / "manifest.csv").is_file()
 
 
 def test_file_size_limit_is_reported(tmp_path: Path) -> None:
@@ -437,9 +572,23 @@ def test_file_size_limit_is_reported(tmp_path: Path) -> None:
 
 def test_region_csv_contains_coordinates_and_final_result(tmp_path: Path) -> None:
     page_path = _make_page(tmp_path / "aspirin_page.png", ["aspirin"])
-    result = DocumentOCSRProcessor("demo", tmp_path / "out").process(page_path)
+    detector = FakeDetector([
+        DocumentRegion("doc", 1, "p001_r001", (70, 120, 360, 380), "molecule", 0.9, confirmed=True),
+    ])
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector)
+    processor.report_generator = FakeReportGenerator()
+    result = processor.process(page_path)
     frame = pd.read_csv(result["exports"]["regions_csv"])
-    assert {"document_id", "page_number", "region_id", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2"}.issubset(frame.columns)
+    assert {
+        "document_id",
+        "page_number",
+        "region_id",
+        "bbox_x1",
+        "bbox_y1",
+        "bbox_x2",
+        "bbox_y2",
+        "confirmed",
+    }.issubset(frame.columns)
     molecule_rows = frame[frame["region_type"] == "molecule"]
     assert not molecule_rows.empty
     assert "final_smiles" in frame.columns
