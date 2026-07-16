@@ -99,9 +99,11 @@ def test_batch_default_table_headers_are_chinese() -> None:
 
 
 def test_document_region_type_labels_cover_reaction_workflow() -> None:
+    assert REGION_TYPE_LABELS["reaction"] == "反应式"
     assert REGION_TYPE_LABELS["reaction_arrow"] == "反应箭头"
     assert REGION_TYPE_LABELS["reaction_condition"] == "反应条件"
     assert REGION_TYPE_LABELS["figure"] == "普通图像/插图"
+    assert REGION_TYPE_LABELS["ignore"] == "忽略"
 
 
 def test_batch_chart_source_uses_chinese_labels() -> None:

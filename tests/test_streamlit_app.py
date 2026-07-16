@@ -98,9 +98,13 @@ def test_image_editor_supports_visual_two_point_crop() -> None:
 def test_document_page_uses_chinese_mode_labels() -> None:
     source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "document_page.py").read_text(encoding="utf-8")
     assert "仅检测分子区域（速度快，不执行结构识别）" in source
-    assert "检测并识别分子结构（调用 OCSR，耗时较长）" in source
+    assert "检测并识别已确认分子区域（新检测结果需先人工确认）" in source
     assert "Update bbox and rerun" not in source
     assert "Delete region" not in source
+    assert "确认并识别" in source
+    assert "合并两个或多个区域" in source
+    assert "拆分当前区域" in source
+    assert "下载检测训练标注" in source
 
 
 def test_document_subprocess_json_parser_ignores_trailing_logs() -> None:

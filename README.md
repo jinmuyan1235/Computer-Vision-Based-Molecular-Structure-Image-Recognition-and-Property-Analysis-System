@@ -713,7 +713,7 @@ python scripts/evaluate_ocsr.py \
 
 ## PDF and Multi-Molecule Document Processing
 
-The document workflow lets users upload a PDF, a full-page PNG/JPG image, or a ZIP archive of page images. It expands the input into page images, runs a lightweight OpenCV molecule-region detector, crops each region, sends molecule regions to the selected OCSR backend, and exports document-level results that keep page numbers and bbox coordinates.
+The document workflow lets users upload a PDF, a full-page PNG/JPG image, or a ZIP archive of page images. It expands the input into page images, runs a lightweight OpenCV molecule-region detector, lets a reviewer confirm or edit regions, sends only confirmed molecule regions to the selected OCSR backend, and exports document-level results that keep page numbers and bbox coordinates.
 
 Example CLI:
 
@@ -731,6 +731,14 @@ python scripts/process_document.py \
   --input data/documents/page.png \
   --backend demo \
   --detect-only
+```
+
+Export confirmed document-region annotations for future detector training:
+
+```bash
+python scripts/export_document_detection_annotations.py \
+  --document-result data/outputs/documents/<run>/document_result.json \
+  --output data/outputs/documents/<run>/detection_annotations.json
 ```
 
 PDF rendering uses optional PyMuPDF when installed:
@@ -773,6 +781,7 @@ Each region is exported with:
   "region_id": "p003_r005",
   "bbox": [x1, y1, x2, y2],
   "region_type": "molecule",
+  "confirmed": true,
   "detection_confidence": 0.88,
   "crop_path": "...",
   "ocsr": {},
@@ -780,15 +789,16 @@ Each region is exported with:
 }
 ```
 
-The document detector is pluggable: `HybridMoleculeRegionDetector` can combine a future trainable layout model with the OpenCV fallback. The fallback distinguishes `molecule`, `reaction_arrow`, `reaction_condition`, `reaction_like`, `text`, `table`, `figure`, and `unknown`. Reaction regions, text, tables, figures, and manually marked `non_molecule` regions are not sent to single-molecule OCSR by default. Reaction parsing is not implemented in this task, so reaction graphics are recorded as unsupported rather than treated as ordinary molecules.
+The document detector is pluggable: `HybridMoleculeRegionDetector` can combine a future trainable layout model with the OpenCV fallback. The fallback distinguishes `molecule`, `reaction_arrow`, `reaction_condition`, `reaction_like`, `text`, `table`, `figure`, and `unknown`; the audit UI also provides coarse labels `molecule`, `text`, `table`, `reaction`, and `ignore`. Reaction regions, text, tables, figures, ignored regions, and unconfirmed molecule regions are not sent to single-molecule OCSR by default. Reaction parsing is not implemented in this task, so reaction graphics are recorded as unsupported rather than treated as ordinary molecules.
 
-Streamlit provides a `PDF/多分子文档` tab for page review, detected boxes, deletion of false positives, manual bbox addition, coordinate adjustment, region type changes, single-region reprocessing, and result downloads. User edits are recorded in each region's `audit` list with before/after bbox/type metadata and timestamp.
+Streamlit provides a `PDF/多分子文档` tab for page review, detected boxes, draggable/resizeable bbox adjustment, deletion of false positives, manual bbox addition, coordinate adjustment, region type changes, merge/split operations, page-level batch confirmation, single-region reprocessing, failed-region review-queue routing, detection-annotation export, and result downloads. User edits are recorded in each region's `audit` list with before/after bbox/type metadata and timestamp.
 
 Each document run writes an isolated output directory containing:
 
 - `document_result.json`
 - `regions.csv`
 - `failed_regions.csv`
+- `detection_annotations.json`
 - `crops/`
 - `redrawn/`
 - `annotated_pages/`

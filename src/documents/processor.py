@@ -20,14 +20,15 @@ from src.analysis.molecule_report import MoleculeReportGenerator
 from src.documents.detectors import BaseMoleculeRegionDetector, HeuristicMoleculeRegionDetector, HybridMoleculeRegionDetector
 from src.documents.input_loader import DocumentInputLoader
 from src.documents.models import DocumentPage, DocumentRegion, normalize_bbox, relative_path
-from src.documents.region_editing import apply_region_edits, summarize_regions
+from src.documents.region_editing import apply_region_edits, is_region_confirmed, summarize_regions
 from src.export.csv_exporter import save_csv
 from src.export.json_exporter import save_json
 from src.export.structure_exporter import export_batch_structure_files
+from src.feedback.store import export_document_detection_annotations, save_review_queue_item
 from src.utils.file_utils import ensure_directory
 
 
-REACTION_REGION_TYPES = {"reaction_like", "reaction_arrow", "reaction_condition"}
+REACTION_REGION_TYPES = {"reaction", "reaction_like", "reaction_arrow", "reaction_condition"}
 
 
 class DocumentOCSRProcessor:
@@ -40,6 +41,7 @@ class DocumentOCSRProcessor:
         detector: BaseMoleculeRegionDetector | None = None,
         loader: DocumentInputLoader | None = None,
         runtime_config: dict[str, Any] | None = None,
+        review_output_dir: str | Path | None = None,
     ) -> None:
         self.output_dir = ensure_directory(output_dir)
         self.backend = backend
@@ -50,6 +52,7 @@ class DocumentOCSRProcessor:
             output_dir=self.output_dir,
             runtime_config=runtime_config,
         )
+        self.review_output_dir = Path(review_output_dir).expanduser().resolve() if review_output_dir else None
 
     def process(
         self,
@@ -83,6 +86,10 @@ class DocumentOCSRProcessor:
         if run_ocsr:
             candidates: list[DocumentRegion] = []
             for region in regions:
+                if region.region_type == "molecule" and not is_region_confirmed(region.to_dict()):
+                    region.status = "detected"
+                    region.message = "等待人工确认后识别。"
+                    continue
                 if self.prepare_region_for_ocsr(region, pages):
                     candidates.append(region)
                 elif region.region_type == "molecule":
@@ -101,6 +108,10 @@ class DocumentOCSRProcessor:
             "recognized_candidate_count": recognized_candidates,
             "skipped_candidate_count": skipped_candidates,
             "candidate_region_count": len([region for region in regions if region.region_type == "molecule"]),
+            "confirmed_candidate_region_count": len([
+                region for region in regions
+                if region.region_type == "molecule" and is_region_confirmed(region.to_dict())
+            ]),
         }
         result["exports"] = self.export(result, document_dir)
         return result
@@ -125,12 +136,14 @@ class DocumentOCSRProcessor:
                 source=region.get("source", "detector"),
                 detector_name=region.get("detector_name"),
                 status=region.get("status", "detected"),
+                confirmed=bool(region.get("confirmed")),
                 message=region.get("message"),
                 audit=region.get("audit", []),
                 ocsr=region.get("ocsr", {}),
                 final_result=region.get("final_result", {}),
                 report=region.get("report"),
                 screening=region.get("screening", {}),
+                review=region.get("review", {}),
                 processing_time_ms=region.get("processing_time_ms"),
             )
             self.recognize_region(region_obj, pages, document_dir, screen=screen)
@@ -156,22 +169,29 @@ class DocumentOCSRProcessor:
                 "bbox": list(region.bbox),
                 "region_type": region.region_type,
                 "detection_confidence": region.detection_confidence,
+                "confirmed": region.confirmed,
             })
+            report.setdefault("analysis_id", f"{region.document_id}_{region.region_id}")
+            report.setdefault("input", {})
             report["input"]["document_id"] = region.document_id
             report["input"]["page_number"] = region.page_number
             report["input"]["region_id"] = region.region_id
             report["input"]["bbox"] = list(region.bbox)
+            report["input"]["type"] = "document_region"
             region.report = report
             region.ocsr = report.get("ocsr") or {}
             region.final_result = report.get("final") or {}
             region.status = "recognized" if report.get("status") == "success" else "failed"
             region.message = report.get("message") or ("识别成功。" if region.status == "recognized" else "识别失败。")
             region.processing_time_ms = round((perf_counter() - region_started) * 1000, 2)
+            if region.status == "failed":
+                self._queue_failed_region_for_review(region)
         except Exception as exc:
             region.status = "failed"
             region.message = f"区域识别失败：{exc}"
             region.processing_time_ms = round((perf_counter() - region_started) * 1000, 2)
             region.report = {
+                "analysis_id": f"{region.document_id}_{region.region_id}",
                 "status": "failed",
                 "message": region.message,
                 "input": {
@@ -182,7 +202,17 @@ class DocumentOCSRProcessor:
                     "bbox": list(region.bbox),
                     "path": str(crop_path) if crop_path is not None else None,
                 },
+                "document_region": {
+                    "document_id": region.document_id,
+                    "page_number": region.page_number,
+                    "region_id": region.region_id,
+                    "bbox": list(region.bbox),
+                    "region_type": region.region_type,
+                    "detection_confidence": region.detection_confidence,
+                    "confirmed": region.confirmed,
+                },
             }
+            self._queue_failed_region_for_review(region)
         return region
 
     def prepare_region_for_ocsr(
@@ -198,6 +228,11 @@ class DocumentOCSRProcessor:
             region.status = "skipped"
             region.message = self._non_molecule_skip_message(region.region_type)
             region.screening = {"passed": False, "reason": region.message, "detector_message": detector_message}
+            return False
+        if not is_region_confirmed(region.to_dict()):
+            region.status = "detected"
+            region.message = "等待人工确认后识别。"
+            region.screening = {"passed": False, "reason": region.message, "requires_confirmation": True}
             return False
         try:
             page = self._find_page(pages, region.page_number)
@@ -226,6 +261,8 @@ class DocumentOCSRProcessor:
             return "该区域是文本，已跳过单分子识别。"
         if region_type == "figure":
             return "该区域像普通图像/插图，已跳过单分子识别，建议人工确认。"
+        if region_type == "ignore":
+            return "该区域已标记为忽略，已跳过单分子识别。"
         return "该区域不是单个分子结构，已跳过单分子识别。"
 
     def _screen_region_candidate(
@@ -352,7 +389,11 @@ class DocumentOCSRProcessor:
         document_dir = Path(updated["output_dir"])
         if rerun_ocsr:
             for region in updated.get("regions", []):
-                if region.get("status") in {"edited", "detected"} and region.get("region_type") == "molecule":
+                if (
+                    region.get("status") in {"confirmed", "edited", "detected", "failed"}
+                    and region.get("region_type") == "molecule"
+                    and is_region_confirmed(region)
+                ):
                     self.recognize_region(region, updated.get("pages", []), document_dir)
         updated["summary"] = self._summary(updated.get("pages", []), updated.get("regions", []), updated.get("detection_errors", []))
         updated["exports"] = self.export(updated, document_dir)
@@ -395,6 +436,11 @@ class DocumentOCSRProcessor:
             file_prefix="document",
         )
         annotated_paths = self._save_annotated_pages(document_result, output_root)
+        detection_annotations = export_document_detection_annotations(
+            [document_result],
+            output_root / "detection_annotations.json",
+            root=output_root,
+        )
         redrawn_dir = ensure_directory(output_root / "redrawn")
         for region in document_result.get("regions", []):
             redrawn = (((region.get("report") or {}).get("images") or {}).get("redrawn_molecule"))
@@ -411,6 +457,7 @@ class DocumentOCSRProcessor:
             "structures_zip": structure_exports["successful_zip"],
             "structure_failed_csv": structure_exports["failed_csv"],
             "structure_review_csv": structure_exports["review_csv"],
+            "detection_annotations_json": detection_annotations["output_path"],
         }
         document_result["exports"] = exports
         json_path = save_json(document_result, output_root / "document_result.json")
@@ -441,11 +488,15 @@ class DocumentOCSRProcessor:
                 "detection_confidence": region.get("detection_confidence"),
                 "source": region.get("source"),
                 "status": region.get("status"),
+                "confirmed": bool(region.get("confirmed")),
+                "annotation_status": region.get("annotation_status"),
                 "message": region.get("message"),
                 "crop_path": relative_path(region.get("crop_path"), output_dir) if region.get("crop_path") else None,
                 "audit_count": len(region.get("audit") or []),
                 "screening_passed": (region.get("screening") or {}).get("passed"),
                 "screening_reason": (region.get("screening") or {}).get("reason"),
+                "review_queued": (region.get("review") or {}).get("queued"),
+                "review_annotation_path": (region.get("review") or {}).get("annotation_path"),
                 "processing_time_ms": region.get("processing_time_ms"),
             }
             row.update({key: value for key, value in flat.items() if key not in row})
@@ -476,6 +527,32 @@ class DocumentOCSRProcessor:
             "summary": self._summary(page_dicts, region_dicts, detection_errors),
             "exports": {},
         }
+
+    def _queue_failed_region_for_review(self, region: DocumentRegion) -> None:
+        if self.review_output_dir is None or not is_region_confirmed(region.to_dict()):
+            return
+        if (region.review or {}).get("queued"):
+            return
+        report = region.report or {}
+        if not report:
+            return
+        try:
+            queued = save_review_queue_item(
+                report,
+                output_dir=self.review_output_dir,
+                notes=f"Document region recognition failed: {region.document_id}/{region.region_id}",
+                correction_type="other",
+                source_reference=f"{region.document_id}:page-{region.page_number}:{region.region_id}",
+                source_license="unspecified",
+            )
+            region.review = {
+                "queued": True,
+                "annotation_path": queued.get("annotation_path"),
+                "manifest_path": queued.get("manifest_path"),
+                "review_status": queued.get("review_status"),
+            }
+        except Exception as exc:
+            region.review = {"queued": False, "error": str(exc)}
 
     @staticmethod
     def _summary(

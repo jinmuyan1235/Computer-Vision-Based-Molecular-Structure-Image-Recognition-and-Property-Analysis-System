@@ -37,7 +37,12 @@ def main() -> int:
             "decimer_device": args.decimer_device,
             "visible_gpu_index": args.visible_gpu_index,
         }
-        processor = DocumentOCSRProcessor(backend=args.backend, output_dir=args.output, runtime_config=runtime_config)
+        processor = DocumentOCSRProcessor(
+            backend=args.backend,
+            output_dir=args.output,
+            runtime_config=runtime_config,
+            review_output_dir=config.DATA_DIR,
+        )
         result = processor.process(args.input, run_ocsr=not args.detect_only)
         record_result_payload(result, result.get("exports", {}).get("json"))
     except OptionalDependencyError as exc:
