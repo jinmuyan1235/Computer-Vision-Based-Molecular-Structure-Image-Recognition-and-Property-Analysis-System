@@ -31,14 +31,22 @@ OUTPUT_STAGE_LABELS = {
 CROP_QUERY_KEYS = ("crop_editor_key", "crop_x", "crop_y", "crop_click_nonce")
 
 
-def render_image_editor(image_bytes: bytes, filename: str, key_prefix: str = "single_image") -> tuple[dict[str, Any], bytes, bool]:
+def render_image_editor(
+    image_bytes: bytes,
+    filename: str,
+    key_prefix: str = "single_image",
+    *,
+    expanded: bool = False,
+    show_json: bool = True,
+) -> tuple[dict[str, Any], bytes, bool]:
     """Render lightweight preprocessing controls and return adjustments plus preview bytes."""
     dimensions = image_dimensions(image_bytes)
     default_bbox = [0, 0, dimensions["width"], dimensions["height"]]
     image_identity = image_identity_from_bytes(image_bytes, dimensions)
     _prepare_crop_state(key_prefix, image_identity, default_bbox)
     _consume_crop_click(key_prefix, dimensions)
-    with st.expander("单图预处理编辑器", expanded=False):
+    container = st.container() if expanded else st.expander("单图预处理编辑器", expanded=False)
+    with container:
         st.caption(f"{filename} | {dimensions['width']} × {dimensions['height']}")
         controls = st.columns(4)
         use_crop = controls[0].checkbox("裁剪", value=False, key=f"{key_prefix}_crop_enabled")
@@ -90,7 +98,8 @@ def render_image_editor(image_bytes: bytes, filename: str, key_prefix: str = "si
         except Exception as exc:
             st.warning(f"预处理预览失败：{exc}")
             adjusted_bytes = image_bytes
-        st.json({"user_preprocessing": adjustments})
+        if show_json:
+            st.json({"user_preprocessing": adjustments})
     return adjustments, adjusted_bytes, has_user_adjustments(adjustments)
 
 

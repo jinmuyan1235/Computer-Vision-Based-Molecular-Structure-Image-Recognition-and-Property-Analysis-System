@@ -65,8 +65,9 @@ def render_blocked_workflow(health: Mapping[str, Any] | None, workflow_name: str
 def render_health_page(health: Mapping[str, Any] | None) -> None:
     """Render the full health-check page."""
     st.subheader("生产启动健康检查")
-    if st.button("重新执行健康检查", key="force_health_check"):
+    if st.button("执行完整模型预热", key="force_health_check"):
         st.session_state["health_force_refresh"] = True
+        st.session_state["health_full_warmup"] = True
         st.rerun()
     if not health:
         st.info("尚未生成健康检查结果。")

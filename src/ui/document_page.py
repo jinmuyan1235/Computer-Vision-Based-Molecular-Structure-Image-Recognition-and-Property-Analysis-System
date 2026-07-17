@@ -20,7 +20,7 @@ from src.documents.input_loader import DocumentInputError, OptionalDependencyErr
 from src.documents.processor import DocumentOCSRProcessor
 from src.storage.analysis_repository import record_result_payload
 from src.ui.image_viewer import show_document_page
-from src.ui.labels import REGION_TYPE_LABELS, localize_region_rows
+from src.ui.labels import REGION_TYPE_LABELS, localize_region_rows, region_type_label, status_label
 from src.ui.records import render_records
 from src.ui.state import current_runtime_key, get_document_processor, remember_backend_status, runtime_config_from_key
 from src.ui.styles import page_intro
@@ -307,7 +307,209 @@ def show_document_result(document_result: dict, backend: str) -> dict:
     rows = DocumentOCSRProcessor.region_rows(document_result)
     if not rows:
         st.info("未检测到分子候选区域。可以在下方手动添加区域。")
-    elif st.checkbox("显示区域结果表", value=False, key="show_document_region_table"):
+        _render_document_toolbar(document_result, backend, rows, None)
+    else:
+        document_result = _document_workbench(document_result, backend, rows)
+
+    logs = st.session_state.get("document_job_logs") or {}
+    if logs:
+        st.caption(f"最近一次后台日志：{logs.get('stdout_path')} / {logs.get('stderr_path')}")
+
+    return document_result
+
+
+def _document_workbench(document_result: dict, backend: str, rows: list[dict]) -> dict:
+    active = [region for region in document_result.get("regions", []) if region.get("status") != "deleted"]
+    if not active:
+        st.info("当前没有可编辑的区域。")
+        _render_document_toolbar(document_result, backend, rows, None)
+        return document_result
+
+    selected_id = _selected_region_id(active)
+    selected = next((region for region in active if region["region_id"] == selected_id), active[0])
+    document_result = _render_document_toolbar(document_result, backend, rows, selected)
+    _consume_document_bbox_query(selected["region_id"])
+    bbox = selected.get("bbox") or [0, 0, 1, 1]
+    for key, value in zip(("x1", "y1", "x2", "y2"), bbox):
+        st.session_state.setdefault(f"edit_{key}_{selected['region_id']}", int(value))
+
+    region_list, canvas, inspector = st.columns([0.22, 0.53, 0.25])
+    with region_list:
+        selected = _render_region_list(active, selected["region_id"])
+    with canvas:
+        page = _page_for_region(document_result, selected)
+        if page:
+            preview_bbox = [
+                int(st.session_state.get(f"edit_x1_{selected['region_id']}", (selected.get("bbox") or [0, 0, 1, 1])[0])),
+                int(st.session_state.get(f"edit_y1_{selected['region_id']}", (selected.get("bbox") or [0, 0, 1, 1])[1])),
+                int(st.session_state.get(f"edit_x2_{selected['region_id']}", (selected.get("bbox") or [0, 0, 1, 1])[2])),
+                int(st.session_state.get(f"edit_y2_{selected['region_id']}", (selected.get("bbox") or [0, 0, 1, 1])[3])),
+            ]
+            _render_bbox_dragger(page, active, selected["region_id"], preview_bbox)
+        else:
+            st.warning("当前区域找不到对应页面图像。")
+    with inspector:
+        _render_region_inspector(document_result, backend, selected)
+    return document_result
+
+
+def _selected_region_id(active: list[dict]) -> str:
+    active_ids = [str(region["region_id"]) for region in active]
+    current = str(st.session_state.get("document_region_select") or active_ids[0])
+    return current if current in active_ids else active_ids[0]
+
+
+def _render_region_list(active: list[dict], selected_id: str) -> dict:
+    st.subheader("区域列表")
+    page_options = ["全部"] + [str(page) for page in sorted({int(region.get("page_number", 0)) for region in active})]
+    selected_page = st.selectbox("页码", page_options, key="document_filter_page")
+    type_options = ["全部", *AUDIT_REGION_TYPES]
+    selected_type = st.selectbox(
+        "类型",
+        type_options,
+        key="document_filter_type",
+        format_func=lambda value: "全部" if value == "全部" else REGION_TYPE_LABELS.get(value, value),
+    )
+    status_options = ["全部", "待确认", "已确认", "识别成功", "识别失败", "已跳过"]
+    selected_status = st.selectbox("状态", status_options, key="document_filter_status")
+    filtered = [
+        region
+        for region in active
+        if (selected_page == "全部" or str(region.get("page_number")) == selected_page)
+        and (selected_type == "全部" or _audit_region_type(region.get("region_type")) == selected_type)
+        and _region_matches_status(region, selected_status)
+    ]
+    if not filtered:
+        st.info("没有匹配区域。")
+        filtered = active
+    ids = [str(region["region_id"]) for region in filtered]
+    if selected_id not in ids:
+        selected_id = ids[0]
+    choice = st.radio(
+        "当前区域",
+        ids,
+        index=ids.index(selected_id),
+        key="document_region_select",
+        format_func=lambda region_id: _region_option_label(next(region for region in filtered if str(region["region_id"]) == region_id)),
+        label_visibility="collapsed",
+    )
+    return next(region for region in filtered if str(region["region_id"]) == str(choice))
+
+
+def _region_matches_status(region: dict, selected_status: str) -> bool:
+    if selected_status == "全部":
+        return True
+    if selected_status == "待确认":
+        return not bool(region.get("confirmed"))
+    if selected_status == "已确认":
+        return bool(region.get("confirmed"))
+    mapping = {
+        "识别成功": "recognized",
+        "识别失败": "failed",
+        "已跳过": "skipped",
+    }
+    return str(region.get("status") or "") == mapping.get(selected_status)
+
+
+def _region_option_label(region: dict) -> str:
+    status = "已确认" if region.get("confirmed") else status_label(region.get("status") or "detected")
+    return (
+        f"第 {region.get('page_number')} 页 · "
+        f"{region.get('region_id')} · "
+        f"{region_type_label(region.get('region_type'))} · {status}"
+    )
+
+
+def _render_region_inspector(document_result: dict, backend: str, selected: dict) -> None:
+    selected_id = str(selected["region_id"])
+    st.subheader("当前区域")
+    st.caption(f"页码：{selected.get('page_number')}；ID：{selected_id}")
+    st.write(f"**类型：** {region_type_label(selected.get('region_type'))}")
+    st.write(f"**状态：** {status_label(selected.get('status'))}")
+    st.write(f"**置信度：** {selected.get('detection_confidence') if selected.get('detection_confidence') is not None else '-'}")
+    if selected.get("final_smiles"):
+        st.code(str(selected.get("final_smiles")), language=None)
+
+    bbox = selected.get("bbox") or [0, 0, 1, 1]
+    with st.popover("坐标与类型"):
+        first_row = st.columns(2)
+        x1 = first_row[0].number_input("x1", min_value=0, value=int(st.session_state.get(f"edit_x1_{selected_id}", bbox[0])), key=f"edit_x1_{selected_id}")
+        y1 = first_row[1].number_input("y1", min_value=0, value=int(st.session_state.get(f"edit_y1_{selected_id}", bbox[1])), key=f"edit_y1_{selected_id}")
+        second_row = st.columns(2)
+        x2 = second_row[0].number_input("x2", min_value=1, value=int(st.session_state.get(f"edit_x2_{selected_id}", bbox[2])), key=f"edit_x2_{selected_id}")
+        y2 = second_row[1].number_input("y2", min_value=1, value=int(st.session_state.get(f"edit_y2_{selected_id}", bbox[3])), key=f"edit_y2_{selected_id}")
+        allowed = list(AUDIT_REGION_TYPES)
+        current = _audit_region_type(selected.get("region_type"))
+        region_type = st.selectbox(
+            "区域类型",
+            allowed,
+            index=allowed.index(current),
+            format_func=lambda value: REGION_TYPE_LABELS[value],
+            key=f"edit_type_{selected_id}",
+        )
+    confirmed = bool(selected.get("confirmed"))
+    if st.button("保存区域", key=f"update_region_{selected_id}"):
+        _apply_edits_with_notice(
+            document_result,
+            backend,
+            [{
+                "action": "update",
+                "region_id": selected_id,
+                "bbox": [x1, y1, x2, y2],
+                "region_type": region_type,
+                "confirmed": confirmed,
+            }],
+            rerun_ocsr=False,
+            message="区域已保存。",
+        )
+    if st.button("确认并识别", key=f"confirm_region_{selected_id}", type="primary"):
+        _apply_edits_with_notice(
+            document_result,
+            backend,
+            [{
+                "action": "update",
+                "region_id": selected_id,
+                "bbox": [x1, y1, x2, y2],
+                "region_type": region_type,
+                "confirmed": True,
+            }],
+            rerun_ocsr=region_type == "molecule",
+            message="区域已确认；分子区域已重新识别。",
+        )
+    minor = st.columns(2)
+    if minor[0].button("标记忽略", key=f"mark_region_{selected_id}"):
+        _apply_edits_with_notice(
+            document_result,
+            backend,
+            [{"action": "mark", "region_id": selected_id, "region_type": "ignore", "confirmed": True}],
+            rerun_ocsr=False,
+            message="区域已标记为忽略。",
+        )
+    with minor[1].popover("删除"):
+        st.warning("删除后该区域会从当前工作台中移除。")
+        if st.button("确认删除", key=f"delete_region_confirm_{selected_id}"):
+            _apply_edits_with_notice(
+                document_result,
+                backend,
+                [{"action": "delete", "region_id": selected_id, "note": "用户在界面删除区域。"}],
+                rerun_ocsr=False,
+                message="区域已删除。",
+            )
+
+
+def _render_document_toolbar(document_result: dict, backend: str, rows: list[dict], selected: dict | None) -> dict:
+    toolbar = st.columns([0.14, 0.12, 0.12, 0.16, 0.14, 0.32])
+    with toolbar[0].popover("新增区域"):
+        _render_add_region_popover(document_result, backend)
+    with toolbar[1].popover("合并"):
+        _render_merge_popover(document_result, backend, selected)
+    with toolbar[2].popover("拆分"):
+        _render_split_popover(document_result, backend, selected)
+    with toolbar[3].popover("批量操作"):
+        _render_batch_region_popover(document_result, backend)
+    with toolbar[4].popover("导出"):
+        _download_panel(document_result)
+    with toolbar[5].popover("结果表"):
         important = [
             "page_number",
             "region_id",
@@ -328,25 +530,139 @@ def show_document_result(document_result: dict, backend: str) -> dict:
             localize_region_rows(display_rows),
             title_keys=("区域 ID",),
             summary_keys=("页码", "区域类型", "状态", "最终 SMILES", "推理耗时(ms)"),
+            max_records=100,
         )
-        if st.checkbox("显示完整字段", value=False, key="show_document_full_table"):
-            render_records(
-                localize_region_rows(rows),
-                title_keys=("区域 ID",),
-                summary_keys=("页码", "区域类型", "状态", "说明", "最终 SMILES"),
-                max_records=100,
-            )
-
-    if st.checkbox("显示区域编辑工具", value=False, key="show_document_region_editor"):
-        document_result = _region_editor(document_result, backend)
-
-    logs = st.session_state.get("document_job_logs") or {}
-    if logs:
-        st.caption(f"最近一次后台日志：{logs.get('stdout_path')} / {logs.get('stderr_path')}")
-
-    if st.checkbox("显示结果导出", value=False, key="show_document_downloads"):
-        _download_panel(document_result)
     return document_result
+
+
+def _render_add_region_popover(document_result: dict, backend: str) -> None:
+    page_numbers = [int(page["page_number"]) for page in document_result.get("pages", [])]
+    if not page_numbers:
+        st.info("没有可添加区域的页面。")
+        return
+    page_number = st.selectbox("页码", page_numbers, key="add_region_page")
+    row1 = st.columns(2)
+    add_x1 = row1[0].number_input("新区域 x1", min_value=0, value=0, key="add_x1")
+    add_y1 = row1[1].number_input("新区域 y1", min_value=0, value=0, key="add_y1")
+    row2 = st.columns(2)
+    add_x2 = row2[0].number_input("新区域 x2", min_value=1, value=200, key="add_x2")
+    add_y2 = row2[1].number_input("新区域 y2", min_value=1, value=200, key="add_y2")
+    add_type = st.selectbox("新区域类型", AUDIT_REGION_TYPES, format_func=lambda value: REGION_TYPE_LABELS[value], key="add_type")
+    add_confirmed = st.checkbox("添加后立即确认", value=True, key="add_confirmed")
+    if st.button("添加区域", key="add_region"):
+        _apply_edits_with_notice(
+            document_result,
+            backend,
+            [{
+                "action": "add",
+                "page_number": page_number,
+                "bbox": [add_x1, add_y1, add_x2, add_y2],
+                "region_type": add_type,
+                "confirmed": add_confirmed,
+            }],
+            rerun_ocsr=add_confirmed and add_type == "molecule",
+            message="区域已添加。",
+        )
+
+
+def _render_merge_popover(document_result: dict, backend: str, selected: dict | None) -> None:
+    active = [region for region in document_result.get("regions", []) if region.get("status") != "deleted"]
+    if len(active) < 2:
+        st.info("至少需要两个区域才能合并。")
+        return
+    region_ids = [str(region["region_id"]) for region in active]
+    default = [str(selected["region_id"])] if selected else []
+    merge_ids = st.multiselect("待合并区域", region_ids, default=default, key="merge_region_ids")
+    current = _audit_region_type((selected or {}).get("region_type"))
+    merge_type = st.selectbox(
+        "合并后类型",
+        AUDIT_REGION_TYPES,
+        index=AUDIT_REGION_TYPES.index(current),
+        format_func=lambda value: REGION_TYPE_LABELS[value],
+        key="merge_region_type",
+    )
+    merge_confirmed = st.checkbox("合并后立即确认", value=False, key="merge_confirmed")
+    if st.button("合并区域", key="merge_regions", disabled=len(merge_ids) < 2):
+        _apply_edits_with_notice(
+            document_result,
+            backend,
+            [{
+                "action": "merge",
+                "region_ids": merge_ids,
+                "region_type": merge_type,
+                "confirmed": merge_confirmed,
+            }],
+            rerun_ocsr=merge_confirmed and merge_type == "molecule",
+            message="区域已合并。",
+        )
+
+
+def _render_split_popover(document_result: dict, backend: str, selected: dict | None) -> None:
+    if not selected:
+        st.info("请先选择一个区域。")
+        return
+    selected_id = str(selected["region_id"])
+    split_direction_label = st.radio("拆分方向", ["左右拆分", "上下拆分"], horizontal=True, key=f"split_direction_{selected_id}")
+    split_ratio = st.slider("拆分位置", 0.1, 0.9, 0.5, 0.05, key=f"split_ratio_{selected_id}")
+    current = _audit_region_type(selected.get("region_type"))
+    split_confirmed = st.checkbox("拆分后立即确认", value=False, key=f"split_confirmed_{selected_id}")
+    if st.button("拆分区域", key=f"split_region_{selected_id}"):
+        _apply_edits_with_notice(
+            document_result,
+            backend,
+            [{
+                "action": "split",
+                "region_id": selected_id,
+                "direction": "vertical" if split_direction_label == "左右拆分" else "horizontal",
+                "split_at": float(split_ratio),
+                "region_type": current,
+                "confirmed": split_confirmed,
+            }],
+            rerun_ocsr=split_confirmed and current == "molecule",
+            message="区域已拆分。",
+        )
+
+
+def _render_batch_region_popover(document_result: dict, backend: str) -> None:
+    active = [region for region in document_result.get("regions", []) if region.get("status") != "deleted"]
+    page_numbers = sorted({int(region["page_number"]) for region in active})
+    if not page_numbers:
+        st.info("没有可批量操作的区域。")
+        return
+    page_number_for_batch = st.selectbox("批量确认页码", page_numbers, key="confirm_page_number")
+    if st.button("确认本页全部区域", key=f"confirm_page_{page_number_for_batch}"):
+        _apply_edits_with_notice(
+            document_result,
+            backend,
+            [{"action": "confirm_page", "page_number": page_number_for_batch, "note": "页面批量确认。"}],
+            rerun_ocsr=False,
+            message="本页区域已批量确认。",
+        )
+    if st.button("确认本页并识别分子", key=f"confirm_page_ocsr_{page_number_for_batch}"):
+        _apply_edits_with_notice(
+            document_result,
+            backend,
+            [{"action": "confirm_page", "page_number": page_number_for_batch, "note": "页面批量确认并识别。"}],
+            rerun_ocsr=True,
+            message="本页区域已确认，已确认分子区域已识别。",
+        )
+
+
+def _apply_edits_with_notice(
+    document_result: dict,
+    backend: str,
+    edits: list[dict],
+    *,
+    rerun_ocsr: bool,
+    message: str,
+) -> None:
+    try:
+        updated = _apply_document_edits(document_result, backend, edits, rerun_ocsr=rerun_ocsr)
+        st.session_state["document_result"] = updated
+        st.success(message)
+        st.rerun()
+    except RuntimeError as exc:
+        st.error(str(exc))
 
 
 def _region_editor(document_result: dict, backend: str) -> dict:

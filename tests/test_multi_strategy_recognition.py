@@ -84,7 +84,7 @@ def test_failed_attempt_retries_next_strategy(tmp_path: Path) -> None:
     assert "recognition_failed" in result.attempts[0]["retry_reason_codes"]
 
 
-def test_low_quality_retries_and_records_strategy_agreement(tmp_path: Path) -> None:
+def test_low_quality_valid_result_stops_after_first_attempt(tmp_path: Path) -> None:
     recognizer = FakeRecognizer([_result("CCO"), _result("OCC")])
 
     result = recognize_with_fallback_strategies(
@@ -95,9 +95,9 @@ def test_low_quality_retries_and_records_strategy_agreement(tmp_path: Path) -> N
         strategies=["original", "normalized"],
     )
 
-    assert len(recognizer.calls) == 2
-    assert result.strategy_agreement is True
-    assert "image_quality_low_contrast" in result.attempts[0]["retry_reason_codes"]
+    assert len(recognizer.calls) == 1
+    assert result.strategy_agreement is None
+    assert result.attempts[0]["retry_reason_codes"] == []
 
 
 def test_strategy_disagreement_requires_review() -> None:

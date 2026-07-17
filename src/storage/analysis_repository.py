@@ -7,8 +7,10 @@ from datetime import datetime, timezone
 import csv
 import io
 import json
+import os
 from pathlib import Path
 import shutil
+import tempfile
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
@@ -39,7 +41,7 @@ class AnalysisRepository:
     """Read/write the local SQLite history index."""
 
     def __init__(self, db_path: str | Path | None = None) -> None:
-        self.db_path = Path(db_path).expanduser().resolve() if db_path is not None else None
+        self.db_path = Path(db_path).expanduser().resolve() if db_path is not None else _default_db_path()
 
     def save_analysis(self, report: Mapping[str, Any], report_path: str | Path | None = None) -> dict[str, Any]:
         """Upsert one analysis report into the history index."""
@@ -193,6 +195,8 @@ class AnalysisRepository:
             clauses.append(filter_clause)
         if favorites_only:
             clauses.append("is_favorite = 1")
+        if config.IS_PRODUCTION_MODE:
+            clauses.append("backend != 'demo'")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         params.extend([int(limit), int(offset)])
         with closing(connect(self.db_path)) as connection:
@@ -349,12 +353,20 @@ class AnalysisRepository:
 
 def record_report(report: Mapping[str, Any], report_path: str | Path | None = None) -> dict[str, Any]:
     """Convenience wrapper for UI code."""
+    if not _should_index_report(report):
+        return {"indexed": False, "reason": "demo_backend_disabled_in_production"}
     return AnalysisRepository().save_analysis(report, report_path=report_path)
 
 
 def record_reports(reports: Iterable[Mapping[str, Any]], report_path: str | Path | None = None) -> int:
     """Convenience wrapper for indexing many reports."""
-    return AnalysisRepository().save_many(reports, report_path=report_path)
+    repository = AnalysisRepository()
+    count = 0
+    for report in reports:
+        if _should_index_report(report):
+            repository.save_analysis(report, report_path=report_path)
+            count += 1
+    return count
 
 
 def record_result_payload(result: Mapping[str, Any], report_path: str | Path | None = None) -> int:
@@ -419,6 +431,18 @@ def _block(value: Mapping[str, Any], key: str) -> Mapping[str, Any]:
 
 def _text(value: Any) -> str:
     return "" if value is None else str(value)
+
+
+def _default_db_path() -> Path | None:
+    """Keep subprocess-based pytest runs out of the user's local history database."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return Path(tempfile.gettempdir()) / f"molecule_vision_pytest_{os.getpid()}.db"
+    return None
+
+
+def _should_index_report(report: Mapping[str, Any]) -> bool:
+    ocsr = _block(report, "ocsr")
+    return not (config.IS_PRODUCTION_MODE and str(ocsr.get("backend") or "").lower() == "demo")
 
 
 def _row_dict(row: Any) -> dict[str, Any]:

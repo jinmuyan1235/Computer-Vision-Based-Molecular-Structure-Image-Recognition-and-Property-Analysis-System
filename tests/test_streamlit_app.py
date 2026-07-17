@@ -10,7 +10,12 @@ def test_streamlit_app_starts_without_exception() -> None:
     app = AppTest.from_file(str(app_path), default_timeout=30).run()
     assert not app.exception
     assert app.title[0].value == "分子结构识别与性质分析"
-    assert len(app.tabs) == 8
+    assert len(app.tabs) == 0
+    source = app_path.read_text(encoding="utf-8")
+    assert "PAGE_LABELS" in source
+    assert "active_page" in source
+    assert "st.tabs" not in source
+    assert "st.navigation" not in source
 
 
 def test_smiles_result_page_renders_without_exception(tmp_path: Path) -> None:

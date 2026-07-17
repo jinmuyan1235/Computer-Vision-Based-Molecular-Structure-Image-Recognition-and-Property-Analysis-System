@@ -320,13 +320,30 @@ def _backend_checks(backend: str, status: Mapping[str, Any], production: bool) -
             {"backend": backend},
         )
     )
-    package_ok = bool(status.get("package_installed", backend == "demo"))
+    child_statuses = list(status.get("child_statuses") or []) if backend == "ensemble" else []
+    if backend == "ensemble":
+        package_backends = [
+            str(item.get("backend"))
+            for item in child_statuses
+            if item.get("available") and item.get("package_installed")
+        ]
+        package_ok = len(package_backends) >= 2
+        package_message = (
+            f"联合识别使用的子后端包可导入：{', '.join(package_backends)}。"
+            if package_ok
+            else "联合识别需要至少两个可导入的真实子后端包。"
+        )
+        package_details = {"child_backends": package_backends}
+    else:
+        package_ok = bool(status.get("package_installed", backend == "demo"))
+        package_message = "后端包可导入。" if package_ok else "后端包未安装或无法导入。"
+        package_details = {"package_version": status.get("package_version")}
     checks.append(
         _check(
             "backend.package",
             CHECK_PASS if package_ok else CHECK_FAIL,
-            "后端包可导入。" if package_ok else "后端包未安装或无法导入。",
-            {"package_version": status.get("package_version")},
+            package_message,
+            package_details,
         )
     )
     model_path = _primary_model_path(status)
@@ -356,7 +373,6 @@ def _backend_checks(backend: str, status: Mapping[str, Any], production: bool) -
         checks.append(_check("backend.model_load", CHECK_SKIP, "本次未强制加载模型。"))
     checks.append(_device_check(backend, status))
     if backend == "ensemble":
-        child_statuses = list(status.get("child_statuses") or [])
         available_children = [item.get("backend") for item in child_statuses if item.get("available")]
         checks.append(
             _check(

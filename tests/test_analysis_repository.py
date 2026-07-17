@@ -17,6 +17,7 @@ from src.storage.analysis_repository import (
     ARTIFACT_STATUS_EXPIRED,
     ARTIFACT_STATUS_MISSING,
     AnalysisRepository,
+    record_report,
     record_result_payload,
 )
 
@@ -276,6 +277,31 @@ def test_repository_records_corrections_jobs_and_result_payloads(tmp_path: Path,
     monkeypatch.setattr(module, "AnalysisRepository", lambda: AnalysisRepository(db_path))
     assert record_result_payload({"reports": [batch_report]}, payload_path) == 1
     assert repository.get_analysis("amine001") is not None
+
+
+def test_production_history_excludes_demo_reports(tmp_path: Path, monkeypatch) -> None:
+    import src.storage.analysis_repository as module
+
+    repository = AnalysisRepository(tmp_path / "app.db")
+    report = _report(tmp_path, "CCO", "demo001", "demo.png")
+    monkeypatch.setattr(module.config, "IS_PRODUCTION_MODE", True)
+    monkeypatch.setattr(module, "AnalysisRepository", lambda: repository)
+
+    result = record_report(report, tmp_path / "demo_report.json")
+
+    assert result == {"indexed": False, "reason": "demo_backend_disabled_in_production"}
+    assert repository.list_analyses() == []
+
+
+def test_pytest_default_repository_is_not_user_database(monkeypatch) -> None:
+    import src.storage.analysis_repository as module
+
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/test_analysis_repository.py::test")
+
+    repository = module.AnalysisRepository()
+
+    assert repository.db_path is not None
+    assert repository.db_path != module.config.APP_DB_PATH
 
 
 def test_repository_favorites_protect_persistent_image_runs(tmp_path: Path) -> None:
