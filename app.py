@@ -9,6 +9,7 @@ from src.runtime.health import image_workflows_enabled, run_production_health_ch
 from src.runtime.run_store import cleanup_runs_if_due
 from src.ui.about_page import render_about_page
 from src.ui.batch_page import render_batch_page
+from src.ui.dataset_review_page import render_dataset_review_page
 from src.ui.document_page import render_document_page
 from src.ui.health_page import render_blocked_workflow, render_health_banner, render_health_page
 from src.ui.history_page import render_history_page
@@ -22,6 +23,7 @@ from src.ui.styles import apply_styles, reset_main_scroll
 
 
 PAGE_LABELS = {
+    "dataset_review": "Data Management / OCSR Dataset Review",
     "image": "工作台 / 图片识别",
     "document": "工作台 / 文档识别",
     "batch": "工作台 / 批量处理",
@@ -108,6 +110,10 @@ def _render_review_nav_page() -> None:
     render_review_queue_page()
 
 
+def _render_dataset_review_nav_page() -> None:
+    render_dataset_review_page()
+
+
 def _render_health_nav_page() -> None:
     render_health_page(production_health)
 
@@ -128,6 +134,8 @@ elif active_page == "history":
     _render_history_nav_page()
 elif active_page == "review":
     _render_review_nav_page()
+elif active_page == "dataset_review":
+    _render_dataset_review_nav_page()
 elif active_page == "health":
     _render_health_nav_page()
 elif active_page == "about":
