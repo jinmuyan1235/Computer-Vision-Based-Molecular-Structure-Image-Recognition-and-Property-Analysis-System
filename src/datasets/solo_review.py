@@ -468,20 +468,63 @@ class SoloReviewStore:
         if max_samples is not None:
             target = min(target, max_samples)
         target = min(target, len(eligible))
+        audits_by_id = {str(audit["sample_id"]): audit for audit in eligible}
+        existing = {
+            str(row.get("sample_id") or ""): row for row in _read_csv(self.recheck_path)
+            if str(row.get("sample_id") or "") in audits_by_id
+        }
         strata: dict[str, list[dict[str, Any]]] = {}
         for audit in eligible:
+            if str(audit["sample_id"]) in existing:
+                continue
             strata.setdefault(str(audit["visual_review_status"]), []).append(audit)
         for audits in strata.values():
             randomizer.shuffle(audits)
-        statuses = sorted(strata)
-        randomizer.shuffle(statuses)
+        all_statuses = sorted({str(audit["visual_review_status"]) for audit in eligible})
+        class_counts = {
+            status: sum(audit["visual_review_status"] == status for audit in eligible)
+            for status in all_statuses
+        }
+        ideals = {status: target * class_counts[status] / len(eligible) for status in all_statuses}
+        quotas = {status: 0 for status in all_statuses}
+        if target >= len(all_statuses):
+            quotas = {
+                status: min(class_counts[status], max(1, int(ideals[status])))
+                for status in all_statuses
+            }
+            while sum(quotas.values()) > target:
+                status = min(
+                    (name for name in all_statuses if quotas[name] > 1),
+                    key=lambda name: (ideals[name] - quotas[name], name),
+                )
+                quotas[status] -= 1
+            while sum(quotas.values()) < target:
+                status = max(
+                    (name for name in all_statuses if quotas[name] < class_counts[name]),
+                    key=lambda name: (ideals[name] - quotas[name], class_counts[name], name),
+                )
+                quotas[status] += 1
+        else:
+            statuses = list(all_statuses)
+            randomizer.shuffle(statuses)
+            for status in statuses[:target]:
+                quotas[status] = 1
+        existing_by_status = {
+            status: sum(
+                audits_by_id[sample_id]["visual_review_status"] == status
+                for sample_id in existing
+            )
+            for status in all_statuses
+        }
         selected: list[dict[str, Any]] = []
-        for status in statuses[:target]:
-            selected.append(strata[status].pop())
-        remainder = [audit for status in statuses for audit in strata[status]]
+        for status in all_statuses:
+            needed = max(0, quotas[status] - existing_by_status[status])
+            selected.extend(strata.get(status, [])[:needed])
+            strata[status] = strata.get(status, [])[needed:]
+        remaining_slots = max(0, target - len(existing) - len(selected))
+        remainder = [audit for status in all_statuses for audit in strata.get(status, [])]
         randomizer.shuffle(remainder)
-        selected.extend(remainder[:max(0, target - len(selected))])
-        existing = {row.get("sample_id"): row for row in _read_csv(self.recheck_path)}
+        selected.extend(remainder[:remaining_slots])
         for audit in selected:
             sample_id = str(audit["sample_id"])
             if sample_id in existing:

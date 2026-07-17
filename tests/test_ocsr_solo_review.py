@@ -346,6 +346,27 @@ def test_delayed_recheck_hides_first_visual_decision_and_compares_visual_results
     assert report["by_visual_review_status"]["valid_single_molecule_crop"]["consistency_rate"] == 1.0
 
 
+def test_recheck_queue_extends_to_new_total_without_resampling_existing_items(tmp_path: Path) -> None:
+    sample_ids = tuple(f"sample-{index}" for index in range(10))
+    _, _, store = _setup(tmp_path, sample_ids)
+    store.submit_visual_batch(
+        sample_ids[:4], visual_review_status="text", region_type="text",
+    )
+    first = store.create_recheck_queue(0.5, seed=3)
+    first_ids = {row["sample_id"] for row in _read_rows(store.recheck_path)}
+    assert first["selected"] == 2
+    assert len(first_ids) == 2
+
+    store.submit_visual_batch(
+        sample_ids[4:], visual_review_status="text", region_type="text",
+    )
+    extended = store.create_recheck_queue(0.5, seed=3)
+    final_ids = {row["sample_id"] for row in _read_rows(store.recheck_path)}
+    assert extended["selected"] == 3
+    assert len(final_ids) == 5
+    assert first_ids.issubset(final_ids)
+
+
 def test_delayed_recheck_stratifies_all_visual_classes_and_supports_batch(tmp_path: Path) -> None:
     _, review, store = _setup(tmp_path, ("molecule", "text-a", "text-b", "reaction"))
     store.submit_visual("molecule", visual_review_status="valid_single_molecule_crop", region_type="molecule")
