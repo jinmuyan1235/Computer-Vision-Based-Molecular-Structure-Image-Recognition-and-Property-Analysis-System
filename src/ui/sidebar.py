@@ -15,7 +15,6 @@ from src.ui.labels import (
     runnable_backends,
     unavailable_backends,
 )
-from src.ui.health_page import render_sidebar_health_status
 from src.ui.state import current_runtime_key, get_backend_statuses, merged_backend_status, runtime_config_from_key
 
 
@@ -32,44 +31,9 @@ def _query_gpu_selection() -> str | None:
 def render_sidebar() -> tuple[str, bool, bool]:
     """Render sidebar controls and return selected backend and display switches."""
     with st.sidebar:
-        st.header("运行设置")
+        st.header("运行环境")
         production_mode = config.APP_MODE == "production"
-        if production_mode:
-            st.success("当前运行模式：生产")
-            st.caption("生产模式禁止使用演示图片识别；真实后端不可用时会阻止识别。")
-        else:
-            st.info("当前运行模式：演示")
-            st.caption("演示模式可显示内置 demo 后端；demo 结果不代表真实 OCSR。")
-
-        render_sidebar_health_status(st.session_state.get("production_health"))
-
-        gpu_options = gpu_selection_options()
-        gpu_values = [option["value"] for option in gpu_options]
-        gpu_labels = {option["value"]: option["label"] for option in gpu_options}
-        current_gpu = st.session_state.get("gpu_device_selection") or _query_gpu_selection() or default_gpu_selection(gpu_options)
-        if current_gpu not in gpu_values:
-            current_gpu = default_gpu_selection(gpu_options)
-        selected_gpu = st.selectbox(
-            "本机推理设备",
-            gpu_values,
-            index=gpu_values.index(current_gpu),
-            format_func=lambda value: gpu_labels.get(value, value),
-            key="gpu_device_selection",
-        )
-        try:
-            st.query_params["gpu_device"] = selected_gpu
-        except Exception:
-            pass
-        runtime = runtime_config_from_key(current_runtime_key())
-        st.caption(
-            "实际传入："
-            f"MolScribe={runtime.get('molscribe_device')}，"
-            f"DECIMER={runtime.get('decimer_device')}，"
-            f"GPU索引={runtime.get('visible_gpu_index') or '自动/未指定'}"
-        )
-        st.caption("设备语义：自动选择会优先 GPU、不可用时回退 CPU；CPU 为强制 CPU；指定 GPU 不可用会直接失败。")
-        if st.session_state.get("gpu_device_selection") not in {"auto", "cpu"}:
-            st.caption("DECIMER/TensorFlow 已加载后再切换 GPU，建议重启 Streamlit 以确保显存绑定生效。")
+        st.caption(f"模式：{'生产' if production_mode else '演示'}")
 
         statuses = get_backend_statuses()
         if "selected_backend" not in st.session_state:
@@ -102,43 +66,75 @@ def render_sidebar() -> tuple[str, bool, bool]:
             st.session_state["selected_backend"] = fallback if fallback in options else options[0]
 
         selected = st.selectbox(
-            "当前识别后端",
+            "后端",
             options,
-            index=options.index(st.session_state["selected_backend"]),
             format_func=backend_label,
             key="selected_backend",
         )
+
+        gpu_options = gpu_selection_options()
+        gpu_values = [option["value"] for option in gpu_options]
+        gpu_labels = {option["value"]: option["label"] for option in gpu_options}
+        current_gpu = st.session_state.get("gpu_device_selection") or _query_gpu_selection() or default_gpu_selection(gpu_options)
+        if current_gpu not in gpu_values:
+            current_gpu = default_gpu_selection(gpu_options)
+        selected_gpu = st.selectbox(
+            "设备",
+            gpu_values,
+            index=gpu_values.index(current_gpu),
+            format_func=lambda value: gpu_labels.get(value, value),
+            key="gpu_device_selection",
+        )
+        try:
+            st.query_params["gpu_device"] = selected_gpu
+        except Exception:
+            pass
+
         status = merged_backend_status(selected)
         if status.get("available"):
-            st.success("后端可用")
+            st.success("状态：可用")
         else:
-            st.error("后端不可用")
+            st.error("状态：不可用")
         if selected == "demo":
             st.warning("演示模式只识别内置样例文件名，不是真实 AI 图像识别。")
 
-        show_preprocessing = st.checkbox("显示 OpenCV 预处理过程", value=True)
-        export_pdf = st.checkbox("启用 PDF 报告", value=False)
+        show_preprocessing = False
+        export_pdf = False
+        show_advanced = st.checkbox("显示高级信息", value=False, key="show_advanced_info")
+        if show_advanced:
+            runtime = runtime_config_from_key(current_runtime_key())
+            st.caption(
+                "实际传入："
+                f"MolScribe={runtime.get('molscribe_device')}，"
+                f"DECIMER={runtime.get('decimer_device')}，"
+                f"GPU索引={runtime.get('visible_gpu_index') or '自动/未指定'}"
+            )
+            st.caption("设备语义：自动选择会优先 GPU、不可用时回退 CPU；CPU 为强制 CPU；指定 GPU 不可用会直接失败。")
+            if st.session_state.get("gpu_device_selection") not in {"auto", "cpu"}:
+                st.caption("DECIMER/TensorFlow 已加载后再切换 GPU，建议重启 Streamlit 以确保显存绑定生效。")
+            show_preprocessing = st.checkbox("显示 OpenCV 预处理过程", value=False, key="show_preprocessing_process")
+            export_pdf = st.checkbox("启用 PDF 报告", value=False, key="export_pdf_reports")
 
-        with st.expander("高级设置", expanded=False):
-            st.checkbox("显示演示模式", value=show_demo, key="show_demo_backend", disabled=production_mode)
-            if production_mode:
-                st.caption("生产模式已禁用演示图片识别。")
-            st.caption("SMILES 分析页不调用图片识别模型；该设置只影响图片、文档和批处理。")
+            with st.expander("高级设置", expanded=False):
+                st.checkbox("显示演示模式", value=show_demo, key="show_demo_backend", disabled=production_mode)
+                if production_mode:
+                    st.caption("生产模式已禁用演示图片识别。")
+                st.caption("SMILES 分析页不调用图片识别模型；该设置只影响图片、文档和批处理。")
 
-        with st.expander("识别后端说明", expanded=False):
-            for backend, description in BACKEND_DESCRIPTIONS.items():
-                st.markdown(f"**{backend_label(backend)}**  \n{description}")
+            with st.expander("识别后端说明", expanded=False):
+                for backend, description in BACKEND_DESCRIPTIONS.items():
+                    st.markdown(f"**{backend_label(backend)}**  \n{description}")
 
-        unavailable = unavailable_backends(statuses)
-        if unavailable:
-            with st.expander("未配置的识别后端", expanded=False):
-                for backend in unavailable:
-                    item = statuses.get(backend, {})
-                    st.caption(f"{backend_label(backend)}：{item.get('message') or '未配置'}")
+            unavailable = unavailable_backends(statuses)
+            if unavailable:
+                with st.expander("未配置的识别后端", expanded=False):
+                    for backend in unavailable:
+                        item = statuses.get(backend, {})
+                        st.caption(f"{backend_label(backend)}：{item.get('message') or '未配置'}")
 
-        with st.expander("技术信息", expanded=False):
-            st.write(f"**当前设备选择：** {gpu_labels.get(st.session_state.get('gpu_device_selection', 'auto'), '自动')}")
-            _render_technical_status(status)
+            with st.expander("技术信息", expanded=False):
+                st.write(f"**当前设备选择：** {gpu_labels.get(st.session_state.get('gpu_device_selection', 'auto'), '自动')}")
+                _render_technical_status(status)
 
     return selected, show_preprocessing, export_pdf
 

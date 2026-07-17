@@ -172,14 +172,14 @@ def default_backend(
     configured: str | None = None,
     allow_demo_fallback: bool = True,
 ) -> str:
-    """Prefer real OCSR backends over demo, with DECIMER first when available."""
+    """Prefer the configured runnable backend, then a deterministic real fallback."""
     options = runnable_backends(statuses, allow_demo_fallback=allow_demo_fallback)
-    if "decimer" in options:
-        return "decimer"
-    if configured in options and configured != "demo":
+    if configured in options:
         return str(configured)
     if "molscribe" in options:
         return "molscribe"
+    if "decimer" in options:
+        return "decimer"
     if "ensemble" in options:
         return "ensemble"
     return "demo" if allow_demo_fallback else ""

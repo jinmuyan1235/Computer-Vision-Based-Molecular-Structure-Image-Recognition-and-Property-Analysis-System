@@ -42,14 +42,14 @@ def test_ensemble_requires_two_real_backends() -> None:
     assert "ensemble" in runnable_backends(two_real)
 
 
-def test_decimer_is_default_when_available() -> None:
+def test_configured_backend_is_default_when_available() -> None:
     statuses = {
         "demo": {"available": True},
         "molscribe": {"available": True},
         "decimer": {"available": True},
         "ensemble": {"available": True},
     }
-    assert default_backend(statuses, configured="molscribe") == "decimer"
+    assert default_backend(statuses, configured="molscribe") == "molscribe"
 
 
 def test_demo_is_default_only_without_real_backends() -> None:

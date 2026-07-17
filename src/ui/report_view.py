@@ -25,7 +25,11 @@ from src.storage.analysis_repository import AnalysisRepository, record_report
 from src.ui.image_viewer import show_preprocess_thumbnail, show_structure
 from src.ui.labels import backend_label, status_label
 from src.ui.records import render_records
+from src.ui.streamlit_compat import segmented_control
 from src.utils.file_utils import safe_stem
+
+
+REPORT_SECTION_OPTIONS = ["概览", "人工纠错", "候选比较", "分子性质", "技术信息"]
 
 
 def _final_smiles(report: dict[str, Any]) -> str | None:
@@ -337,6 +341,200 @@ def show_structure_exports(report: dict[str, Any], key_prefix: str) -> None:
             )
 
 
+def _render_result_message(report: dict[str, Any], ocsr: dict[str, Any]) -> None:
+    st.success(report.get("message", "分析完成。"))
+    if ocsr.get("backend") == "demo":
+        st.warning("当前是演示结果：系统按内置样例文件名返回固定 SMILES，并没有进行真实图片识别。")
+    elif ocsr.get("result_origin") in {"real_model", "real_model_ensemble"}:
+        st.caption("当前结果来自真实 OCSR 模型推理。")
+
+
+def _render_core_result(report: dict[str, Any]) -> None:
+    ocsr = report.get("ocsr") or {}
+    correction = report.get("correction") or {}
+    final = report.get("final") or {}
+    validation = report.get("validation") or {}
+    left, right = st.columns([1.05, 0.95])
+    with left:
+        st.subheader("核心识别结果")
+        st.code(final.get("smiles") or ocsr.get("smiles") or "", language=None)
+        st.write(f"**Canonical SMILES：** `{final.get('canonical_smiles') or validation.get('canonical_smiles') or '-'}`")
+        if final.get("standardized_smiles") or validation.get("standardized_smiles"):
+            st.write(f"**Standardized SMILES：** `{final.get('standardized_smiles') or validation.get('standardized_smiles')}`")
+        confidence = ocsr.get("confidence")
+        st.write(f"**识别后端：** {backend_label(ocsr.get('backend'), short=True)}")
+        st.write(f"**置信度：** {confidence if confidence is not None else '模型未提供'}")
+        st.write(f"**当前结果来源：** {final.get('source') or '未知'}")
+        st.write(f"**RDKit 校验：** {'有效' if validation.get('valid') else '无效'}")
+        if correction.get("applied"):
+            st.info(f"已应用人工修正：`{correction.get('corrected_canonical_smiles')}`")
+    with right:
+        st.subheader("分子结构重绘")
+        show_structure((report.get("images") or {}).get("redrawn_molecule"), "最终分析结构")
+
+
+def _render_descriptor_metrics(report: dict[str, Any]) -> None:
+    descriptors = report.get("descriptors") or {}
+    if not descriptors:
+        return
+    st.subheader("分子性质")
+    labels = {
+        "formula": "分子式",
+        "molecular_weight": "分子量",
+        "logp": "LogP",
+        "tpsa": "TPSA",
+        "hbd": "HBD",
+        "hba": "HBA",
+        "rotatable_bonds": "可旋转键",
+        "heavy_atom_count": "重原子数",
+    }
+    compact = st.columns(min(4, max(1, len(descriptors))))
+    for index, (key, value) in enumerate(descriptors.items()):
+        compact[index % len(compact)].metric(labels.get(key, key), str(value))
+
+
+def _render_lipinski_summary(report: dict[str, Any]) -> None:
+    lipinski = report.get("lipinski") or {}
+    if not lipinski:
+        return
+    if lipinski.get("passed"):
+        st.info(lipinski.get("summary", "符合规则。"))
+    else:
+        st.warning(lipinski.get("summary", "存在规则提示。"))
+
+
+def _render_preprocessing_details(report: dict[str, Any], show_preprocessing: bool) -> None:
+    if not show_preprocessing or report.get("input", {}).get("type") != "image":
+        st.info("预处理过程默认隐藏；可在侧栏勾选“显示高级信息 / 显示 OpenCV 预处理过程”后查看。")
+        return
+    if report.get("user_preprocessing"):
+        with st.expander("人工预处理参数", expanded=False):
+            st.json({"user_preprocessing": report.get("user_preprocessing")})
+    stage_paths = (report.get("images") or {}).get("preprocessing") or {}
+    if not stage_paths:
+        st.info("该报告没有预处理图像记录。")
+        return
+    titles = {
+        "uploaded_original": "上传原图",
+        "user_adjusted": "人工调整图",
+        "original": "原图",
+        "gray": "灰度",
+        "denoised": "去噪",
+        "binary": "二值化",
+        "cropped": "裁剪",
+        "deskewed": "旋转校正",
+        "normalized": "归一化",
+    }
+    columns = st.columns(3)
+    stage_order = [
+        "uploaded_original",
+        "user_adjusted",
+        "original",
+        "gray",
+        "denoised",
+        "binary",
+        "cropped",
+        "deskewed",
+        "normalized",
+    ]
+    for index, name in enumerate(stage_order):
+        if name in stage_paths:
+            with columns[index % 3]:
+                show_preprocess_thumbnail(stage_paths[name], titles[name])
+
+
+def _render_technical_diagnostics(report: dict[str, Any]) -> None:
+    ocsr = report.get("ocsr") or {}
+    runtime = report.get("runtime") or {}
+    st.json({
+        "backend": ocsr.get("backend"),
+        "device": ocsr.get("device"),
+        "model_name": ocsr.get("model_name"),
+        "model_version": ocsr.get("model_version"),
+        "model_sha256": ocsr.get("model_sha256"),
+        "package_version": ocsr.get("package_version"),
+        "git_commit": ocsr.get("git_commit") or runtime.get("git_commit"),
+        "app_mode": runtime.get("app_mode"),
+        "dependency_versions": ocsr.get("dependency_versions") or runtime.get("dependency_versions"),
+        "inference_time_ms": ocsr.get("inference_time_ms"),
+    })
+
+
+def show_report_export_actions(report: dict[str, Any], export_pdf: bool, key_prefix: str) -> None:
+    """Render compact report export actions without occupying the whole page."""
+    final = report.get("final") or {}
+    validation = report.get("validation") or {}
+    smiles = final.get("smiles") or (report.get("ocsr") or {}).get("smiles") or ""
+    canonical = final.get("canonical_smiles") or validation.get("canonical_smiles") or ""
+    actions = st.columns([0.18, 0.20, 0.20, 0.42])
+    with actions[0].popover("复制 SMILES"):
+        st.text_input("SMILES", value=smiles, key=f"{key_prefix}_smiles_copy")
+        st.text_input("Canonical SMILES", value=canonical, key=f"{key_prefix}_canonical_copy")
+    with actions[1].popover("下载结构"):
+        show_structure_exports(report, key_prefix)
+    with actions[2].popover("导出报告"):
+        st.download_button(
+            "下载 JSON 报告",
+            to_json_text(report),
+            file_name=f"{key_prefix}_report.json",
+            mime="application/json",
+            key=f"json_{key_prefix}",
+        )
+        if export_pdf:
+            pdf_result = save_pdf(report, OUTPUT_DIR / f"{key_prefix}_report.pdf")
+            if pdf_result["success"]:
+                st.download_button(
+                    "下载 PDF 报告",
+                    Path(pdf_result["path"]).read_bytes(),
+                    file_name=f"{key_prefix}_report.pdf",
+                    mime="application/pdf",
+                    key=f"pdf_{key_prefix}",
+                )
+            else:
+                st.caption(pdf_result["message"])
+        else:
+            st.caption("如需 PDF，请在侧栏高级信息中启用 PDF 报告。")
+    if report.get("run") and actions[3].button("保留本次分析记录", key=f"protect_run_{key_prefix}"):
+        mark_run_protected_from_report(report, "user_keep")
+        st.success("已标记保留；自动清理不会删除该分析记录。")
+
+
+def show_report_workbench(report: dict[str, Any], show_preprocessing: bool, key_prefix: str) -> dict[str, Any]:
+    """Render a compact, sectioned report view for the single-image workflow."""
+    if report.get("status") != "success":
+        show_report(report, show_preprocessing, False, key_prefix)
+        return report
+
+    ocsr = report.get("ocsr") or {}
+    _render_result_message(report, ocsr)
+    show_recognition_decision(report)
+    section = segmented_control(
+        "结果视图",
+        REPORT_SECTION_OPTIONS,
+        default=st.session_state.get(f"{key_prefix}_report_section", "概览"),
+        key=f"{key_prefix}_report_section",
+        label_visibility="collapsed",
+    )
+    if section == "概览":
+        _render_core_result(report)
+        _render_descriptor_metrics(report)
+        _render_lipinski_summary(report)
+    elif section == "人工纠错":
+        report = show_correction_panel(report)
+    elif section == "候选比较":
+        show_ensemble_details(ocsr)
+        report = show_ensemble_candidate_actions(report)
+        report = show_strategy_attempts(report)
+    elif section == "分子性质":
+        _render_descriptor_metrics(report)
+        _render_lipinski_summary(report)
+        show_chemical_identity(report)
+    elif section == "技术信息":
+        _render_preprocessing_details(report, show_preprocessing)
+        _render_technical_diagnostics(report)
+    return report
+
+
 def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bool, key_prefix: str) -> None:
     """Render a molecule analysis report in Streamlit."""
     if report.get("status") != "success":
@@ -449,30 +647,8 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
                     with columns[index % 3]:
                         show_preprocess_thumbnail(stage_paths[name], titles[name])
 
-    with st.expander("结果导出", expanded=True):
-        st.download_button(
-            "下载 JSON 报告",
-            to_json_text(report),
-            file_name=f"{key_prefix}_report.json",
-            mime="application/json",
-            key=f"json_{key_prefix}",
-        )
-        if export_pdf:
-            pdf_result = save_pdf(report, OUTPUT_DIR / f"{key_prefix}_report.pdf")
-            if pdf_result["success"]:
-                st.download_button(
-                    "下载 PDF 报告",
-                    Path(pdf_result["path"]).read_bytes(),
-                    file_name=f"{key_prefix}_report.pdf",
-                    mime="application/pdf",
-                    key=f"pdf_{key_prefix}",
-                )
-            else:
-                st.caption(pdf_result["message"])
-        show_structure_exports(report, key_prefix)
-        if report.get("run") and st.button("保留本次分析记录", key=f"protect_run_{key_prefix}"):
-            mark_run_protected_from_report(report, "user_keep")
-            st.success("已标记保留；自动清理不会删除该分析记录。")
+    with st.expander("结果导出", expanded=False):
+        show_report_export_actions(report, export_pdf, key_prefix)
 
     with st.expander("技术诊断", expanded=False):
         runtime = report.get("runtime") or {}

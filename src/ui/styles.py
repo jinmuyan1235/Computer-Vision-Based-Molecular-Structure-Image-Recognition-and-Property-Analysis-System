@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 def apply_styles() -> None:
@@ -12,7 +15,7 @@ def apply_styles() -> None:
         <style>
         .block-container {
             max-width: 1280px;
-            padding-top: 1.2rem;
+            padding-top: 2rem;
             padding-bottom: 2.2rem;
         }
         h1 {
@@ -53,6 +56,42 @@ def page_intro(title: str, description: str) -> None:
     """Render a compact page heading."""
     st.subheader(title)
     st.caption(description)
+
+
+def reset_main_scroll(view_key: str) -> None:
+    """Return to the top when navigation or runtime selection changes."""
+    encoded_view = json.dumps(view_key)
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          try {{
+            const parentWindow = window.parent;
+            const storageKey = "molecule-vision-active-view";
+            const viewKey = {encoded_view};
+            if (parentWindow.sessionStorage.getItem(storageKey) === viewKey) return;
+            const documentRoot = parentWindow.document;
+            const targets = [
+              documentRoot.scrollingElement,
+              documentRoot.documentElement,
+              documentRoot.body,
+              documentRoot.querySelector('[data-testid="stAppViewContainer"]'),
+              documentRoot.querySelector('[data-testid="stMain"]'),
+              documentRoot.querySelector('section.main'),
+            ];
+            for (const target of new Set(targets)) {{
+              if (!target) continue;
+              target.scrollTop = 0;
+              target.scrollTo?.({{ top: 0, behavior: "auto" }});
+            }}
+            parentWindow.scrollTo(0, 0);
+            parentWindow.sessionStorage.setItem(storageKey, viewKey);
+          }} catch (_error) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
 
 
 def status_card(message: str, tone: str = "info") -> None:

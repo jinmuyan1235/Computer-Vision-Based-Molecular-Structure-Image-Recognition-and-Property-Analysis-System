@@ -32,9 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     os.environ["OCSR_HEALTH_WORKER_PROCESS"] = "1"
-    os.environ.setdefault("MOLSCRIBE_CHILD_PROCESS", "1")
-    os.environ.setdefault("DECIMER_CHILD_PROCESS", "1")
     args = build_parser().parse_args()
+    if args.backend != "ensemble":
+        os.environ.setdefault("MOLSCRIBE_CHILD_PROCESS", "1")
+        os.environ.setdefault("DECIMER_CHILD_PROCESS", "1")
     try:
         runtime_config = json.loads(args.runtime_json)
         if not isinstance(runtime_config, dict):

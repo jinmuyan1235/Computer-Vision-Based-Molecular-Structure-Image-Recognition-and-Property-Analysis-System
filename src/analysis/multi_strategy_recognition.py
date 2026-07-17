@@ -139,11 +139,19 @@ def retry_reason_codes(attempt: Mapping[str, Any], image_quality: Mapping[str, A
     if isinstance(consensus, Mapping) and consensus.get("decision") == "review_needed":
         reasons.append("result_review_needed")
 
+    result_is_usable = bool(
+        attempt.get("status") == "success"
+        and attempt.get("smiles")
+        and attempt.get("valid_smiles")
+        and "low_confidence" not in reasons
+    )
     quality = dict(image_quality or {})
     quality_reasons = set(str(item) for item in quality.get("reason_codes") or [])
-    if quality_reasons & QUALITY_RETRY_REASONS:
+    # A quality warning remains part of the report, but should not multiply
+    # expensive model calls after a valid first-pass structure was obtained.
+    if not result_is_usable and quality_reasons & QUALITY_RETRY_REASONS:
         reasons.extend(f"image_quality_{item}" for item in sorted(quality_reasons & QUALITY_RETRY_REASONS))
-    if quality.get("passed") is False and not quality_reasons:
+    if not result_is_usable and quality.get("passed") is False and not quality_reasons:
         reasons.append("image_quality_failed")
     return sorted(set(reasons))
 

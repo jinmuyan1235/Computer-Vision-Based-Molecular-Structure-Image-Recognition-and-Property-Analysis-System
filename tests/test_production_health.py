@@ -35,6 +35,27 @@ def test_production_health_blocks_demo_backend(monkeypatch: pytest.MonkeyPatch, 
     assert any("生产模式" in suggestion for suggestion in result["repair_suggestions"])
 
 
+def test_ensemble_health_checks_child_packages_not_a_nonexistent_ensemble_package() -> None:
+    checks = health_module._backend_checks(
+        "ensemble",
+        {
+            "available": True,
+            "message": "ensemble ready",
+            "package_version": None,
+            "device": "mixed",
+            "child_statuses": [
+                {"backend": "molscribe", "available": True, "package_installed": True},
+                {"backend": "decimer", "available": True, "package_installed": True},
+            ],
+        },
+        production=True,
+    )
+
+    package_check = next(check for check in checks if check["name"] == "backend.package")
+    assert package_check["status"] == "pass"
+    assert package_check["details"]["child_backends"] == ["molscribe", "decimer"]
+
+
 def test_health_cache_reuses_successful_warmup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _patch_health_paths(monkeypatch, tmp_path)
     warmup_image = tmp_path / "warmup.png"

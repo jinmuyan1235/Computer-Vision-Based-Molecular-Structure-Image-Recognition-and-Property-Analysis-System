@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -9,63 +10,189 @@ from pathlib import Path
 
 import streamlit as st
 
+import config
 from src.analysis.correction import sha256_file
 from src.analysis.molecule_report import MoleculeReportGenerator
 from src.runtime.run_store import ImageRun, create_image_run_from_bytes, save_run_report, write_runtime_metadata
 from src.storage.analysis_repository import record_report
 from src.ui.image_editor import render_image_editor
 from src.ui.image_viewer import show_upload_preview
-from src.ui.report_view import show_correction_panel, show_report
+from src.ui.report_view import show_report_export_actions, show_report_workbench
 from src.ui.state import (
     current_runtime_key,
     remember_backend_status,
     runtime_config_from_key,
 )
+from src.ui.streamlit_compat import segmented_control
 from src.ui.styles import page_intro
 from src.runtime.job_manager import extract_json_object, run_json_command
 from src.utils.file_utils import safe_stem
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+IMAGE_WORKFLOW_STAGES = ["1 上传图片", "2 调整图片", "3 识别结果", "4 导出"]
+IMAGE_WORKFLOW_STAGE_REQUEST_KEY = "image_workflow_requested_stage"
 
 
 def render_image_page(backend: str, show_preprocessing: bool, export_pdf: bool) -> None:
+    _apply_requested_workflow_stage()
     page_intro("图片识别", "上传单张分子结构图，执行 OCSR 识别、RDKit 校验、性质计算和人工纠错。")
+    payload = st.session_state.get("single_image_upload_payload")
+    default_stage = "3 识别结果" if st.session_state.get("image_report") else ("2 调整图片" if payload else "1 上传图片")
+    stage = segmented_control(
+        "单图识别流程",
+        IMAGE_WORKFLOW_STAGES,
+        default=st.session_state.get("image_workflow_stage", default_stage),
+        key="image_workflow_stage",
+        label_visibility="collapsed",
+    )
+    if stage != "1 上传图片" and not payload:
+        st.info("请先上传一张分子结构图片。")
+        _render_upload_step()
+        return
+    if stage in {"3 识别结果", "4 导出"} and "image_report" not in st.session_state:
+        st.info("还没有识别结果。可以先在“调整图片”中启动识别。")
+        _render_adjust_step(payload, backend)
+        return
+
+    if stage == "1 上传图片":
+        _render_upload_step()
+    elif stage == "2 调整图片":
+        _render_adjust_step(payload, backend)
+    elif stage == "3 识别结果":
+        _render_result_step(show_preprocessing)
+    elif stage == "4 导出":
+        _render_export_step(export_pdf)
+
+
+def _render_upload_step() -> None:
     uploaded = st.file_uploader("上传 PNG/JPG/JPEG 分子结构图", type=["png", "jpg", "jpeg"], key="single_upload")
+    payload = st.session_state.get("single_image_upload_payload")
     if uploaded is not None:
-        uploaded_bytes = uploaded.getvalue()
-        show_upload_preview(uploaded, f"上传原图：{uploaded.name}")
-        user_preprocessing, adjusted_bytes, has_adjustments = render_image_editor(
-            uploaded_bytes,
-            uploaded.name,
-            key_prefix=f"single_{safe_stem(uploaded.name)}",
-        )
-        if st.button("开始识别与分析", type="primary", key="analyze_image"):
-            progress = st.empty()
-            progress.info("正在执行图像预处理、OCSR 与 RDKit 分析……")
-            image_run = create_image_run_from_bytes(uploaded_bytes, uploaded.name)
-            try:
-                effective_input = _prepare_effective_input(image_run, uploaded.name, adjusted_bytes, user_preprocessing, has_adjustments)
-                if backend == "demo":
-                    report = MoleculeReportGenerator(backend, image_run.run_dir).generate(
-                        image_path=effective_input,
-                        analysis_id=image_run.analysis_id,
-                    )
-                    _attach_user_preprocessing(report, user_preprocessing, effective_input, image_run.input_path, has_adjustments)
-                    result_path = save_run_report(report, image_run)
-                    record_report(report, result_path)
-                else:
-                    report = _process_image_subprocess(image_run, backend, effective_input, user_preprocessing, has_adjustments)
-                    record_report(report, (report.get("run") or {}).get("report_path"))
-                st.session_state["image_report"] = report
-                remember_backend_status(backend)
-                progress.empty()
-            except RuntimeError as exc:
-                write_runtime_metadata(image_run, {"status": "failed", "message": str(exc)})
-                progress.empty()
-                st.error(str(exc))
-    if "image_report" in st.session_state:
-        active_report = show_correction_panel(st.session_state["image_report"])
-        show_report(active_report, show_preprocessing, export_pdf, f"image_{active_report.get('analysis_id', 'report')[:8]}")
+        payload = _remember_uploaded_image(uploaded)
+    if not payload:
+        st.info("拖入或选择一张分子结构图片后，再进入调整和识别。")
+        return
+    left, right = st.columns([0.62, 0.38])
+    with left:
+        show_upload_preview(payload["bytes"], f"上传原图：{payload['name']}")
+    with right:
+        st.write(f"**文件名：** {payload['name']}")
+        st.caption(f"SHA-256：{payload['sha256']}")
+        if st.button("进入调整图片", type="primary", key="go_adjust_image"):
+            _request_workflow_stage("2 调整图片")
+            st.rerun()
+
+
+def _render_adjust_step(payload: dict | None, backend: str) -> None:
+    if not payload:
+        return
+    user_preprocessing, adjusted_bytes, has_adjustments = render_image_editor(
+        payload["bytes"],
+        payload["name"],
+        key_prefix=f"single_{safe_stem(payload['name'])}",
+        expanded=True,
+        show_json=False,
+    )
+    st.session_state["single_image_adjustments"] = dict(user_preprocessing)
+    st.session_state["single_image_adjusted_bytes"] = adjusted_bytes
+    st.session_state["single_image_has_adjustments"] = bool(has_adjustments)
+    actions = st.columns([0.24, 0.18, 0.58])
+    if actions[0].button("开始识别与分析", type="primary", key="analyze_image"):
+        _run_image_analysis(payload, backend, user_preprocessing, adjusted_bytes, has_adjustments)
+    if actions[1].button("返回上传", key="back_to_image_upload"):
+        _request_workflow_stage("1 上传图片")
+        st.rerun()
+
+
+def _render_result_step(show_preprocessing: bool) -> None:
+    report = st.session_state.get("image_report")
+    if not report:
+        return
+    key_prefix = f"image_{str(report.get('analysis_id', 'report'))[:8]}"
+    active_report = show_report_workbench(report, show_preprocessing, key_prefix)
+    st.session_state["image_report"] = active_report
+    if st.button("进入导出", key="go_image_export"):
+        _request_workflow_stage("4 导出")
+        st.rerun()
+
+
+def _render_export_step(export_pdf: bool) -> None:
+    report = st.session_state.get("image_report")
+    if not report:
+        return
+    st.subheader("结果导出")
+    st.caption("复制 SMILES、下载结构文件或导出报告，不再默认展开所有格式。")
+    key_prefix = f"image_{str(report.get('analysis_id', 'report'))[:8]}_export"
+    show_report_export_actions(report, export_pdf, key_prefix)
+
+
+def _remember_uploaded_image(uploaded: object) -> dict:
+    uploaded_bytes = uploaded.getvalue()
+    payload = {
+        "name": uploaded.name,
+        "bytes": uploaded_bytes,
+        "sha256": sha256_file_like(uploaded_bytes),
+    }
+    previous = st.session_state.get("single_image_upload_payload") or {}
+    if previous.get("sha256") != payload["sha256"]:
+        st.session_state.pop("image_report", None)
+        st.session_state.pop("single_image_adjustments", None)
+        st.session_state.pop("single_image_adjusted_bytes", None)
+        st.session_state.pop("single_image_has_adjustments", None)
+    st.session_state["single_image_upload_payload"] = payload
+    return payload
+
+
+def sha256_file_like(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _request_workflow_stage(stage: str) -> None:
+    """Queue a stage change for the next rerun, before the widget is created."""
+    if stage in IMAGE_WORKFLOW_STAGES:
+        st.session_state[IMAGE_WORKFLOW_STAGE_REQUEST_KEY] = stage
+
+
+def _apply_requested_workflow_stage() -> None:
+    """Apply a queued stage change before Streamlit instantiates the stage widget."""
+    requested_stage = st.session_state.pop(IMAGE_WORKFLOW_STAGE_REQUEST_KEY, None)
+    if requested_stage in IMAGE_WORKFLOW_STAGES:
+        st.session_state["image_workflow_stage"] = requested_stage
+
+
+def _run_image_analysis(
+    payload: dict,
+    backend: str,
+    user_preprocessing: dict,
+    adjusted_bytes: bytes,
+    has_adjustments: bool,
+) -> None:
+    progress = st.status("正在准备图片…", expanded=True)
+    progress.write("正在进行图像预处理。")
+    progress.write("正在加载模型并执行 OCSR 识别；首次加载 MolScribe 模型通常需要几十秒。")
+    image_run = create_image_run_from_bytes(payload["bytes"], payload["name"])
+    try:
+        effective_input = _prepare_effective_input(image_run, payload["name"], adjusted_bytes, user_preprocessing, has_adjustments)
+        if backend == "demo":
+            report = MoleculeReportGenerator(backend, image_run.run_dir).generate(
+                image_path=effective_input,
+                analysis_id=image_run.analysis_id,
+            )
+            _attach_user_preprocessing(report, user_preprocessing, effective_input, image_run.input_path, has_adjustments)
+            result_path = save_run_report(report, image_run)
+            record_report(report, result_path)
+        else:
+            report = _process_image_subprocess(image_run, backend, effective_input, user_preprocessing, has_adjustments)
+            record_report(report, (report.get("run") or {}).get("report_path"))
+        st.session_state["image_report"] = report
+        _request_workflow_stage("3 识别结果")
+        remember_backend_status(backend)
+        progress.update(label="识别与分析完成", state="complete", expanded=False)
+        st.rerun()
+    except Exception as exc:
+        write_runtime_metadata(image_run, {"status": "failed", "message": str(exc)})
+        progress.update(label="识别未完成", state="error", expanded=True)
+        st.error(str(exc))
 
 
 def _process_image_subprocess(
@@ -105,13 +232,21 @@ def _process_image_subprocess(
         command.extend(["--visible-gpu-index", str(runtime["visible_gpu_index"])])
 
     env = os.environ.copy()
-    env.setdefault("MOLSCRIBE_ISOLATED_SUBPROCESS", "true")
-    env.setdefault("DECIMER_ISOLATED_SUBPROCESS", "true")
+    if backend == "ensemble":
+        # MolScribe loads CUDA 11/cuDNN 8 while DECIMER uses TensorFlow with
+        # CUDA 12/cuDNN 9. Keep them in their own model processes.
+        env.pop("MOLSCRIBE_CHILD_PROCESS", None)
+        env.pop("DECIMER_CHILD_PROCESS", None)
+    else:
+        # The report process is already isolated from Streamlit for a single
+        # backend, so avoid a second model process in that case.
+        env["MOLSCRIBE_CHILD_PROCESS"] = "1"
+        env["DECIMER_CHILD_PROCESS"] = "1"
     completed = run_json_command(
         command,
         cwd=PROJECT_ROOT,
         env=env,
-        timeout=900,
+        timeout=max(180.0, float(config.OCSR_TIMEOUT_SECONDS) + 60.0),
     )
     payload = completed.payload
     if completed.timed_out:
