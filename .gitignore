@@ -19,9 +19,12 @@ data/ocsr_real_acceptance/download_metadata.json
 data/health/*
 !data/health/.gitkeep
 data/ocsr_collections/
+data/ocsr_holdout_collection/
+data/ocsr_holdout_collection_dry_run/
 data/ocsr_first_batch/
 data/ocsr_first_batch_final/
 data/review/
+data/review_holdout/
 data/datasets/
 data/evaluation/
 data/runs/

@@ -925,3 +925,68 @@ python scripts/compare_visual_detector_runs.py \
 ```
 
 All evaluation outputs live under ignored `data/evaluation/`. These manifests contain only regions already proposed by the detector, so the reports cannot compute complete-page molecule detection recall or count molecules missed entirely on a page. `visual-dev-v0.1` is a development set only. Future holdout evaluation uses the same command with `data/datasets/visual-holdout-v0.1/detector_training_manifest.csv`; if that snapshot does not exist, no holdout result is fabricated and no generalization improvement is claimed.
+
+### Independent Visual Holdout
+
+Keep holdout collection, review, snapshots, and evaluation in separate ignored directories. Record the Git/config/checksum protocol before collection, then explicitly collect with the frozen baseline profile:
+
+```bash
+python scripts/record_visual_holdout_protocol.py \
+  --output data/review_holdout/holdout_protocol.json \
+  --dev-checksums data/datasets/visual-dev-v0.1/checksums.sha256 \
+  --paper-sources /mnt/c/Users/Administrator/Desktop/ocsr_first_batch_sources/paper_sources.csv \
+  --pmcid PMC6767204 --pmcid PMC9506485 --pmcid PMC8703884
+
+python scripts/collect_ocsr_dataset.py \
+  --dataset-root data/ocsr_holdout_collection --dry-run \
+  --screening-config baseline pmc \
+  --pmcid PMC6767204 --pmcid PMC9506485 --pmcid PMC8703884
+
+# Optional in WSL environments where requests stalls on the official S3 PDF body.
+python scripts/prefetch_pmc_oa_pdfs.py \
+  --dataset-root data/ocsr_holdout_collection \
+  --pmcid PMC6767204 --pmcid PMC9506485 --pmcid PMC8703884
+
+DOCUMENT_MAX_PAGES=40 python scripts/collect_ocsr_dataset.py \
+  --dataset-root data/ocsr_holdout_collection \
+  --screening-config baseline pmc \
+  --pmcid PMC6767204 --pmcid PMC9506485 --pmcid PMC8703884
+
+python scripts/run_ocsr_machine_review.py \
+  --dataset-root data/ocsr_holdout_collection \
+  --output-dir data/review_holdout --reuse-predictions
+```
+
+Launch the same batch-review UI against only the holdout roots. Review both `Machine-routed visual` and `Machine rejected`; visual labels must be based on the crop and source page, never MolScribe, DECIMER, or ensemble output. Create the delayed-recheck queue at 10%; it is stratified by first-round visual class and hides the first answer.
+
+```bash
+OCSR_REVIEW_DATASET_ROOT=data/ocsr_holdout_collection \
+OCSR_REVIEW_ROOT=data/review_holdout \
+OCSR_VISUAL_ONLY_REVIEW=true \
+FAST_START=true ./start_gpu_app.sh
+```
+
+After every machine-routed and machine-rejected sample has an audit and `Visual remaining` is zero, analyze and freeze with an explicit role. The holdout snapshot requires exactly three paper records and refuses overwrite.
+
+```bash
+python scripts/analyze_visual_review.py --review-dir data/review_holdout
+python scripts/snapshot_visual_dataset.py \
+  --version visual-holdout-v0.1 --dataset-role holdout \
+  --review-dir data/review_holdout \
+  --output data/datasets/visual-holdout-v0.1
+
+python scripts/evaluate_visual_detector.py \
+  --manifest data/datasets/visual-holdout-v0.1/detector_training_manifest.csv \
+  --dataset-role holdout --config baseline \
+  --output data/evaluation/visual-holdout-v0.1/baseline
+python scripts/evaluate_visual_detector.py \
+  --manifest data/datasets/visual-holdout-v0.1/detector_training_manifest.csv \
+  --dataset-role holdout --config candidate \
+  --output data/evaluation/visual-holdout-v0.1/candidate
+python scripts/compare_visual_detector_runs.py \
+  --baseline data/evaluation/visual-holdout-v0.1/baseline \
+  --candidate data/evaluation/visual-holdout-v0.1/candidate \
+  --output data/evaluation/visual-holdout-v0.1/comparison
+```
+
+The evaluator reads `dataset_role` from the snapshot summary when `--dataset-role` is omitted, but an explicit command-line value takes priority. It never infers the role from directory names. Holdout metrics cover candidate screening on existing baseline-proposed crops only; they cannot measure complete-page molecule detection recall, missed molecule count, bbox proposal recall, or regions never proposed by baseline.

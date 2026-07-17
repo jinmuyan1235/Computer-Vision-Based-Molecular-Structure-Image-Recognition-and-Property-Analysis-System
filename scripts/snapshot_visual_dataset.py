@@ -20,6 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", required=True)
     parser.add_argument("--review-dir", default="data/review")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--dataset-role", choices=["development", "holdout"], default="development")
     return parser
 
 
@@ -28,6 +29,7 @@ def main() -> int:
     try:
         result = snapshot_visual_dataset(
             version=args.version, review_dir=args.review_dir, output=args.output,
+            dataset_role=args.dataset_role,
         )
     except Exception as exc:
         print(json.dumps({"status": "failed", "message": str(exc)}, ensure_ascii=False, indent=2))

@@ -253,6 +253,16 @@ def test_visual_remaining_counts_only_machine_routed_samples_without_audit(tmp_p
     assert after["reviewed"] == 3
 
 
+def test_strict_dataset_root_does_not_search_legacy_collection_fallbacks(tmp_path: Path) -> None:
+    store = SoloReviewStore(
+        tmp_path / "holdout_collection",
+        review_root=tmp_path / "review_holdout",
+        strict_dataset_root=True,
+    )
+    roots = store._candidate_roots(None)
+    assert roots == [(tmp_path / "holdout_collection").resolve()]
+
+
 def test_machine_rejected_samples_are_available_to_batch_review(tmp_path: Path) -> None:
     _, review, store = _setup(tmp_path, ("rejected-a", "rejected-b"))
     rows = _read_rows(store.machine_manifest_path)

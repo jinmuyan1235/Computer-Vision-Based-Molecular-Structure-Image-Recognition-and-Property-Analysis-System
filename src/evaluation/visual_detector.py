@@ -18,6 +18,7 @@ from src.documents.candidate_screening import get_screening_config, screen_regio
 KNOWN_INITIAL_TYPES = (
     "multiple_molecules", "invalid_crop", "reaction", "molecule", "figure", "table", "text", "logo", "blank",
 )
+DATASET_ROLES = {"development", "holdout"}
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -75,6 +76,26 @@ def _resolve_image(row: dict[str, str], manifest_path: Path) -> Path:
 
 def _safe_div(numerator: int | float, denominator: int | float) -> float:
     return float(numerator / denominator) if denominator else 0.0
+
+
+def _resolve_dataset_role(manifest_path: Path, explicit_role: str | None) -> tuple[str, str]:
+    """Resolve role without using directory-name heuristics."""
+    if explicit_role is not None:
+        if explicit_role not in DATASET_ROLES:
+            raise ValueError(f"Unsupported dataset role: {explicit_role}")
+        return explicit_role, "command_line"
+    summary_path = manifest_path.parent / "dataset_summary.json"
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Unable to read dataset summary: {summary_path}") from exc
+        role = str(summary.get("dataset_role") or "").strip().lower()
+        if role:
+            if role not in DATASET_ROLES:
+                raise ValueError(f"Unsupported dataset role in {summary_path}: {role}")
+            return role, "dataset_summary"
+    return "development", "default"
 
 
 def _classification_metrics(truths: list[str], predictions: list[str]) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -158,6 +179,7 @@ def evaluate_visual_detector(
     output: str | Path,
     *,
     config_name: str = "baseline",
+    dataset_role: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate candidate classification only; full-page detection recall is out of scope."""
     manifest_path = Path(manifest).expanduser().resolve()
@@ -216,11 +238,12 @@ def evaluate_visual_detector(
             "molecule_recall", "molecule_f1", "false_positive_rate",
         ],
     )
-    dataset_role = "holdout" if "holdout" in manifest_path.as_posix().lower() else "development"
+    resolved_role, role_source = _resolve_dataset_role(manifest_path, dataset_role)
     error_counts = Counter(f"{row['predicted_class']}->{row['truth_class']}" for row in errors)
     metrics = {
         "manifest": str(manifest_path), "output": str(output_dir), "config": config_name,
-        "dataset_role": dataset_role, "development_only": dataset_role == "development",
+        "dataset_role": resolved_role, "dataset_role_source": role_source,
+        "development_only": resolved_role == "development",
         "sample_count": len(predictions), "molecule_vs_non_molecule": binary,
         "multiclass": {**multiclass, "per_class": {row["class"]: row for row in per_class}},
         "molecule_candidate_purity": binary["molecule_candidate_purity"],
@@ -228,17 +251,22 @@ def evaluate_visual_detector(
         "uncertain_prediction_rate": _safe_div(sum(value == "uncertain" for value in predicted), len(predicted)),
         "error_counts": dict(sorted(error_counts.items())),
         "scope_limitation": (
-            "This manifest contains only candidates already proposed by the detector. It cannot measure complete-page "
-            "molecule detection recall or determine how many molecules were missed on each page."
+            "Candidate-screening metrics measure molecule/non-molecule classification only for existing crops already "
+            "proposed by the baseline detector. Candidate-formation metrics are not completely measurable from this "
+            "manifest: it cannot measure complete-page molecule detection recall, the number of molecules missed on a "
+            "page, bbox proposal recall, or performance on regions never proposed by the baseline detector."
         ),
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     report = [
         f"# Visual Detector Evaluation ({config_name})", "",
-        f"Dataset role: **{dataset_role}**", "",
-        "## Scope limitation", "", metrics["scope_limitation"], "",
+        f"Dataset role: **{resolved_role}** (source: `{role_source}`)", "",
+        "## A. Candidate-screening metrics", "",
+        "These metrics evaluate molecule/non-molecule classification for existing candidate crops.", "",
+        "## B. Candidate-formation metrics", "",
+        metrics["scope_limitation"], "",
     ]
-    if dataset_role == "development":
+    if resolved_role == "development":
         report.extend([
             "Only development-set evaluation has been completed. No holdout result is available, so this report does not claim improved generalization.", "",
         ])

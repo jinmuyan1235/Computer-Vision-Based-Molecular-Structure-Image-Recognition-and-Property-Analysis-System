@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,15 @@ def render_dataset_review_page() -> None:
         st.success(str(notice))
     if error := st.session_state.pop("solo_review_error", None):
         st.error(str(error))
-    store = SoloReviewStore(config.DATA_DIR / "ocsr_collections", review_root=config.DATA_DIR / "review")
+    configured_dataset_root = os.getenv("OCSR_REVIEW_DATASET_ROOT")
+    configured_review_root = os.getenv("OCSR_REVIEW_ROOT")
+    store = SoloReviewStore(
+        configured_dataset_root or config.DATA_DIR / "ocsr_collections",
+        review_root=configured_review_root or config.DATA_DIR / "review",
+        strict_dataset_root=bool(configured_dataset_root or configured_review_root),
+    )
+    if configured_dataset_root or configured_review_root:
+        st.caption(f"Isolated dataset: {store.dataset_root} | review ledger: {store.review_root}")
     mode = st.segmented_control(
         "Review mode",
         ["Queue", "Batch classify", "Delayed recheck"],
@@ -92,7 +101,7 @@ def _render_queue_workspace(store: SoloReviewStore) -> None:
 
 def _render_recheck_workspace(store: SoloReviewStore) -> None:
     controls = st.columns([0.18, 0.14, 0.18, 0.18, 0.32])
-    proportion = controls[0].number_input("Recheck ratio", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
+    proportion = controls[0].number_input("Recheck ratio", min_value=0.0, max_value=1.0, value=0.1, step=0.05)
     seed = controls[1].number_input("Seed", min_value=0, value=7, step=1)
     max_samples = int(controls[2].number_input("Maximum samples", min_value=0, value=0, step=1, help="0 means no additional cap."))
     if controls[3].button("Create recheck queue", type="secondary"):
@@ -303,7 +312,10 @@ def _render_item(store: SoloReviewStore, item: dict[str, Any], *, recheck: bool)
     status_columns[3].metric("Machine category", item.get("machine_category") or item.get("category") or "-")
     _render_file_status(item)
     _render_images(item)
-    _render_predictions(store, item)
+    if os.getenv("OCSR_VISUAL_ONLY_REVIEW", "").strip().lower() in {"1", "true", "yes", "on"}:
+        st.info("Visual-only review: MolScribe, DECIMER, and ensemble outputs are hidden to avoid label bias.")
+    else:
+        _render_predictions(store, item)
     _render_details(item)
     if not recheck and item.get("audit"):
         with st.expander("Latest review audit", expanded=False):
