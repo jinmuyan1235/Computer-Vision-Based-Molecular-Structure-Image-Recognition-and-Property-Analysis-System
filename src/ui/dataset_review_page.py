@@ -145,33 +145,55 @@ def _render_recheck_workspace(store: SoloReviewStore) -> None:
 
 def _render_batch_workspace(store: SoloReviewStore) -> None:
     st.subheader("Batch visual classification")
-    st.caption("Filter and inspect one thumbnail page, including machine rejections, then apply one visual class to the selection.")
-    source_label = st.selectbox(
-        "Batch source", ["Machine-routed visual", "Machine rejected"], key="batch_source",
+    st.caption(
+        "Filter and inspect machine-routed, machine-rejected, or already reviewed samples, "
+        "then apply one visual class to the selected images."
     )
-    source_scope = "pending_human_review" if source_label == "Machine-routed visual" else "machine_rejected"
-    summaries = store.list_item_summaries(scope=source_scope, include_reviewed=False)
+    source_label = st.selectbox(
+        "Batch source", ["Machine-routed visual", "Machine rejected", "Reviewed samples"], key="batch_source",
+    )
+    source_scope = {
+        "Machine-routed visual": "pending_human_review",
+        "Machine rejected": "machine_rejected",
+        "Reviewed samples": "all_samples",
+    }[source_label]
+    correction_mode = source_label == "Reviewed samples"
+    summaries = store.list_item_summaries(scope=source_scope, include_reviewed=correction_mode)
+    if correction_mode:
+        summaries = [row for row in summaries if row["visual_review_status"]]
     if not summaries:
-        st.info(f"No unreviewed samples in {source_label}.")
+        if correction_mode:
+            st.info("No reviewed samples are available for batch correction.")
+        else:
+            st.info(f"No unreviewed samples in {source_label}.")
         return
     categories = sorted({row["category"] for row in summaries})
-    filters = st.columns([0.34, 0.22, 0.22, 0.22])
-    category = filters[0].selectbox("Machine category", ["All", *categories], key="batch_machine_category")
-    page_size = int(filters[1].selectbox("Page size", [8, 12, 20, 32], index=2, key="batch_page_size"))
-    filtered = summaries if category == "All" else [row for row in summaries if row["category"] == category]
+    visual_statuses = sorted({row["visual_review_status"] for row in summaries if row["visual_review_status"]})
+    filters = st.columns([0.26, 0.24, 0.16, 0.16, 0.18])
+    visual_status = filters[0].selectbox(
+        "Current visual class", ["All", *visual_statuses],
+        key="batch_current_visual_class", disabled=not correction_mode,
+    )
+    category = filters[1].selectbox("Machine category", ["All", *categories], key="batch_machine_category")
+    page_size = int(filters[2].selectbox("Page size", [8, 12, 20, 32], index=2, key="batch_page_size"))
+    filtered = summaries
+    if correction_mode and visual_status != "All":
+        filtered = [row for row in filtered if row["visual_review_status"] == visual_status]
+    if category != "All":
+        filtered = [row for row in filtered if row["category"] == category]
     page_count = max(1, (len(filtered) + page_size - 1) // page_size)
-    page_number = int(filters[2].number_input(
+    page_number = int(filters[3].number_input(
         "Page",
         min_value=1,
         max_value=page_count,
         value=1,
         step=1,
-        key=f"batch_page_number_{category}_{page_size}",
+        key=f"batch_page_number_{source_label}_{visual_status}_{category}_{page_size}",
     ))
-    filters[3].metric("Matching", len(filtered))
+    filters[4].metric("Matching", len(filtered))
     displayed = filtered[(page_number - 1) * page_size:page_number * page_size]
     displayed_ids = [row["sample_id"] for row in displayed]
-    page_key = f"{source_scope}_{category}_{page_size}_{page_number}"
+    page_key = f"{source_scope}_{visual_status}_{category}_{page_size}_{page_number}"
     checkbox_keys = {sample_id: f"batch_pick_{source_scope}_{sample_id}" for sample_id in displayed_ids}
     selection_controls = st.columns([0.20, 0.20, 0.60])
     if selection_controls[0].button("Select displayed", key=f"select_batch_page_{page_key}"):
@@ -186,7 +208,7 @@ def _render_batch_workspace(store: SoloReviewStore) -> None:
     target_key = f"batch_target_{category}_{page_number}"
     reviewer_key = f"batch_reviewer_{category}_{page_number}"
     notes_key = f"batch_notes_{category}_{page_number}"
-    with st.form(key=f"batch_classification_form_{category}_{page_size}_{page_number}", border=True):
+    with st.form(key=f"batch_classification_form_{source_label}_{category}_{page_size}_{page_number}", border=True):
         action = st.columns([0.28, 0.22, 0.50])
         action[0].selectbox(
             "Apply class",
@@ -196,7 +218,13 @@ def _render_batch_workspace(store: SoloReviewStore) -> None:
         )
         action[1].text_input("Reviewer", value="local", key=reviewer_key)
         action[2].text_input("Batch notes", key=notes_key)
-        st.warning(f"This will classify {len(selected_ids)} selected sample(s) with the same label.")
+        if correction_mode:
+            st.warning(
+                f"Correction mode replaces the existing visual audit for {len(selected_ids)} selected sample(s) "
+                "and rebuilds the exported review manifests."
+            )
+        else:
+            st.warning(f"This will classify {len(selected_ids)} selected sample(s) with the same label.")
         st.form_submit_button(
             "Save batch classification",
             type="primary",
@@ -230,8 +258,8 @@ def _render_batch_thumbnails(
                 else:
                     st.info("Image missing")
                 st.caption(
-                    f"{summary['category']} · quality={summary['image_quality_level'] or '-'} · "
-                    f"…{sample_id[-12:]}"
+                    f"machine={summary['category']} · reviewed={summary.get('visual_review_status') or '-'} · "
+                    f"quality={summary['image_quality_level'] or '-'} · …{sample_id[-12:]}"
                 )
                 with st.expander("Sample details", expanded=False):
                     st.code(sample_id, language=None)

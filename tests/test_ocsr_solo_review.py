@@ -236,6 +236,41 @@ def test_batch_visual_classification_requires_selection(tmp_path: Path) -> None:
         store.submit_visual_batch([], visual_review_status="text", region_type="text")
 
 
+def test_reviewed_summaries_can_be_filtered_and_batch_corrected(tmp_path: Path) -> None:
+    _, review, store = _setup(tmp_path, ("wrong-a", "wrong-b", "correct"))
+    store.submit_visual_batch(
+        ["wrong-a", "wrong-b"],
+        visual_review_status="valid_single_molecule_crop",
+        region_type="molecule",
+        reviewer="first-pass",
+    )
+    store.submit_visual("correct", visual_review_status="text", region_type="text")
+
+    reviewed = store.list_item_summaries(scope="all_samples", include_reviewed=True)
+    wrong_ids = {
+        row["sample_id"] for row in reviewed
+        if row["visual_review_status"] == "valid_single_molecule_crop"
+    }
+    assert wrong_ids == {"wrong-a", "wrong-b"}
+
+    store.submit_visual_batch(
+        sorted(wrong_ids),
+        visual_review_status="text",
+        region_type="text",
+        reviewer="correction-pass",
+        review_notes="Correct accidental molecule labels.",
+    )
+
+    corrected = SoloReviewStore(store.dataset_root, review_root=review)
+    assert corrected.queue_stats()["reviewed"] == 3
+    assert {
+        row["visual_review_status"]
+        for row in corrected.list_item_summaries(scope="all_samples", include_reviewed=True)
+    } == {"text"}
+    assert _read_rows(review / "visual_verified.csv") == []
+    assert len(_read_rows(review / "visual_rejected.csv")) == 3
+
+
 def test_visual_remaining_counts_only_machine_routed_samples_without_audit(tmp_path: Path) -> None:
     _, _, store = _setup(tmp_path, ("first", "second", "third"))
 
