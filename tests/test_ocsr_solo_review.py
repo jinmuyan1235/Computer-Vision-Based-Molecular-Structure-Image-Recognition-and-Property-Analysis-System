@@ -9,13 +9,14 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from src.datasets.solo_review import SoloReviewStore
+from src.ui.dataset_review_page import _model_failures
 
 
 QUEUE_FIELDS = (
     "sample_id", "verification_status", "image_path", "source_page_path", "bbox", "machine_category", "category",
     "source_kind", "source_document", "source_license", "source_url", "attribution", "expected_action", "split",
     "molscribe_smiles", "decimer_smiles", "ensemble_smiles", "molscribe_raw", "decimer_raw", "ensemble_raw",
-    "risk_reasons", "image_quality_score", "image_quality_level",
+    "risk_reasons", "deterministic_errors", "image_quality_score", "image_quality_level",
 )
 
 
@@ -51,6 +52,7 @@ def _queue_row(sample_id: str, image_name: str) -> dict[str, str]:
         "decimer_raw": raw,
         "ensemble_raw": raw,
         "risk_reasons": "[\"model_disagreement\"]",
+        "deterministic_errors": "[]",
         "image_quality_score": "0.77",
         "image_quality_level": "medium",
     }
@@ -126,3 +128,42 @@ def test_delayed_recheck_hides_first_answer_and_writes_consistency_report(tmp_pa
     report = json.loads((review / "review_consistency_report.json").read_text(encoding="utf-8"))
     assert report["completed_rechecks"] == 1
     assert report["consistency_rate"] == 1.0
+
+
+def test_machine_manifest_is_primary_source_and_exposes_all_reviewable_scopes(tmp_path: Path) -> None:
+    _, review, store = _setup(tmp_path, ("legacy-queue",))
+    rows = [
+        _queue_row("human", "crop-0.png"),
+        _queue_row("verified", "crop-0.png"),
+        _queue_row("machine", "crop-0.png"),
+        _queue_row("invalid", "crop-0.png"),
+    ]
+    rows[0]["verification_status"] = "pending_human_review"
+    rows[1]["verification_status"] = "machine_verified"
+    rows[2]["verification_status"] = "pending_machine_review"
+    rows[2]["deterministic_errors"] = "[\"model_backend_unavailable\"]"
+    rows[2]["molscribe_raw"] = json.dumps({"status": "failed", "message": "model package missing"})
+    rows[3]["verification_status"] = "rejected_invalid"
+    with (review / "machine_review_manifest.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=QUEUE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    assert [item["sample_id"] for item in store.list_items()] == ["human"]
+    assert [item["sample_id"] for item in store.list_items(scope="machine_verified")] == ["verified"]
+    pending_machine = store.list_items(scope="pending_machine_review")
+    assert [item["sample_id"] for item in pending_machine] == ["machine"]
+    assert _model_failures(pending_machine[0]) == [{"backend": "molscribe", "status": "failed", "message": "model package missing"}]
+    assert [item["sample_id"] for item in store.list_items(scope="all_reviewable")] == ["human", "machine", "verified"]
+    assert store.queue_stats() == {
+        "total": 4,
+        "pending_human": 1,
+        "machine_verified": 1,
+        "pending_machine": 1,
+        "reviewed": 0,
+        "rejected": 1,
+    }
+
+    result = store.submit("verified", verification_status="human_verified_single", final_smiles="CCO")
+    assert result.verification_status == "human_verified_single"
+    assert store.queue_stats()["reviewed"] == 1
