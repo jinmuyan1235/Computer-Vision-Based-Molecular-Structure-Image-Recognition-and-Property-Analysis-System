@@ -81,16 +81,16 @@ def _render_item(store: SoloReviewStore, item: dict[str, Any], *, recheck: bool)
 
 def _render_file_status(item: dict[str, Any]) -> None:
     st.caption("Source file resolution")
-    rows = []
+    lines: list[str] = []
     for label, info in (("Original document page", item.get("page_path_info", {})), ("Candidate image", item.get("image_path_info", {})), ("Candidate crop", item.get("crop_path_info", {}))):
-        rows.append({
-            "file": label,
-            "manifest path": info.get("manifest_path", ""),
-            "dataset root": info.get("dataset_root", item.get("dataset_root_resolved", "")),
-            "resolved path": info.get("resolved_path", ""),
-            "exists": "yes" if info.get("exists") else "no",
-        })
-    st.table(rows)
+        lines.extend((
+            f"{label}: {'exists' if info.get('exists') else 'missing'}",
+            f"  manifest path: {info.get('manifest_path', '')}",
+            f"  dataset root: {info.get('dataset_root', item.get('dataset_root_resolved', ''))}",
+            f"  resolved path: {info.get('resolved_path', '')}",
+        ))
+    # Avoid Streamlit's Arrow serialization here: it has crashed in this WSL runtime.
+    st.code("\n".join(lines), language=None)
     if not item.get("files_complete"):
         st.warning("A required source file is missing. Visual status is suggested as missing_source_file and ground-truth acceptance is disabled.")
 
