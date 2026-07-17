@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import io
 import json
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 from PIL import Image
 
 from src.datasets.http import CachedHttpClient
+from src.datasets.licenses import is_allowed_license, normalize_license
 from src.datasets.pipeline import DatasetPipeline
 from src.datasets.pmc import PmcOpenAccessCollector
 from src.datasets.provenance import SourceRecord, SourceRegistry
@@ -54,6 +56,14 @@ class FakeRecognizer:
         return FakeOCSRResult(self.backend)
 
 
+class TrackingRecognizer(FakeRecognizer):
+    created: list[str] = []
+
+    def __init__(self, backend: str) -> None:
+        super().__init__(backend)
+        self.created.append(backend)
+
+
 def _png_bytes() -> bytes:
     buffer = io.BytesIO()
     Image.new("RGB", (80, 80), "white").save(buffer, format="PNG")
@@ -71,6 +81,14 @@ def _source() -> SourceRecord:
         retrieved_at="2026-01-01T00:00:00+00:00",
         attribution="PubChem CID 702",
     )
+
+
+def test_license_normalizes_explicit_creative_commons_urls() -> None:
+    assert normalize_license("https://creativecommons.org/licenses/by/4.0/") == "cc-by-4.0"
+    assert normalize_license("http://creativecommons.org/licenses/by-sa/3.0/") == "cc-by-sa-3.0"
+    assert normalize_license("https://creativecommons.org/publicdomain/zero/1.0/") == "cc0-1.0"
+    assert is_allowed_license("Creative Commons: https://creativecommons.org/licenses/by/4.0/")
+    assert not is_allowed_license("Creative Commons Attribution license")
 
 
 def test_pubchem_collection_records_properties_sdf_png_and_uses_cache(tmp_path: Path, monkeypatch) -> None:
@@ -98,6 +116,36 @@ def test_pubchem_collection_records_properties_sdf_png_and_uses_cache(tmp_path: 
     assert source["license_allowed"] == "true"
     row = pipeline.pending_manifest.read_text(encoding="utf-8")
     assert "molscribe" in row and "decimer" in row and "ensemble" in row
+
+
+def test_negative_candidate_records_not_applicable_predictions_without_model_call(tmp_path: Path, monkeypatch) -> None:
+    image = tmp_path / "text.png"
+    image.write_bytes(_png_bytes())
+    pipeline = DatasetPipeline(tmp_path, recognizer_factory=FakeRecognizer)
+    monkeypatch.setattr(
+        pipeline,
+        "_predict_all",
+        lambda _: (_ for _ in ()).throw(AssertionError("negative candidate must not invoke OCSR")),
+    )
+
+    pipeline.add_candidate(image, _source(), category="text", source_document="doc-1")
+
+    row = next(csv.DictReader(pipeline.pending_manifest.open(encoding="utf-8")))
+    predictions = json.loads(row["candidate_predictions"])
+    assert [item["status"] for item in predictions] == ["not_applicable"] * 3
+
+
+def test_positive_candidate_builds_ensemble_from_existing_backend_results(tmp_path: Path) -> None:
+    image = tmp_path / "molecule.png"
+    image.write_bytes(_png_bytes())
+    TrackingRecognizer.created = []
+    pipeline = DatasetPipeline(tmp_path, recognizer_factory=TrackingRecognizer)
+
+    predictions = pipeline._predict_all(image)
+
+    assert TrackingRecognizer.created == ["molscribe", "decimer"]
+    assert [item["backend"] for item in predictions] == ["molscribe", "decimer", "ensemble"]
+    assert predictions[-1]["candidates"] is not None
 
 
 def test_pmc_unknown_license_registers_metadata_without_pdf_download(tmp_path: Path) -> None:
@@ -149,6 +197,27 @@ def test_pmc_allowed_page_image_is_materialized_only_after_oa_and_license_checks
     assert result.source.license_allowed is True
     assert result.document_path is not None and result.document_path.suffix == ".png"
     assert session.calls == [oa_url, xml_url, page_url]
+
+
+def test_pmc_allowed_default_download_uses_official_aws_article_pdf(tmp_path: Path) -> None:
+    pmcid = "PMC2222222"
+    oa_url = f"https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id={pmcid}"
+    xml_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
+    listing_url = f"https://pmc-oa-opendata.s3.amazonaws.com/?list-type=2&prefix={pmcid}.&delimiter=/"
+    pdf_url = f"https://pmc-oa-opendata.s3.amazonaws.com/{pmcid}.2/{pmcid}.2.pdf"
+    session = FakeSession({
+        oa_url: f"<OA><records><record id='{pmcid}'><link href='https://example.test/package.tar.gz'/></record></records></OA>".encode(),
+        xml_url: b"<article><front><article-meta><permissions><license><license-p>CC BY 4.0</license-p></license></permissions></article-meta></front></article>",
+        listing_url: f"<ListBucketResult><CommonPrefixes><Prefix>{pmcid}.1/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>{pmcid}.2/</Prefix></CommonPrefixes></ListBucketResult>".encode(),
+        pdf_url: b"%PDF-1.7 fake article",
+    })
+    collector = PmcOpenAccessCollector(CachedHttpClient(tmp_path / "cache", session=session, request_interval=0), tmp_path / "sources")
+
+    result = collector.collect(pmcid)
+
+    assert result.document_path is not None and result.document_path.suffix == ".pdf"
+    assert result.source.source_url == pdf_url
+    assert session.calls == [oa_url, xml_url, listing_url, pdf_url]
 
 
 def test_two_person_review_is_required_before_verified_manifest(tmp_path: Path, monkeypatch) -> None:

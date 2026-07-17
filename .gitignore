@@ -19,7 +19,10 @@ data/ocsr_real_acceptance/download_metadata.json
 data/health/*
 !data/health/.gitkeep
 data/ocsr_collections/
+data/ocsr_first_batch/
+data/ocsr_first_batch_final/
 data/review/
+data/feedback/
 data/app.db
 data/app.db-*
 *.onnx

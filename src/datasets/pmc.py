@@ -20,6 +20,7 @@ from src.utils.file_utils import ensure_directory
 EUROPE_PMC_XML = "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
 PMC_PDF = "https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
 PMC_OA_API = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id={pmcid}"
+PMC_AWS_BUCKET = "https://pmc-oa-opendata.s3.amazonaws.com"
 
 
 @dataclass(frozen=True)
@@ -76,8 +77,11 @@ class PmcOpenAccessCollector:
         if dry_run or not source.license_allowed:
             return PmcSource(pmcid=pmcid, source=source)
 
-        resource_url = document_url or PMC_PDF.format(pmcid=pmcid)
-        resource_payload, resource_metadata = self.client.get_bytes(resource_url)
+        if document_url:
+            resource_url = document_url
+            resource_payload, resource_metadata = self.client.get_bytes(resource_url)
+        else:
+            resource_url, resource_payload, resource_metadata = self._download_official_pdf(pmcid)
         suffix, resource_type = self._material_type(resource_payload)
         if not suffix:
             raise ValueError(f"PMC source {pmcid} did not return a PDF or supported page image from {resource_url}.")
@@ -86,6 +90,7 @@ class PmcOpenAccessCollector:
         source = SourceRecord(
             **{
                 **source.__dict__,
+                "source_url": resource_url,
                 "source_sha256": resource_metadata["sha256"],
                 "metadata": {
                     **(source.metadata or {}),
@@ -96,6 +101,25 @@ class PmcOpenAccessCollector:
             }
         )
         return PmcSource(pmcid=pmcid, source=source, document_path=document_path)
+
+    def _download_official_pdf(self, pmcid: str) -> tuple[str, bytes, dict[str, Any]]:
+        """Download an article PDF from PMC's public anonymous AWS dataset.
+
+        The interactive PMC ``/pdf/`` endpoint may reject automated requests even
+        for Open Access articles. The PMC dataset service publishes the same
+        permitted article objects in a public S3 bucket, indexed by article
+        version. We enumerate only this article's version prefixes and retain the
+        final object URL in provenance.
+        """
+        listing_url = f"{PMC_AWS_BUCKET}/?list-type=2&prefix={pmcid}.&delimiter=/"
+        listing_payload, _ = self.client.get_bytes(listing_url)
+        versions = self._parse_aws_versions(listing_payload, pmcid)
+        if not versions:
+            raise ValueError(f"PMC cloud dataset did not expose an article version for {pmcid}.")
+        version = max(versions)
+        resource_url = f"{PMC_AWS_BUCKET}/{pmcid}.{version}/{pmcid}.{version}.pdf"
+        payload, metadata = self.client.get_bytes(resource_url)
+        return resource_url, payload, metadata
 
     @staticmethod
     def _normalize_pmcid(value: str) -> str:
@@ -135,6 +159,17 @@ class PmcOpenAccessCollector:
             "is_open_access": True,
             "package_url": str(link.get("href") or "") if link is not None else "",
         }
+
+    @staticmethod
+    def _parse_aws_versions(payload: bytes, pmcid: str) -> list[int]:
+        root = ET.fromstring(payload)
+        versions: list[int] = []
+        pattern = re.compile(rf"{re.escape(pmcid)}\.(\d+)/")
+        for node in root.findall(".//{*}CommonPrefixes/{*}Prefix"):
+            match = pattern.fullmatch((node.text or "").strip())
+            if match:
+                versions.append(int(match.group(1)))
+        return versions
 
     @staticmethod
     def _material_type(payload: bytes) -> tuple[str, str]:
