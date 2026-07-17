@@ -1,4 +1,4 @@
-"""Tests for the single-developer human review ledger and delayed recheck flow."""
+"""Tests for visual-only OCSR review and trusted structure confirmation."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import csv
 import json
 from pathlib import Path
 
+import pytest
 from PIL import Image, ImageDraw
 
 from src.datasets.solo_review import SoloReviewStore
@@ -13,9 +14,11 @@ from src.ui.dataset_review_page import _model_failures
 
 
 QUEUE_FIELDS = (
-    "sample_id", "verification_status", "image_path", "source_page_path", "bbox", "machine_category", "category",
-    "source_kind", "source_document", "source_license", "source_url", "attribution", "expected_action", "split",
-    "molscribe_smiles", "decimer_smiles", "ensemble_smiles", "molscribe_raw", "decimer_raw", "ensemble_raw",
+    "sample_id", "verification_status", "dataset_root", "image_path", "source_page_path", "bbox", "machine_category", "category",
+    "source_kind", "source_id", "source_document", "source_license", "source_url", "attribution", "expected_action", "split",
+    "ground_truth_origin", "ground_truth_smiles", "ground_truth_inchikey", "source_compound_id", "source_structure_file",
+    "source_canonical_smiles", "source_inchikey", "molscribe_smiles", "decimer_smiles", "ensemble_smiles",
+    "molscribe_inchikey", "decimer_inchikey", "ensemble_inchikey", "molscribe_raw", "decimer_raw", "ensemble_raw",
     "risk_reasons", "deterministic_errors", "image_quality_score", "image_quality_level",
 )
 
@@ -28,142 +31,153 @@ def _page(path: Path) -> None:
     image.save(path)
 
 
-def _queue_row(sample_id: str, image_name: str) -> dict[str, str]:
+def _queue_row(sample_id: str, image_name: str, *, trusted: bool = False) -> dict[str, str]:
     raw = json.dumps({"status": "success", "smiles": "CCO"})
-    return {
-        "sample_id": sample_id,
-        "verification_status": "pending_human_review",
-        "image_path": f"images/{image_name}",
-        "source_page_path": "pages/page.png",
-        "bbox": "[20, 20, 100, 100]",
-        "machine_category": "molecule",
-        "category": "molecule",
-        "source_kind": "pmc_oa",
-        "source_document": "PMC-test",
-        "source_license": "cc-by-4.0",
-        "source_url": "https://example.test/source",
-        "attribution": "Example attribution",
-        "expected_action": "recognize",
-        "split": "train",
-        "molscribe_smiles": "CCO",
-        "decimer_smiles": "CCO",
-        "ensemble_smiles": "CCO",
-        "molscribe_raw": raw,
-        "decimer_raw": raw,
-        "ensemble_raw": raw,
-        "risk_reasons": "[\"model_disagreement\"]",
-        "deterministic_errors": "[]",
-        "image_quality_score": "0.77",
-        "image_quality_level": "medium",
+    row = {
+        "sample_id": sample_id, "verification_status": "pending_human_review", "dataset_root": "",
+        "image_path": f"candidates/{image_name}", "source_page_path": "document_runs/page.png", "bbox": "[20, 20, 100, 100]",
+        "machine_category": "molecule", "category": "molecule", "source_kind": "pmc_oa", "source_id": "PMC-test",
+        "source_document": "PMC-test", "source_license": "cc-by-4.0", "source_url": "https://example.test/source",
+        "attribution": "Example attribution", "expected_action": "recognize", "split": "train",
+        "ground_truth_origin": "", "ground_truth_smiles": "", "ground_truth_inchikey": "", "source_compound_id": "",
+        "source_structure_file": "", "source_canonical_smiles": "", "source_inchikey": "",
+        "molscribe_smiles": "CCO", "decimer_smiles": "CCO", "ensemble_smiles": "CCO",
+        "molscribe_inchikey": "LFQSCWFLJHTTHZ-UHFFFAOYSA-N", "decimer_inchikey": "LFQSCWFLJHTTHZ-UHFFFAOYSA-N",
+        "ensemble_inchikey": "LFQSCWFLJHTTHZ-UHFFFAOYSA-N", "molscribe_raw": raw, "decimer_raw": raw, "ensemble_raw": raw,
+        "risk_reasons": "[\"model_disagreement\"]", "deterministic_errors": "[]", "image_quality_score": "0.77", "image_quality_level": "medium",
     }
+    if trusted:
+        row.update({
+            "source_kind": "pubchem", "source_id": "123", "ground_truth_origin": "pubchem", "ground_truth_smiles": "CCO",
+            "ground_truth_inchikey": "LFQSCWFLJHTTHZ-UHFFFAOYSA-N", "source_compound_id": "123", "source_structure_file": "records/123.sdf",
+        })
+    return row
 
 
-def _setup(tmp_path: Path, sample_ids: tuple[str, ...] = ("sample-1",)) -> tuple[Path, Path, SoloReviewStore]:
+def _setup(tmp_path: Path, sample_ids: tuple[str, ...] = ("sample-1",), *, trusted: bool = False) -> tuple[Path, Path, SoloReviewStore]:
+    default_root = tmp_path / "default-root"
     dataset = tmp_path / "dataset"
     review = tmp_path / "review"
-    (dataset / "images").mkdir(parents=True)
-    (dataset / "pages").mkdir(parents=True)
-    _page(dataset / "pages" / "page.png")
+    (dataset / "candidates").mkdir(parents=True)
+    (dataset / "document_runs").mkdir(parents=True)
+    _page(dataset / "document_runs" / "page.png")
     rows = []
     for index, sample_id in enumerate(sample_ids):
-        image = dataset / "images" / f"crop-{index}.png"
+        image = dataset / "candidates" / f"crop-{index}.png"
         _page(image)
-        rows.append(_queue_row(sample_id, image.name))
+        row = _queue_row(sample_id, image.name, trusted=trusted)
+        row["dataset_root"] = str(dataset)
+        rows.append(row)
     review.mkdir()
-    with (review / "human_review_queue.csv").open("w", encoding="utf-8", newline="") as handle:
+    with (review / "machine_review_manifest.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=QUEUE_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
-    return dataset, review, SoloReviewStore(dataset, review_root=review)
+    return dataset, review, SoloReviewStore(default_root, review_root=review)
 
 
-def test_single_review_saves_audit_corrected_crop_and_evaluation_manifest(tmp_path: Path) -> None:
+def _read_rows(path: Path) -> list[dict[str, str]]:
+    with path.open(encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def test_visual_review_does_not_require_smiles_and_routes_to_chemistry_required(tmp_path: Path) -> None:
     _, review, store = _setup(tmp_path)
 
-    result = store.submit(
-        "sample-1",
-        verification_status="human_verified_single",
-        final_smiles="CCN",
-        bbox_after=[30, 25, 110, 105],
-        region_type="molecule",
-        review_notes="Corrected one atom and crop.",
-        reviewer="developer",
-        selected_prediction="ensemble",
-    )
+    result = store.submit_visual("sample-1", visual_review_status="valid_single_molecule_crop", bbox_after=[30, 25, 110, 105], region_type="molecule", review_notes="Clear crop.", reviewer="developer")
 
     audit = json.loads(result.audit_path.read_text(encoding="utf-8"))
-    assert audit["verification_status"] == "human_verified_single"
-    assert audit["bbox_before"] == [20, 20, 100, 100]
-    assert set(audit["correction_types"]) == {"smiles", "bbox"}
+    assert audit["visual_review_status"] == "valid_single_molecule_crop"
+    assert audit["final_smiles"] == ""
+    assert set(audit["correction_types"]) == {"bbox"}
     assert Path(result.image_path).is_file()
-    output = list(csv.DictReader((review / "human_verified_single.csv").open(encoding="utf-8")))
-    assert output[0]["ground_truth_canonical_smiles"] == "CCN"
-    assert output[0]["review_notes"] == "Corrected one atom and crop."
+    assert _read_rows(review / "visual_verified.csv")[0]["sample_id"] == "sample-1"
+    assert _read_rows(review / "chemistry_review_required.csv")[0]["ground_truth_smiles"] == ""
+    assert _read_rows(review / "structure_ground_truth_verified.csv") == []
 
 
-def test_rejected_and_uncertain_have_separate_outputs(tmp_path: Path) -> None:
-    _, review, store = _setup(tmp_path, ("reject", "uncertain"))
+def test_trusted_external_ground_truth_can_be_confirmed_after_visual_review(tmp_path: Path) -> None:
+    _, review, store = _setup(tmp_path, trusted=True)
+    item = store.get_item("sample-1")
+    assert item and item["trusted_ground_truth_available"] is True
+    assert item["molscribe_matches_ground_truth"] is True
 
-    store.submit("reject", verification_status="rejected", review_notes="Not a molecule.")
-    store.submit("uncertain", verification_status="uncertain", review_notes="Crop is ambiguous.")
+    store.submit_visual("sample-1", visual_review_status="valid_single_molecule_crop", region_type="molecule")
+    result = store.submit_structure_ground_truth("sample-1", reviewer="developer")
 
-    rejected = list(csv.DictReader((review / "human_rejected.csv").open(encoding="utf-8")))
-    uncertain = list(csv.DictReader((review / "uncertain.csv").open(encoding="utf-8")))
-    assert rejected[0]["sample_id"] == "reject"
-    assert uncertain[0]["sample_id"] == "uncertain"
-    assert rejected[0]["ground_truth_smiles"] == ""
-
-
-def test_delayed_recheck_hides_first_answer_and_writes_consistency_report(tmp_path: Path) -> None:
-    _, review, store = _setup(tmp_path)
-    store.submit("sample-1", verification_status="human_verified_single", final_smiles="CCO", review_notes="First answer.")
-
-    selected = store.create_recheck_queue(1.0, seed=7)
-    recheck_items = store.list_recheck_items()
-
-    assert selected["selected"] == 1
-    assert recheck_items[0]["first_review_hidden"] is True
-    assert recheck_items[0]["audit"] == {}
-    store.submit_recheck("sample-1", verification_status="human_verified_single", final_smiles="CCO", bbox_after=[20, 20, 100, 100], region_type="molecule")
-    report = json.loads((review / "review_consistency_report.json").read_text(encoding="utf-8"))
-    assert report["completed_rechecks"] == 1
-    assert report["consistency_rate"] == 1.0
+    assert result.verification_status == "structure_ground_truth_verified"
+    verified = _read_rows(review / "structure_ground_truth_verified.csv")
+    assert verified[0]["ground_truth_origin"] == "pubchem"
+    assert verified[0]["ground_truth_canonical_smiles"] == "CCO"
+    assert verified[0]["source_compound_id"] == "123"
 
 
-def test_machine_manifest_is_primary_source_and_exposes_all_reviewable_scopes(tmp_path: Path) -> None:
-    _, review, store = _setup(tmp_path, ("legacy-queue",))
-    rows = [
-        _queue_row("human", "crop-0.png"),
-        _queue_row("verified", "crop-0.png"),
-        _queue_row("machine", "crop-0.png"),
-        _queue_row("invalid", "crop-0.png"),
-    ]
-    rows[0]["verification_status"] = "pending_human_review"
+def test_visual_rejection_revokes_prior_structure_confirmation(tmp_path: Path) -> None:
+    _, review, store = _setup(tmp_path, trusted=True)
+    store.submit_visual("sample-1", visual_review_status="valid_single_molecule_crop", region_type="molecule")
+    store.submit_structure_ground_truth("sample-1")
+
+    store.submit_visual("sample-1", visual_review_status="invalid_crop", region_type="invalid_crop")
+
+    assert _read_rows(review / "structure_ground_truth_verified.csv") == []
+    assert _read_rows(review / "visual_rejected.csv")[0]["sample_id"] == "sample-1"
+
+
+def test_structure_ground_truth_is_blocked_for_model_only_labels(tmp_path: Path) -> None:
+    _, _, store = _setup(tmp_path)
+    store.submit_visual("sample-1", visual_review_status="valid_single_molecule_crop", region_type="molecule")
+    with pytest.raises(ValueError, match="No trusted external ground truth"):
+        store.submit_structure_ground_truth("sample-1")
+
+
+def test_missing_source_files_require_missing_status_and_record_output(tmp_path: Path) -> None:
+    dataset, review, store = _setup(tmp_path, trusted=True)
+    (dataset / "document_runs" / "page.png").unlink()
+    item = store.get_item("sample-1")
+    assert item and item["files_complete"] is False
+    assert "source_page_path" in item["missing_source_files"]
+    with pytest.raises(ValueError, match="missing_source_file"):
+        store.submit_visual("sample-1", visual_review_status="valid_single_molecule_crop")
+
+    store.submit_visual("sample-1", visual_review_status="missing_source_file")
+    missing = _read_rows(review / "missing_files.csv")
+    assert missing[0]["sample_id"] == "sample-1"
+    with pytest.raises(ValueError, match="source page or crop"):
+        store.submit_structure_ground_truth("sample-1")
+
+
+def test_machine_manifest_is_primary_and_explicit_dataset_root_resolves_document_runs_and_candidates(tmp_path: Path) -> None:
+    dataset, _, store = _setup(tmp_path, ("human", "verified", "machine", "invalid"))
+    rows = _read_rows(store.machine_manifest_path)
     rows[1]["verification_status"] = "machine_verified"
     rows[2]["verification_status"] = "pending_machine_review"
     rows[2]["deterministic_errors"] = "[\"model_backend_unavailable\"]"
     rows[2]["molscribe_raw"] = json.dumps({"status": "failed", "message": "model package missing"})
     rows[3]["verification_status"] = "rejected_invalid"
-    with (review / "machine_review_manifest.csv").open("w", encoding="utf-8", newline="") as handle:
+    with store.machine_manifest_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=QUEUE_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
 
-    assert [item["sample_id"] for item in store.list_items()] == ["human"]
-    assert [item["sample_id"] for item in store.list_items(scope="machine_verified")] == ["verified"]
+    human = store.list_items()
+    assert [item["sample_id"] for item in human] == ["human"]
+    assert human[0]["page_path_abs"] == str((dataset / "document_runs" / "page.png").resolve())
+    assert human[0]["crop_path_abs"] == str((dataset / "candidates" / "crop-0.png").resolve())
     pending_machine = store.list_items(scope="pending_machine_review")
-    assert [item["sample_id"] for item in pending_machine] == ["machine"]
     assert _model_failures(pending_machine[0]) == [{"backend": "molscribe", "status": "failed", "message": "model package missing"}]
     assert [item["sample_id"] for item in store.list_items(scope="all_reviewable")] == ["human", "machine", "verified"]
-    assert store.queue_stats() == {
-        "total": 4,
-        "pending_human": 1,
-        "machine_verified": 1,
-        "pending_machine": 1,
-        "reviewed": 0,
-        "rejected": 1,
-    }
 
-    result = store.submit("verified", verification_status="human_verified_single", final_smiles="CCO")
-    assert result.verification_status == "human_verified_single"
-    assert store.queue_stats()["reviewed"] == 1
+
+def test_delayed_recheck_hides_first_visual_decision_and_compares_visual_results(tmp_path: Path) -> None:
+    _, review, store = _setup(tmp_path)
+    store.submit_visual("sample-1", visual_review_status="valid_single_molecule_crop", region_type="molecule", review_notes="First visual review.")
+
+    selected = store.create_recheck_queue(1.0, seed=7)
+    recheck_items = store.list_recheck_items()
+    assert selected["selected"] == 1
+    assert recheck_items[0]["first_review_hidden"] is True
+    assert recheck_items[0]["audit"] == {}
+    store.submit_recheck("sample-1", visual_review_status="valid_single_molecule_crop", bbox_after=[20, 20, 100, 100], region_type="molecule")
+    report = json.loads((review / "review_consistency_report.json").read_text(encoding="utf-8"))
+    assert report["completed_rechecks"] == 1
+    assert report["consistency_rate"] == 1.0
