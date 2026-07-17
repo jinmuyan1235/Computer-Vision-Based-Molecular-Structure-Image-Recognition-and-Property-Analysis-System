@@ -9,9 +9,24 @@ def test_streamlit_app_starts_without_exception() -> None:
     app_path = Path(__file__).resolve().parents[1] / "app.py"
     app = AppTest.from_file(str(app_path), default_timeout=30).run()
     assert not app.exception
+
+
+def test_dataset_batch_classification_workspace_renders() -> None:
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    app = AppTest.from_file(str(app_path), default_timeout=30).run()
+
+    app.segmented_control[0].set_value("Batch classify").run(timeout=30)
+
+    assert not app.exception
+    assert any(item.value == "Batch visual classification" for item in app.subheader)
+    checkbox_labels = [item.label for item in app.checkbox]
+    info_messages = [item.value for item in app.info]
+    assert "Select image" in checkbox_labels or "No samples are waiting for visual review." in info_messages
     assert app.title[0].value == "分子结构识别与性质分析"
     assert len(app.tabs) == 0
     source = app_path.read_text(encoding="utf-8")
+    review_source = (app_path.parent / "src" / "ui" / "dataset_review_page.py").read_text(encoding="utf-8")
+    assert 'st.checkbox("Select image"' in review_source
     assert "PAGE_LABELS" in source
     assert "active_page" in source
     assert "st.tabs" not in source

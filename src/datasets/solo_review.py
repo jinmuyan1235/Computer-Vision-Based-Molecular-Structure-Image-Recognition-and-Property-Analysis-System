@@ -31,22 +31,34 @@ VISUAL_REVIEW_STATUSES = (
     "multiple_molecules",
     "text",
     "table",
+    "figure",
+    "logo",
+    "blank",
     "invalid_crop",
     "missing_source_file",
     "uncertain_visual",
 )
-VISUAL_REJECTED_STATUSES = {"reaction", "multiple_molecules", "text", "table", "invalid_crop"}
+VISUAL_REJECTED_STATUSES = {
+    "reaction", "multiple_molecules", "text", "table", "figure", "logo", "blank", "invalid_crop",
+}
 TRUSTED_GROUND_TRUTH_ORIGINS = frozenset({
     "pubchem", "chembl", "supplementary_sdf", "supplementary_smiles", "curated_database", "chemist_manual",
 })
-REGION_TYPES = ("molecule", "reaction", "multiple_molecules", "text", "table", "invalid_crop")
+REGION_TYPES = (
+    "molecule", "reaction", "multiple_molecules", "text", "table", "figure", "logo", "blank", "invalid_crop",
+)
 # Retained as a small compatibility surface for code that imported the old name.
 SOLO_STATUSES = VISUAL_REVIEW_STATUSES
 REVIEW_SCOPES = {
     "pending_human_review": {"pending_human_review"},
     "machine_verified": {"machine_verified"},
     "pending_machine_review": {"pending_machine_review"},
+    "machine_rejected": {"rejected_invalid", "rejected_license"},
     "all_reviewable": {"pending_human_review", "machine_verified", "pending_machine_review"},
+    "all_samples": {
+        "pending_human_review", "machine_verified", "pending_machine_review",
+        "rejected_invalid", "rejected_license", "human_verified", "human_rejected",
+    },
 }
 OUTCOME_FIELDS = (
     "sample_id", "dataset_root", "image_path", "source_page_path", "resolved_image_path", "resolved_source_page_path",
@@ -133,6 +145,10 @@ class SoloReviewStore:
         self.crop_dir = ensure_directory(self.review_root / "single_review_crops")
         self.recheck_dir = ensure_directory(self.review_root / "rechecks")
         self.recheck_path = self.review_root / "recheck_queue.csv"
+        # A store lives for one Streamlit run. Memoizing these small ledgers
+        # avoids repeatedly reading them while resolving the selected sample.
+        self._source_rows_cache: list[dict[str, str]] | None = None
+        self._audits_cache: dict[str, dict[str, Any]] | None = None
 
     def list_items(self, *, scope: str = "pending_human_review", include_reviewed: bool = True) -> list[dict[str, Any]]:
         """List rows from the full machine manifest, using the old queue only as a fallback."""
@@ -150,8 +166,52 @@ class SoloReviewStore:
             items.append(self._enrich_row(row, audit or {}))
         return sorted(items, key=lambda item: (bool(item.get("audit")), str(item.get("sample_id") or "")))
 
+    def list_item_ids(self, *, scope: str = "pending_human_review", include_reviewed: bool = True) -> list[str]:
+        """List queue identifiers without resolving paths or parsing structures."""
+        if scope not in REVIEW_SCOPES:
+            raise ValueError(f"Unsupported review scope: {scope}")
+        audits = self._audits()
+        identifiers: list[tuple[bool, str]] = []
+        for row in self._source_rows():
+            if str(row.get("verification_status") or "") not in REVIEW_SCOPES[scope]:
+                continue
+            sample_id = str(row.get("sample_id") or "")
+            audit = audits.get(sample_id)
+            if audit and not include_reviewed:
+                continue
+            if sample_id:
+                identifiers.append((bool(audit), sample_id))
+        return [sample_id for _, sample_id in sorted(identifiers)]
+
+    def list_item_summaries(
+        self,
+        *,
+        scope: str = "pending_human_review",
+        include_reviewed: bool = True,
+    ) -> list[dict[str, str]]:
+        """Return lightweight fields for filtering and batch thumbnail pages."""
+        allowed_ids = set(self.list_item_ids(scope=scope, include_reviewed=include_reviewed))
+        summaries = [
+            {
+                "sample_id": str(row.get("sample_id") or ""),
+                "verification_status": str(row.get("verification_status") or ""),
+                "category": str(row.get("machine_category") or row.get("category") or "invalid_crop"),
+                "image_quality_level": str(row.get("image_quality_level") or ""),
+                "dataset_root": str(row.get("dataset_root") or ""),
+                "image_path": str(row.get("image_path") or ""),
+            }
+            for row in self._source_rows()
+            if str(row.get("sample_id") or "") in allowed_ids
+        ]
+        return sorted(summaries, key=lambda row: row["sample_id"])
+
     def get_item(self, sample_id: str) -> dict[str, Any] | None:
-        return next((item for item in self.list_items(scope="all_reviewable") if item.get("sample_id") == sample_id), None)
+        audit = self._audits().get(sample_id, {})
+        row = next(
+            (row for row in self._source_rows() if str(row.get("sample_id") or "") == sample_id),
+            None,
+        )
+        return self._enrich_row(row, audit) if row is not None else None
 
     def queue_stats(self) -> dict[str, int]:
         rows = self._source_rows()
@@ -164,6 +224,12 @@ class SoloReviewStore:
             sample_id for sample_id, audit in audits.items()
             if audit.get("visual_review_status") in VISUAL_REJECTED_STATUSES
         )
+        machine_rejected = sum(
+            str(row.get("verification_status") or "").startswith("rejected_") for row in rows
+        )
+        visual_negative = sum(
+            audit.get("visual_review_status") in VISUAL_REJECTED_STATUSES for audit in audits.values()
+        )
         return {
             "total": len(rows),
             "pending_human": sum(row.get("verification_status") == "pending_human_review" for row in rows),
@@ -171,6 +237,19 @@ class SoloReviewStore:
             "pending_machine": sum(row.get("verification_status") == "pending_machine_review" for row in rows),
             "reviewed": len(audits),
             "rejected": len({sample_id for sample_id in rejected_ids if sample_id}),
+            "machine_rejected": machine_rejected,
+            "visual_negative": visual_negative,
+            "positive_candidates": sum(
+                (row.get("machine_category") or row.get("category")) == "molecule" for row in rows
+            ),
+            "negative_candidates": sum(
+                (row.get("machine_category") or row.get("category")) != "molecule" for row in rows
+            ),
+            "trusted_structure_labels": sum(
+                str(row.get("ground_truth_origin") or "").strip().lower() in TRUSTED_GROUND_TRUTH_ORIGINS
+                and self._structure(str(row.get("ground_truth_smiles") or ""))["valid"]
+                for row in rows
+            ),
         }
 
     def submit_visual(
@@ -184,6 +263,63 @@ class SoloReviewStore:
         reviewer: str = "local",
     ) -> SoloReviewResult:
         """Record an image/region-only decision; no SMILES is accepted here."""
+        payload = self._visual_review_payload(
+            sample_id,
+            visual_review_status=visual_review_status,
+            bbox_after=bbox_after,
+            region_type=region_type,
+            review_notes=review_notes,
+            reviewer=reviewer,
+        )
+        return self._write_audit(payload)
+
+    def submit_visual_batch(
+        self,
+        sample_ids: Iterable[str],
+        *,
+        visual_review_status: str,
+        region_type: str,
+        review_notes: str = "",
+        reviewer: str = "local",
+    ) -> dict[str, Any]:
+        """Validate a batch, write every audit, then rebuild exports once."""
+        identifiers = list(dict.fromkeys(str(sample_id) for sample_id in sample_ids if str(sample_id)))
+        if not identifiers:
+            raise ValueError("Select at least one sample for batch classification.")
+        payloads = [
+            self._visual_review_payload(
+                sample_id,
+                visual_review_status=visual_review_status,
+                region_type=region_type,
+                review_notes=review_notes,
+                reviewer=reviewer,
+            )
+            for sample_id in identifiers
+        ]
+        # All validation is complete before the first audit file is changed.
+        for payload in payloads:
+            audit_path = self.audit_dir / f"{safe_stem(str(payload['sample_id']))}.json"
+            audit_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._audits_cache = None
+        outputs = self.export_outcomes()
+        return {
+            "reviewed_count": len(payloads),
+            "sample_ids": identifiers,
+            "visual_review_status": visual_review_status,
+            "region_type": region_type,
+            "outputs": {name: str(path) for name, path in outputs.items()},
+        }
+
+    def _visual_review_payload(
+        self,
+        sample_id: str,
+        *,
+        visual_review_status: str,
+        bbox_after: list[int] | tuple[int, int, int, int] | None = None,
+        region_type: str | None = None,
+        review_notes: str = "",
+        reviewer: str = "local",
+    ) -> dict[str, Any]:
         if visual_review_status not in VISUAL_REVIEW_STATUSES:
             raise ValueError(f"Unsupported visual review status: {visual_review_status}")
         item = self._required_item(sample_id)
@@ -224,7 +360,7 @@ class SoloReviewStore:
             "reviewed_image_path": self._review_image(item, after, before),
             "source_queue_row": self._source_snapshot(item),
         }
-        return self._write_audit(payload)
+        return payload
 
     def submit_structure_ground_truth(
         self,
@@ -347,8 +483,9 @@ class SoloReviewStore:
     ) -> Path:
         if visual_review_status not in VISUAL_REVIEW_STATUSES:
             raise ValueError("Unsupported recheck visual status.")
-        item = next((candidate for candidate in self.list_recheck_items(pending_only=False) if candidate.get("sample_id") == sample_id), None)
-        if item is None:
+        queued = any(row.get("sample_id") == sample_id for row in _read_csv(self.recheck_path))
+        item = self.get_item(sample_id) if queued else None
+        if not queued or item is None:
             raise ValueError(f"Sample is not in the recheck queue: {sample_id}")
         before = self._bbox(item.get("bbox"))
         after = list(bbox_after) if bbox_after is not None else before
@@ -375,12 +512,18 @@ class SoloReviewStore:
         paths = {
             "visual_verified": self.review_root / "visual_verified.csv",
             "visual_rejected": self.review_root / "visual_rejected.csv",
+            "detector_training_manifest": self.review_root / "detector_training_manifest.csv",
             "missing_files": self.review_root / "missing_files.csv",
             "structure_ground_truth_verified": self.review_root / "structure_ground_truth_verified.csv",
             "chemistry_review_required": self.review_root / "chemistry_review_required.csv",
         }
         _write_csv(paths["visual_verified"], [row for row in outcomes if row["visual_review_status"] == "valid_single_molecule_crop"])
         _write_csv(paths["visual_rejected"], [row for row in outcomes if row["visual_review_status"] in VISUAL_REJECTED_STATUSES])
+        _write_csv(paths["detector_training_manifest"], [
+            row for row in outcomes
+            if row["visual_review_status"] == "valid_single_molecule_crop"
+            or row["visual_review_status"] in VISUAL_REJECTED_STATUSES
+        ])
         _write_csv(paths["missing_files"], [row for row in outcomes if row["visual_review_status"] == "missing_source_file"])
         _write_csv(paths["structure_ground_truth_verified"], [row for row in outcomes if row["structure_review_status"] == "structure_ground_truth_verified"])
         _write_csv(paths["chemistry_review_required"], [
@@ -483,9 +626,17 @@ class SoloReviewStore:
         return item
 
     def _source_rows(self) -> list[dict[str, str]]:
-        return _read_csv(self.machine_manifest_path) if self.machine_manifest_path.is_file() else _read_csv(self.queue_path)
+        if self._source_rows_cache is None:
+            self._source_rows_cache = (
+                _read_csv(self.machine_manifest_path)
+                if self.machine_manifest_path.is_file()
+                else _read_csv(self.queue_path)
+            )
+        return self._source_rows_cache
 
     def _audits(self) -> dict[str, dict[str, Any]]:
+        if self._audits_cache is not None:
+            return self._audits_cache
         audits: dict[str, dict[str, Any]] = {}
         for path in self.audit_dir.glob("*.json"):
             try:
@@ -495,7 +646,8 @@ class SoloReviewStore:
             sample_id = str(payload.get("sample_id") or "")
             if sample_id:
                 audits[sample_id] = payload
-        return audits
+        self._audits_cache = audits
+        return self._audits_cache
 
     @staticmethod
     def _bbox(raw_bbox: str | list[int] | tuple[int, ...] | None) -> list[int]:
@@ -555,12 +707,20 @@ class SoloReviewStore:
     def _write_audit(self, payload: dict[str, Any]) -> SoloReviewResult:
         audit_path = self.audit_dir / f"{safe_stem(str(payload['sample_id']))}.json"
         audit_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._audits_cache = None
         self.export_outcomes()
         return SoloReviewResult(str(payload["sample_id"]), str(payload["verification_status"]), audit_path, str(payload.get("reviewed_image_path") or ""))
 
     def _outcome_row(self, audit: dict[str, Any]) -> dict[str, Any]:
         source = audit.get("source_queue_row") or {}
+        visual_status = str(audit.get("visual_review_status") or "")
         structure_verified = audit.get("structure_review_status") == "structure_ground_truth_verified"
+        if visual_status == "valid_single_molecule_crop":
+            expected_action = "recognize"
+        elif visual_status in VISUAL_REJECTED_STATUSES:
+            expected_action = "reject"
+        else:
+            expected_action = ""
         truth = self._structure(str(audit.get("final_smiles") or "")) if structure_verified else self._structure("")
         origin = str(source.get("ground_truth_origin") or "").lower()
         return {
@@ -569,7 +729,7 @@ class SoloReviewStore:
             "source_page_path": source.get("source_page_path", ""), "resolved_image_path": source.get("crop_path_abs", ""),
             "resolved_source_page_path": source.get("page_path_abs", ""), "visual_review_status": audit.get("visual_review_status", ""),
             "structure_review_status": audit.get("structure_review_status", ""), "verification_status": audit.get("verification_status", ""),
-            "expected_action": "recognize" if structure_verified else "", "category": audit.get("region_type_after") or source.get("machine_category") or source.get("category", ""),
+            "expected_action": expected_action, "category": audit.get("region_type_after") or source.get("machine_category") or source.get("category", ""),
             "source": source.get("source_kind", ""), "source_document": source.get("source_document", ""), "source_url": source.get("source_url", ""),
             "source_license": source.get("source_license", ""), "attribution": source.get("attribution", ""), "split": source.get("split", ""),
             "scaffold_key": scaffold_for_smiles(truth["canonical_smiles"]) if structure_verified else "",
