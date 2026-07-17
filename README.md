@@ -844,7 +844,7 @@ python scripts/collect_ocsr_dataset.py \
 
 The collector has response caching, limits, rate intervals, retries, logs, and resume state. PubChem material retains CID, input/canonical SMILES, InChIKey, SDF, and 2D PNG. Approved PMC PDF resources, or an explicit approved PNG/JPEG page resource, pass through the existing renderer and region detector. Candidate images receive MolScribe, DECIMER, and ensemble predictions, but those predictions are never promoted to labels automatically.
 
-`pending_manifest.csv` records molecule candidates and detected `text`, `table`, `reaction`, `blank`, and `invalid_crop` negatives. SHA-256, perceptual hash, canonical SMILES, and InChIKey prevent duplicate work. Two independent reviewers must agree before `verified_manifest.csv` is written:
+`pending_manifest.csv` records molecule candidates and detected `text`, `table`, `reaction`, `figure`, `logo`, `blank`, `multiple_molecules`, and `invalid_crop` negatives. SHA-256 is the deterministic duplicate key. Perceptual-hash neighbours are only routed to human review because sparse black-on-white paper crops can collide; an exact image with conflicting categories is also reviewed rather than silently discarded. Two independent reviewers must agree before `verified_manifest.csv` is written:
 
 ```bash
 python scripts/collect_ocsr_dataset.py --dataset-root data/ocsr_collections review \
@@ -868,13 +868,13 @@ python scripts/run_ocsr_machine_review.py \
 
 Use `--reuse-predictions` to evaluate the saved model outputs only. Otherwise the command reruns MolScribe, DECIMER, and ensemble. It writes `machine_review_manifest.csv`, `rejected_manifest.csv`, `human_review_queue.csv`, `review_summary.json`, and `review_report.md`. Run it only after a non-empty `pending_manifest.csv` has been produced; retaining saved predictions avoids an unnecessary second model run.
 
-Machine review validates image paths and decoding, SHA-256, duplicate and perceptual hashes, bbox integrity, source metadata and license, RDKit SMILES/canonical/InChIKey/formula fields, and explicit split leakage. It records every raw prediction, model agreement, redraw similarity, quality score, category, structure risk, and rejection reason. `machine_verified` is only a technical gate, never human ground truth.
+Machine review validates image paths and decoding, SHA-256, duplicate and perceptual hashes, bbox integrity, source metadata and license, RDKit SMILES/canonical/InChIKey/formula fields, and explicit split leakage. It records every raw prediction, model agreement, redraw similarity, quality score, category, structure risk, and rejection reason. Redraw similarity is computed only for molecule candidates with a valid OCSR prediction. `machine_verified` is only a technical gate, never human ground truth.
 
 Machine statuses are `rejected_invalid`, `rejected_license`, `pending_machine_review`, `machine_verified`, `pending_human_review`, `human_verified`, and `human_rejected`. Disagreement, a negative sample with a valid SMILES, complex chemistry, low quality, cropped structures, unknown licenses, or low redraw similarity route samples to human review.
 
 ### Single-Developer Dataset Review
 
-Open **Data Management / OCSR Dataset Review** in Streamlit after generating `data/review/machine_review_manifest.csv`. This is intentionally a single-person workflow: it has no user accounts, second-review gate, or arbitration system. The Queue view defaults to `pending_human_review` and can switch between pending-human, machine-verified spot checks, pending-machine failures, and all reviewable samples. `machine_review_manifest.csv` is the page's primary source; `human_review_queue.csv` contains only the `pending_human_review` subset and is retained as a stage-two handoff artifact and compatibility fallback.
+Open **Data Management / OCSR Dataset Review** in Streamlit after generating `data/review/machine_review_manifest.csv`. This is intentionally a single-person workflow: it has no user accounts, second-review gate, or arbitration system. The Queue view defaults to pending visual review and can switch between machine-gate passes, pending-machine failures, machine rejections, and all samples. The **Batch classify** view filters pending samples by machine category, paginates crop thumbnails, supports selecting some or all displayed samples, and applies one reviewed class to the selection. A batch is fully validated before audit files are written, and export manifests are rebuilt only once per batch. `machine_review_manifest.csv` is the page's primary source; `human_review_queue.csv` contains only the `pending_human_review` subset and is retained as a stage-two handoff artifact and compatibility fallback.
 
 The page separates **Visual Review** from **Structure Ground Truth Review**. Visual Review only classifies the page region as `valid_single_molecule_crop`, `reaction`, `multiple_molecules`, `text`, `table`, `invalid_crop`, `missing_source_file`, or `uncertain_visual`; it never asks a non-chemist to supply a SMILES. It shows the original document page with bbox, the source crop, a crop generated from the original page, and model redraws explicitly labelled as redraws rather than source images. It also displays the manifest path, chosen dataset root, resolved local path, and file-existence state for every source image.
 
@@ -884,6 +884,7 @@ Each decision writes an independent JSON record under `data/review/single_review
 
 - `data/review/visual_verified.csv`
 - `data/review/visual_rejected.csv`
+- `data/review/detector_training_manifest.csv` (reviewed positives and negatives with `expected_action=recognize|reject`)
 - `data/review/missing_files.csv`
 - `data/review/structure_ground_truth_verified.csv`
 - `data/review/chemistry_review_required.csv`

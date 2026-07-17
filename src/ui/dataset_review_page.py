@@ -6,43 +6,82 @@ import json
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 import streamlit as st
 
 import config
 from src.datasets.solo_review import REGION_TYPES, VISUAL_REVIEW_STATUSES, SoloReviewStore
 
 
+BATCH_CLASS_TO_VISUAL_STATUS = {
+    region_type: "valid_single_molecule_crop" if region_type == "molecule" else region_type
+    for region_type in REGION_TYPES
+}
+
+
 def render_dataset_review_page() -> None:
     """Render the review page without treating model output as chemical truth."""
     st.header("OCSR Data Review")
+    st.info(
+        "Visual Review builds molecule-vs-negative detector/rejector labels. "
+        "Exact OCSR training and accuracy evaluation additionally require a trusted structure label; "
+        "model predictions are evidence, not ground truth."
+    )
+    if notice := st.session_state.pop("solo_review_notice", None):
+        st.success(str(notice))
+    if error := st.session_state.pop("solo_review_error", None):
+        st.error(str(error))
     store = SoloReviewStore(config.DATA_DIR / "ocsr_collections", review_root=config.DATA_DIR / "review")
-    mode = st.segmented_control("Review mode", ["Queue", "Delayed recheck"], default="Queue", key="solo_review_mode")
+    mode = st.segmented_control(
+        "Review mode",
+        ["Queue", "Batch classify", "Delayed recheck"],
+        default="Queue",
+        key="solo_review_mode",
+    )
     if mode == "Delayed recheck":
         _render_recheck_workspace(store)
+    elif mode == "Batch classify":
+        _render_batch_workspace(store)
     else:
         _render_queue_workspace(store)
 
 
 def _render_queue_workspace(store: SoloReviewStore) -> None:
     stats = store.queue_stats()
-    metrics = st.columns(6)
-    for column, label, key in zip(metrics, ("Total", "Pending human", "Machine verified", "Pending machine", "Reviewed", "Rejected"), ("total", "pending_human", "machine_verified", "pending_machine", "reviewed", "rejected")):
+    metrics = st.columns(7)
+    for column, label, key in zip(
+        metrics,
+        ("Total", "Pending visual", "Machine gate passed", "Pending machine", "Visual reviewed", "Machine rejected", "Visual negatives"),
+        ("total", "pending_human", "machine_verified", "pending_machine", "reviewed", "machine_rejected", "visual_negative"),
+    ):
         column.metric(label, stats[key])
+    st.caption(
+        f"Detector candidates: {stats['positive_candidates']} molecule / "
+        f"{stats['negative_candidates']} negative; trusted structure labels: {stats['trusted_structure_labels']}."
+    )
     controls = st.columns([0.36, 0.22, 0.42])
-    scope_label = controls[0].selectbox("Review range", ["Pending human review", "Machine verified", "Pending machine review", "All reviewable"], index=0, key="solo_review_scope")
+    scope_label = controls[0].selectbox(
+        "Review range",
+        ["Pending visual review", "Machine gate passed", "Pending machine review", "Machine rejected", "All samples"],
+        index=0,
+        key="solo_review_scope",
+    )
     scope = {
-        "Pending human review": "pending_human_review", "Machine verified": "machine_verified",
-        "Pending machine review": "pending_machine_review", "All reviewable": "all_reviewable",
+        "Pending visual review": "pending_human_review", "Machine gate passed": "machine_verified",
+        "Pending machine review": "pending_machine_review", "Machine rejected": "machine_rejected",
+        "All samples": "all_samples",
     }[scope_label]
     show_reviewed = controls[1].toggle("Show reviewed", value=False, key="solo_show_reviewed")
-    items = store.list_items(scope=scope, include_reviewed=show_reviewed)
-    if not items:
+    ids = store.list_item_ids(scope=scope, include_reviewed=show_reviewed)
+    if not ids:
         st.info("No matching reviewable samples in data/review/machine_review_manifest.csv.")
         return
-    ids = [str(item["sample_id"]) for item in items]
     selected = controls[2].selectbox("Sample", ids, key="solo_queue_sample")
-    _render_item(store, next(item for item in items if item["sample_id"] == selected), recheck=False)
+    item = store.get_item(str(selected))
+    if item is None:
+        st.warning("The selected sample is no longer available. Refresh the queue.")
+        return
+    _render_item(store, item, recheck=False)
 
 
 def _render_recheck_workspace(store: SoloReviewStore) -> None:
@@ -60,6 +99,138 @@ def _render_recheck_workspace(store: SoloReviewStore) -> None:
         return
     selected = st.selectbox("Recheck sample", [str(item["sample_id"]) for item in items], key="solo_recheck_sample")
     _render_item(store, next(item for item in items if item["sample_id"] == selected), recheck=True)
+
+
+def _render_batch_workspace(store: SoloReviewStore) -> None:
+    st.subheader("Batch visual classification")
+    st.caption("Filter and inspect one thumbnail page, select samples, then apply one visual class to the selection.")
+    summaries = store.list_item_summaries(scope="pending_human_review", include_reviewed=False)
+    if not summaries:
+        st.info("No samples are waiting for visual review.")
+        return
+    categories = sorted({row["category"] for row in summaries})
+    filters = st.columns([0.34, 0.22, 0.22, 0.22])
+    category = filters[0].selectbox("Machine category", ["All", *categories], key="batch_machine_category")
+    page_size = int(filters[1].selectbox("Page size", [8, 12, 20, 32], index=2, key="batch_page_size"))
+    filtered = summaries if category == "All" else [row for row in summaries if row["category"] == category]
+    page_count = max(1, (len(filtered) + page_size - 1) // page_size)
+    page_number = int(filters[2].number_input(
+        "Page",
+        min_value=1,
+        max_value=page_count,
+        value=1,
+        step=1,
+        key=f"batch_page_number_{category}_{page_size}",
+    ))
+    filters[3].metric("Matching", len(filtered))
+    displayed = filtered[(page_number - 1) * page_size:page_number * page_size]
+    displayed_ids = [row["sample_id"] for row in displayed]
+    page_key = f"{category}_{page_size}_{page_number}"
+    checkbox_keys = {sample_id: f"batch_pick_{sample_id}" for sample_id in displayed_ids}
+    selection_controls = st.columns([0.20, 0.20, 0.60])
+    if selection_controls[0].button("Select displayed", key=f"select_batch_page_{page_key}"):
+        for key in checkbox_keys.values():
+            st.session_state[key] = True
+    if selection_controls[1].button("Clear selection", key=f"clear_batch_page_{page_key}"):
+        for key in checkbox_keys.values():
+            st.session_state[key] = False
+    selected_ids = _render_batch_thumbnails(store, displayed, checkbox_keys)
+    selection_controls[2].metric("Selected on this page", len(selected_ids))
+    target_default = category if category in REGION_TYPES else "molecule"
+    target_key = f"batch_target_{category}_{page_number}"
+    reviewer_key = f"batch_reviewer_{category}_{page_number}"
+    notes_key = f"batch_notes_{category}_{page_number}"
+    with st.form(key=f"batch_classification_form_{category}_{page_size}_{page_number}", border=True):
+        action = st.columns([0.28, 0.22, 0.50])
+        action[0].selectbox(
+            "Apply class",
+            REGION_TYPES,
+            index=REGION_TYPES.index(target_default),
+            key=target_key,
+        )
+        action[1].text_input("Reviewer", value="local", key=reviewer_key)
+        action[2].text_input("Batch notes", key=notes_key)
+        st.warning(f"This will classify {len(selected_ids)} selected sample(s) with the same label.")
+        st.form_submit_button(
+            "Save batch classification",
+            type="primary",
+            disabled=not selected_ids,
+            on_click=_save_batch_review,
+            args=(store, selected_ids, target_key, reviewer_key, notes_key, checkbox_keys),
+        )
+
+
+def _render_batch_thumbnails(
+    store: SoloReviewStore,
+    summaries: list[dict[str, str]],
+    checkbox_keys: dict[str, str],
+) -> list[str]:
+    selected_ids: list[str] = []
+    columns = st.columns(4, gap="medium")
+    for index, summary in enumerate(summaries):
+        with columns[index % 4]:
+            sample_id = summary["sample_id"]
+            with st.container(border=True):
+                selected = st.checkbox("Select image", key=checkbox_keys[sample_id])
+                if selected:
+                    selected_ids.append(sample_id)
+                path = store.resolve_dataset_path(summary["image_path"], dataset_root=summary["dataset_root"])
+                if path:
+                    try:
+                        modified = Path(path).stat().st_mtime_ns
+                    except OSError:
+                        modified = 0
+                    st.image(_batch_thumbnail(path, modified), width="stretch")
+                else:
+                    st.info("Image missing")
+                st.caption(
+                    f"{summary['category']} · quality={summary['image_quality_level'] or '-'} · "
+                    f"…{sample_id[-12:]}"
+                )
+                with st.expander("Sample details", expanded=False):
+                    st.code(sample_id, language=None)
+    return selected_ids
+
+
+@st.cache_data(show_spinner=False)
+def _batch_thumbnail(path: str, modified_time_ns: int, size: tuple[int, int] = (480, 300)) -> Image.Image:
+    """Fit arbitrary crop shapes onto an equal-size canvas for an aligned grid."""
+    del modified_time_ns  # Included in the cache key so replaced source files invalidate the thumbnail.
+    with Image.open(path) as image:
+        source = image.convert("RGB")
+    inner_size = (size[0] - 24, size[1] - 24)
+    fitted = ImageOps.contain(source, inner_size, method=Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", size, "white")
+    left = (size[0] - fitted.width) // 2
+    top = (size[1] - fitted.height) // 2
+    canvas.paste(fitted, (left, top))
+    return canvas
+
+
+def _save_batch_review(
+    store: SoloReviewStore,
+    selected_ids: list[str],
+    target_key: str,
+    reviewer_key: str,
+    notes_key: str,
+    checkbox_keys: dict[str, str],
+) -> None:
+    """Persist a selected thumbnail page before Streamlit's submit rerun."""
+    try:
+        region_type = str(st.session_state[target_key])
+        result = store.submit_visual_batch(
+            selected_ids,
+            visual_review_status=BATCH_CLASS_TO_VISUAL_STATUS[region_type],
+            region_type=region_type,
+            reviewer=str(st.session_state.get(reviewer_key) or "local"),
+            review_notes=str(st.session_state.get(notes_key) or ""),
+        )
+        for key in checkbox_keys.values():
+            st.session_state[key] = False
+        st.session_state["solo_review_notice"] = f"Batch classified {result['reviewed_count']} samples as {region_type}."
+        st.session_state.pop("solo_review_error", None)
+    except Exception as exc:
+        st.session_state["solo_review_error"] = str(exc)
 
 
 def _render_item(store: SoloReviewStore, item: dict[str, Any], *, recheck: bool) -> None:
@@ -167,27 +338,74 @@ def _render_actions(store: SoloReviewStore, item: dict[str, Any], *, recheck: bo
     bbox_before = _parse_json(item.get("bbox"), [])
     bbox_values = bbox_before if len(bbox_before) == 4 else [0, 0, 0, 0]
     suggested = "missing_source_file" if not item.get("files_complete") else _current_visual_status(item)
-    visual_status = st.selectbox("Visual result", VISUAL_REVIEW_STATUSES, index=VISUAL_REVIEW_STATUSES.index(suggested), key=f"visual_status_{'recheck_' if recheck else ''}{sample_id}")
-    editor = st.columns([0.24, 0.20, 0.56])
-    region_type = editor[0].selectbox("Region type", REGION_TYPES, index=_region_index(item), key=f"solo_region_{'recheck_' if recheck else ''}{sample_id}")
-    reviewer = editor[1].text_input("Reviewer", value="local", disabled=recheck, key=f"solo_reviewer_{sample_id}")
-    notes = editor[2].text_input("Review notes", key=f"solo_notes_{'recheck_' if recheck else ''}{sample_id}")
-    bbox_columns = st.columns(4)
-    bbox_after = [int(bbox_columns[index].number_input(label, min_value=0, value=int(bbox_values[index]), step=1, key=f"solo_bbox_{'recheck_' if recheck else ''}{sample_id}_{label}")) for index, label in enumerate(("x1", "y1", "x2", "y2"))]
-    if st.button("Save visual review", type="primary", key=f"save_visual_{'recheck_' if recheck else ''}{sample_id}"):
-        try:
-            if recheck:
-                store.submit_recheck(sample_id, visual_review_status=visual_status, bbox_after=bbox_after, region_type=region_type, review_notes=notes)
-            else:
-                store.submit_visual(sample_id, visual_review_status=visual_status, bbox_after=bbox_after, region_type=region_type, review_notes=notes, reviewer=reviewer)
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
+    prefix = "recheck_" if recheck else ""
+    visual_key = f"visual_status_{prefix}{sample_id}"
+    region_key = f"solo_region_{prefix}{sample_id}"
+    reviewer_key = f"solo_reviewer_{prefix}{sample_id}"
+    notes_key = f"solo_notes_{prefix}{sample_id}"
+    bbox_keys = [f"solo_bbox_{prefix}{sample_id}_{label}" for label in ("x1", "y1", "x2", "y2")]
+    with st.form(key=f"visual_review_form_{prefix}{sample_id}", border=True):
+        st.selectbox("Visual result", VISUAL_REVIEW_STATUSES, index=VISUAL_REVIEW_STATUSES.index(suggested), key=visual_key)
+        editor = st.columns([0.24, 0.20, 0.56])
+        editor[0].selectbox("Region type", REGION_TYPES, index=_region_index(item), key=region_key)
+        editor[1].text_input("Reviewer", value="local", disabled=recheck, key=reviewer_key)
+        editor[2].text_input("Review notes", key=notes_key)
+        bbox_columns = st.columns(4)
+        for index, (label, key) in enumerate(zip(("x1", "y1", "x2", "y2"), bbox_keys)):
+            bbox_columns[index].number_input(label, min_value=0, value=int(bbox_values[index]), step=1, key=key)
+        st.form_submit_button(
+            "Save visual review",
+            type="primary",
+            on_click=_save_visual_review,
+            args=(store, sample_id, recheck, visual_key, region_key, reviewer_key, notes_key, bbox_keys),
+        )
+    reviewer = str(st.session_state.get(reviewer_key) or "local")
+    notes = str(st.session_state.get(notes_key) or "")
     if recheck:
         return
     st.divider()
     st.subheader("Structure Ground Truth Review")
     _render_ground_truth_confirmation(store, item, reviewer, notes)
+
+
+def _save_visual_review(
+    store: SoloReviewStore,
+    sample_id: str,
+    recheck: bool,
+    visual_key: str,
+    region_key: str,
+    reviewer_key: str,
+    notes_key: str,
+    bbox_keys: list[str],
+) -> None:
+    """Persist form state before Streamlit performs its single submit rerun."""
+    try:
+        visual_status = str(st.session_state[visual_key])
+        region_type = str(st.session_state[region_key])
+        reviewer = str(st.session_state.get(reviewer_key) or "local")
+        notes = str(st.session_state.get(notes_key) or "")
+        bbox_after = [int(st.session_state[key]) for key in bbox_keys]
+        if recheck:
+            store.submit_recheck(
+                sample_id,
+                visual_review_status=visual_status,
+                bbox_after=bbox_after,
+                region_type=region_type,
+                review_notes=notes,
+            )
+        else:
+            store.submit_visual(
+                sample_id,
+                visual_review_status=visual_status,
+                bbox_after=bbox_after,
+                region_type=region_type,
+                review_notes=notes,
+                reviewer=reviewer,
+            )
+        st.session_state["solo_review_notice"] = f"Saved visual review for {sample_id}."
+        st.session_state.pop("solo_review_error", None)
+    except Exception as exc:
+        st.session_state["solo_review_error"] = str(exc)
 
 
 def _render_ground_truth_confirmation(store: SoloReviewStore, item: dict[str, Any], reviewer: str, notes: str) -> None:
@@ -206,12 +424,23 @@ def _render_ground_truth_confirmation(store: SoloReviewStore, item: dict[str, An
     disabled = not item.get("files_complete") or not visual_complete
     if not visual_complete:
         st.info("Save Visual Review as valid_single_molecule_crop before confirming the trusted structure label.")
-    if st.button("Accept trusted ground truth", disabled=disabled, key=f"accept_truth_{item.get('sample_id')}"):
-        try:
-            store.submit_structure_ground_truth(str(item["sample_id"]), reviewer=reviewer, review_notes=notes)
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
+    st.button(
+        "Accept trusted ground truth",
+        disabled=disabled,
+        key=f"accept_truth_{item.get('sample_id')}",
+        on_click=_accept_ground_truth,
+        args=(store, str(item["sample_id"]), reviewer, notes),
+    )
+
+
+def _accept_ground_truth(store: SoloReviewStore, sample_id: str, reviewer: str, notes: str) -> None:
+    """Confirm trusted truth in the button callback to avoid a second rerun."""
+    try:
+        store.submit_structure_ground_truth(sample_id, reviewer=reviewer, review_notes=notes)
+        st.session_state["solo_review_notice"] = f"Accepted trusted ground truth for {sample_id}."
+        st.session_state.pop("solo_review_error", None)
+    except Exception as exc:
+        st.session_state["solo_review_error"] = str(exc)
 
 
 def _page_with_bbox(path: Path, bbox: list[int]) -> Image.Image:

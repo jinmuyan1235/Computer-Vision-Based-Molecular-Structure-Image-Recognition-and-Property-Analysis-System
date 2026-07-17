@@ -26,7 +26,10 @@ from src.ocsr.recognizer import MoleculeRecognizer
 from src.utils.file_utils import ensure_directory, safe_stem
 
 
-NEGATIVE_CATEGORIES = {"text", "table", "reaction", "blank", "invalid_crop"}
+NEGATIVE_CATEGORIES = {
+    "text", "table", "reaction", "figure", "logo", "blank",
+    "multiple_molecules", "invalid_crop",
+}
 REGION_CATEGORY = {
     "molecule": "molecule",
     "text": "text",
@@ -35,6 +38,10 @@ REGION_CATEGORY = {
     "reaction_like": "reaction",
     "reaction_arrow": "reaction",
     "reaction_condition": "reaction",
+    "figure": "figure",
+    "logo": "logo",
+    "blank": "blank",
+    "multiple_molecules": "multiple_molecules",
 }
 
 

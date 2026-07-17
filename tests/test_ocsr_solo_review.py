@@ -10,7 +10,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 from src.datasets.solo_review import SoloReviewStore
-from src.ui.dataset_review_page import _model_failures
+from src.ui.dataset_review_page import _batch_thumbnail, _model_failures
 
 
 QUEUE_FIELDS = (
@@ -92,6 +92,7 @@ def test_visual_review_does_not_require_smiles_and_routes_to_chemistry_required(
     assert set(audit["correction_types"]) == {"bbox"}
     assert Path(result.image_path).is_file()
     assert _read_rows(review / "visual_verified.csv")[0]["sample_id"] == "sample-1"
+    assert _read_rows(review / "detector_training_manifest.csv")[0]["expected_action"] == "recognize"
     assert _read_rows(review / "chemistry_review_required.csv")[0]["ground_truth_smiles"] == ""
     assert _read_rows(review / "structure_ground_truth_verified.csv") == []
 
@@ -121,6 +122,7 @@ def test_visual_rejection_revokes_prior_structure_confirmation(tmp_path: Path) -
 
     assert _read_rows(review / "structure_ground_truth_verified.csv") == []
     assert _read_rows(review / "visual_rejected.csv")[0]["sample_id"] == "sample-1"
+    assert _read_rows(review / "detector_training_manifest.csv")[0]["expected_action"] == "reject"
 
 
 def test_structure_ground_truth_is_blocked_for_model_only_labels(tmp_path: Path) -> None:
@@ -166,6 +168,85 @@ def test_machine_manifest_is_primary_and_explicit_dataset_root_resolves_document
     pending_machine = store.list_items(scope="pending_machine_review")
     assert _model_failures(pending_machine[0]) == [{"backend": "molscribe", "status": "failed", "message": "model package missing"}]
     assert [item["sample_id"] for item in store.list_items(scope="all_reviewable")] == ["human", "machine", "verified"]
+    assert [item["sample_id"] for item in store.list_items(scope="machine_rejected")] == ["invalid"]
+    assert store.get_item("invalid") is not None
+
+
+def test_lightweight_id_listing_does_not_enrich_every_queue_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, store = _setup(tmp_path, ("first", "second", "third"))
+
+    def unexpected_enrichment(*_: object, **__: object) -> dict[str, object]:
+        raise AssertionError("list_item_ids must not enrich queue rows")
+
+    monkeypatch.setattr(store, "_enrich_row", unexpected_enrichment)
+
+    assert store.list_item_ids(scope="pending_human_review") == ["first", "second", "third"]
+
+
+def test_get_item_enriches_only_the_selected_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, store = _setup(tmp_path, ("first", "second", "third"))
+    original = store._enrich_row
+    calls: list[str] = []
+
+    def track(row: dict[str, str], audit: dict[str, object]) -> dict[str, object]:
+        calls.append(row["sample_id"])
+        return original(row, audit)
+
+    monkeypatch.setattr(store, "_enrich_row", track)
+
+    assert store.get_item("second")["sample_id"] == "second"
+    assert calls == ["second"]
+
+
+def test_batch_visual_classification_writes_all_audits_and_exports_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, review, store = _setup(tmp_path, ("first", "second", "third"))
+    original_export = store.export_outcomes
+    export_calls = 0
+
+    def track_export() -> dict[str, Path]:
+        nonlocal export_calls
+        export_calls += 1
+        return original_export()
+
+    monkeypatch.setattr(store, "export_outcomes", track_export)
+
+    result = store.submit_visual_batch(
+        ["first", "second", "third"],
+        visual_review_status="text",
+        region_type="text",
+        reviewer="batch-reviewer",
+        review_notes="Same text class.",
+    )
+
+    assert result["reviewed_count"] == 3
+    assert export_calls == 1
+    rows = _read_rows(review / "detector_training_manifest.csv")
+    assert {row["sample_id"] for row in rows} == {"first", "second", "third"}
+    assert {row["expected_action"] for row in rows} == {"reject"}
+    assert {row["category"] for row in rows} == {"text"}
+
+
+def test_batch_visual_classification_requires_selection(tmp_path: Path) -> None:
+    _, _, store = _setup(tmp_path)
+
+    with pytest.raises(ValueError, match="Select at least one"):
+        store.submit_visual_batch([], visual_review_status="text", region_type="text")
+
+
+def test_batch_thumbnail_uses_fixed_canvas_for_different_aspect_ratios(tmp_path: Path) -> None:
+    wide = tmp_path / "wide.png"
+    tall = tmp_path / "tall.png"
+    Image.new("RGB", (600, 80), "white").save(wide)
+    Image.new("RGB", (80, 600), "white").save(tall)
+
+    wide_thumbnail = _batch_thumbnail(str(wide), wide.stat().st_mtime_ns)
+    tall_thumbnail = _batch_thumbnail(str(tall), tall.stat().st_mtime_ns)
+
+    assert wide_thumbnail.size == (480, 300)
+    assert tall_thumbnail.size == (480, 300)
 
 
 def test_delayed_recheck_hides_first_visual_decision_and_compares_visual_results(tmp_path: Path) -> None:

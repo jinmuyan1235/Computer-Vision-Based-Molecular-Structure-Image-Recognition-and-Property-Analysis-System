@@ -141,7 +141,7 @@ class MachineReviewProcessor:
             self._review_row(
                 row,
                 leakage.get(str(row.get("sample_id") or ""), []),
-                duplicates.get(str(row.get("sample_id") or ""), ""),
+                duplicates.get(str(row.get("sample_id") or "")),
             )
             for row in rows
         ]
@@ -165,7 +165,12 @@ class MachineReviewProcessor:
             "total": len(output_rows),
         }
 
-    def _review_row(self, row: dict[str, str], split_leakage: list[str], detected_duplicate: str) -> dict[str, Any]:
+    def _review_row(
+        self,
+        row: dict[str, str],
+        split_leakage: list[str],
+        detected_duplicate: tuple[str, str] | None,
+    ) -> dict[str, Any]:
         sample_id = str(row.get("sample_id") or "")
         deterministic_errors: list[str] = []
         risks: list[str] = list(split_leakage)
@@ -234,14 +239,30 @@ class MachineReviewProcessor:
             except Exception as exc:
                 risks.append("redraw_comparison_failed")
                 similarity = None
-        if similarity is None or similarity < self.config.redraw_similarity_threshold:
-            risks.append("low_redraw_similarity")
+        # Redraw comparison has no meaning for a negative crop or when no OCSR
+        # backend produced a valid structure.  Recording those cases as a low
+        # similarity made almost every text/reaction/blank candidate look bad.
+        if machine_category == "molecule" and primary["valid"]:
+            if similarity is None or similarity < self.config.redraw_similarity_threshold:
+                risks.append("low_redraw_similarity")
 
         if split_leakage:
             deterministic_errors.append("split_leakage")
-        duplicate_of = str(row.get("duplicate_of") or detected_duplicate or "")
-        if duplicate_of:
+        duplicate_of = ""
+        duplicate_kind = ""
+        if detected_duplicate:
+            duplicate_of, duplicate_kind = detected_duplicate
+        elif row.get("duplicate_of"):
+            # Old collector manifests did not preserve whether this was an
+            # exact byte duplicate or only an average-hash neighbour.
+            duplicate_of = str(row["duplicate_of"])
+            duplicate_kind = "collector_reported"
+        if duplicate_kind == "exact":
             deterministic_errors.append("duplicate_image")
+        elif duplicate_kind == "category_conflict":
+            risks.append("duplicate_category_conflict")
+        elif duplicate_kind in {"near", "collector_reported"}:
+            risks.append("near_duplicate_image")
 
         machine_status = self._machine_status(
             deterministic_errors=deterministic_errors,
@@ -453,6 +474,7 @@ class MachineReviewProcessor:
             "redraw_comparison_failed", "stereochemistry", "markush_or_query_atom", "polymer_risk",
             "metal_coordination", "charged_structure", "salt_or_multifragment", "model_disagreement",
             "only_one_valid_model", "negative_sample_has_valid_smiles",
+            "near_duplicate_image", "duplicate_category_conflict",
         }
         if bbox_edge_contact or blocking_risks.intersection(risks):
             return "pending_human_review"
@@ -545,31 +567,39 @@ class MachineReviewProcessor:
                     result[sample_id].append(f"split_leakage_{kind}:{value}")
         return result
 
-    def _manifest_duplicates(self, rows: list[dict[str, str]]) -> dict[str, str]:
-        """Find exact and near-image duplicates without relying on prior collector state."""
-        result: dict[str, str] = {}
-        seen_hashes: dict[str, str] = {}
-        phashes: list[tuple[str, str]] = []
+    def _manifest_duplicates(self, rows: list[dict[str, str]]) -> dict[str, tuple[str, str]]:
+        """Classify exact duplicates, label conflicts, and same-class near neighbours.
+
+        The 64-bit average hash is intentionally only a review hint. Sparse
+        black-on-white paper crops collide frequently, so a perceptual-hash
+        neighbour must never be treated as deterministic corruption.
+        """
+        result: dict[str, tuple[str, str]] = {}
+        seen_hashes: dict[str, tuple[str, str]] = {}
+        phashes: dict[str, list[tuple[str, str]]] = defaultdict(list)
         for row in rows:
             sample_id = str(row.get("sample_id") or "")
+            category = str(row.get("category") or "invalid_crop").strip().lower()
             image_hash = str(row.get("image_sha256") or "")
             if sample_id and image_hash:
                 if image_hash in seen_hashes:
-                    result[sample_id] = seen_hashes[image_hash]
+                    prior_sample, prior_category = seen_hashes[image_hash]
+                    kind = "exact" if category == prior_category else "category_conflict"
+                    result[sample_id] = (prior_sample, kind)
                 else:
-                    seen_hashes[image_hash] = sample_id
+                    seen_hashes[image_hash] = (sample_id, category)
             image_phash = str(row.get("perceptual_hash") or "")
             if sample_id and image_phash and sample_id not in result:
-                for prior_sample, prior_phash in phashes:
+                for prior_sample, prior_phash in phashes[category]:
                     try:
                         is_near = hamming_distance(image_phash, prior_phash) <= self.config.perceptual_hash_distance
                     except ValueError:
                         is_near = False
                     if is_near:
-                        result[sample_id] = prior_sample
+                        result[sample_id] = (prior_sample, "near")
                         break
             if sample_id and image_phash:
-                phashes.append((sample_id, image_phash))
+                phashes[category].append((sample_id, image_phash))
         return result
 
     @staticmethod

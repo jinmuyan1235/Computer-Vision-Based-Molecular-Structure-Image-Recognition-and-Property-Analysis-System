@@ -157,6 +157,42 @@ def test_exact_image_duplicate_is_rejected(tmp_path: Path) -> None:
     assert "duplicate_image" in json.loads(next(row for row in rows if row["sample_id"] == "second")["deterministic_errors"])
 
 
+def test_perceptual_neighbour_is_reviewed_instead_of_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    image_dir = root / "images"
+    image_dir.mkdir(parents=True)
+    first, second = image_dir / "first.png", image_dir / "second.png"
+    _image(first, 0)
+    _image(second, 1)
+    rows = [_row("first", first), _row("second", second)]
+    # Exercise the collision path independently of the exact file hashes.
+    rows[1]["perceptual_hash"] = rows[0]["perceptual_hash"]
+    _write_pending(root, rows)
+
+    _, reviewed = _run(root)
+
+    second_row = next(row for row in reviewed if row["sample_id"] == "second")
+    assert second_row["verification_status"] == "pending_human_review"
+    assert json.loads(second_row["deterministic_errors"]) == []
+    assert "near_duplicate_image" in json.loads(second_row["risk_reasons"])
+
+
+def test_exact_cross_category_collision_requires_human_review(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    image_dir = root / "images"
+    image_dir.mkdir(parents=True)
+    image = image_dir / "shared.png"
+    _image(image)
+    _write_pending(root, [_row("molecule", image), _row("text", image, category="text")])
+
+    _, reviewed = _run(root)
+
+    conflict = next(row for row in reviewed if row["sample_id"] == "text")
+    assert conflict["verification_status"] == "pending_human_review"
+    assert "duplicate_category_conflict" in json.loads(conflict["risk_reasons"])
+    assert "duplicate_image" not in json.loads(conflict["deterministic_errors"])
+
+
 def test_cross_split_leakage_is_rejected(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
     image_dir = root / "images"
@@ -206,3 +242,19 @@ def test_negative_sample_with_valid_smiles_routes_to_human_review(tmp_path: Path
 
     assert rows[0]["verification_status"] == "pending_human_review"
     assert "negative_sample_has_valid_smiles" in json.loads(rows[0]["risk_reasons"])
+
+
+def test_negative_without_prediction_has_no_redraw_similarity_risk(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    image_dir = root / "images"
+    image_dir.mkdir(parents=True)
+    image = image_dir / "text.png"
+    _image(image)
+    _write_pending(root, [_row("negative", image, category="text", reference_smiles="", reference_inchikey="")])
+    FakeRecognizer.predictions = {"molscribe": "", "decimer": "", "ensemble": ""}
+    try:
+        _, rows = _run(root)
+    finally:
+        FakeRecognizer.predictions = {"molscribe": "CCO", "decimer": "CCO", "ensemble": "CCO"}
+
+    assert "low_redraw_similarity" not in json.loads(rows[0]["risk_reasons"])
