@@ -119,3 +119,34 @@ def test_visual_dataset_snapshot_copies_checksums_and_refuses_overwrite(tmp_path
     assert hashlib.sha256((output / relative).read_bytes()).hexdigest() == digest
     with pytest.raises(FileExistsError, match="will not be overwritten"):
         snapshot_visual_dataset(version="visual-dev-v0.1", review_dir=review, output=output)
+
+
+def test_holdout_snapshot_requires_zero_remaining_and_records_role_and_papers(tmp_path: Path) -> None:
+    review = _review_fixture(tmp_path)
+    analyze_visual_review(review)
+    _write_csv(review / "visual_verified.csv", [{"sample_id": "molecule-valid"}])
+    _write_csv(review / "visual_rejected.csv", [{"sample_id": "molecule-text"}])
+    _write_csv(review / "missing_files.csv", [])
+    (review / "review_consistency_report.json").write_text("{}", encoding="utf-8")
+    papers = [{"pmcid": f"PMC{index}", "title": f"Paper {index}"} for index in range(1, 4)]
+    (review / "holdout_papers.json").write_text(
+        json.dumps({"papers": papers}), encoding="utf-8",
+    )
+    (review / "single_reviews" / "negative-smiles.json").unlink()
+    with pytest.raises(ValueError, match="Visual remaining must be zero"):
+        snapshot_visual_dataset(
+            version="visual-holdout-v0.1", review_dir=review,
+            output=tmp_path / "incomplete", dataset_role="holdout",
+        )
+    for row in _read_csv(review / "machine_review_manifest.csv"):
+        if not (review / "single_reviews" / f"{row['sample_id']}.json").is_file():
+            _audit(review, row, "invalid_crop", [10, 10, 90, 90])
+    output = tmp_path / "visual-holdout-v0.1"
+    snapshot_visual_dataset(
+        version="visual-holdout-v0.1", review_dir=review,
+        output=output, dataset_role="holdout",
+    )
+    summary = json.loads((output / "dataset_summary.json").read_text(encoding="utf-8"))
+    assert summary["dataset_role"] == "holdout"
+    assert len(summary["papers"]) == 3
+    assert (output / "holdout_papers.json").is_file()

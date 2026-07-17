@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 from pathlib import Path
 
 import cv2
@@ -152,6 +153,25 @@ def test_evaluation_and_comparison_write_required_fields(tmp_path: Path) -> None
     assert "development_set_improved" in comparison
     assert (tmp_path / "comparison" / "comparison.json").is_file()
     assert (tmp_path / "comparison" / "comparison.md").is_file()
+
+
+def test_dataset_role_is_explicit_then_summary_then_development_default(tmp_path: Path) -> None:
+    manifest = _evaluation_manifest(tmp_path)
+    default = evaluate_visual_detector(manifest, tmp_path / "default", config_name="baseline")
+    assert default["dataset_role"] == "development"
+    assert default["dataset_role_source"] == "default"
+
+    (manifest.parent / "dataset_summary.json").write_text(
+        json.dumps({"dataset_role": "holdout"}), encoding="utf-8",
+    )
+    automatic = evaluate_visual_detector(manifest, tmp_path / "automatic", config_name="baseline")
+    assert automatic["dataset_role"] == "holdout"
+    assert automatic["dataset_role_source"] == "dataset_summary"
+    explicit = evaluate_visual_detector(
+        manifest, tmp_path / "explicit", config_name="baseline", dataset_role="development",
+    )
+    assert explicit["dataset_role"] == "development"
+    assert explicit["dataset_role_source"] == "command_line"
 
 
 def test_frozen_visual_development_snapshot_is_unchanged_when_present() -> None:

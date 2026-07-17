@@ -136,9 +136,11 @@ class SoloReviewStore:
         dataset_root: str | Path = config.DATA_DIR / "ocsr_collections",
         *,
         review_root: str | Path = config.DATA_DIR / "review",
+        strict_dataset_root: bool = False,
     ) -> None:
         self.dataset_root = _native_path(dataset_root).resolve()
         self.review_root = ensure_directory(_native_path(review_root).resolve())
+        self.strict_dataset_root = strict_dataset_root
         self.machine_manifest_path = self.review_root / "machine_review_manifest.csv"
         self.queue_path = self.review_root / "human_review_queue.csv"
         self.audit_dir = ensure_directory(self.review_root / "single_reviews")
@@ -707,10 +709,12 @@ class SoloReviewStore:
 
     def _candidate_roots(self, explicit_root: str | None) -> list[Path]:
         roots: list[Path] = []
-        for value in (
-            explicit_root or "", self.dataset_root, config.DATA_DIR / "ocsr_first_batch_final",
-            config.DATA_DIR / "ocsr_first_batch", config.DATA_DIR / "ocsr_collections",
-        ):
+        configured = (explicit_root or "", self.dataset_root)
+        fallbacks = (
+            config.DATA_DIR / "ocsr_first_batch_final", config.DATA_DIR / "ocsr_first_batch",
+            config.DATA_DIR / "ocsr_collections",
+        )
+        for value in configured + (() if self.strict_dataset_root else fallbacks):
             if not str(value):
                 continue
             root = _native_path(value).resolve()
