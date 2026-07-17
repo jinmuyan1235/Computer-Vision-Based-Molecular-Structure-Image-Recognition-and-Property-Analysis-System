@@ -294,6 +294,44 @@ def rank_candidates(
     }
 
 
+def combine_ensemble_results(
+    raw_results: list[OCSRResult],
+    *,
+    enabled_backends: list[str] | tuple[str, ...],
+    backend_priority: list[str] | tuple[str, ...] | None = None,
+    reliability_weights: Mapping[str, float] | None = None,
+    elapsed_ms: float | None = None,
+) -> OCSRResult:
+    """Build the ensemble audit record from already-executed backend outputs."""
+    candidates = [candidate_from_result(result) for result in raw_results]
+    consensus = rank_candidates(candidates, list(backend_priority or config.OCSR_ENSEMBLE_BACKEND_PRIORITY), reliability_weights)
+    similarity = build_similarity_analysis(candidates)
+    recommended = consensus.get("recommended_smiles")
+    decision = str(consensus.get("decision") or ("accepted" if recommended else "rejected"))
+    status = "success" if decision in {"accepted", "accepted_with_warning"} and recommended else "failed"
+    return OCSRResult(
+        smiles=str(recommended) if recommended else None,
+        confidence=None,
+        backend="ensemble",
+        status=status,
+        message=str(consensus.get("reason") or "ensemble inference completed."),
+        inference_time_ms=elapsed_ms,
+        model_name=f"ensemble({'+'.join(enabled_backends)})",
+        model_version=None,
+        device="mixed",
+        package_version=None,
+        git_commit=git_commit(),
+        dependency_versions=dependency_versions(),
+        result_origin="real_model_ensemble",
+        candidates=candidates,
+        consensus=consensus,
+        similarity_analysis=similarity,
+        decision=decision if decision in {"accepted", "accepted_with_warning", "review_needed", "rejected"} else None,
+        risk_level=consensus.get("risk_level"),
+        manual_review_recommended=consensus.get("manual_review_recommended"),
+    )
+
+
 class EnsembleOCSRAdapter(BaseOCSRAdapter):
     """Run multiple optional OCSR backends and produce a consensus result."""
 
@@ -402,35 +440,14 @@ class EnsembleOCSRAdapter(BaseOCSRAdapter):
         if not self.enabled_backends:
             return OCSRResult(None, None, self.backend_name, "failed", "未配置可用的 ensemble 子后端。")
         raw_results = self._run_parallel(image_path_or_array) if self.parallel else self._run_serial(image_path_or_array)
-        candidates = [candidate_from_result(result) for result in raw_results]
-        consensus = rank_candidates(candidates, self.backend_priority, self.reliability_weights)
-        similarity = build_similarity_analysis(candidates)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
         self.last_inference_time_ms = elapsed_ms
-        recommended = consensus.get("recommended_smiles")
-        decision = str(consensus.get("decision") or ("accepted" if recommended else "rejected"))
-        status = "success" if decision in {"accepted", "accepted_with_warning"} and recommended else "failed"
-        message = str(consensus.get("reason") or "ensemble 推理完成。")
-        return OCSRResult(
-            smiles=str(recommended) if recommended else None,
-            confidence=None,
-            backend=self.backend_name,
-            status=status,
-            message=message,
-            inference_time_ms=elapsed_ms,
-            model_name=f"ensemble({'+'.join(self.enabled_backends)})",
-            model_version=None,
-            device="mixed",
-            package_version=None,
-            git_commit=git_commit(),
-            dependency_versions=dependency_versions(),
-            result_origin="real_model_ensemble",
-            candidates=candidates,
-            consensus=consensus,
-            similarity_analysis=similarity,
-            decision=decision if decision in {"accepted", "accepted_with_warning", "review_needed", "rejected"} else None,
-            risk_level=consensus.get("risk_level"),
-            manual_review_recommended=consensus.get("manual_review_recommended"),
+        return combine_ensemble_results(
+            raw_results,
+            enabled_backends=self.enabled_backends,
+            backend_priority=self.backend_priority,
+            reliability_weights=self.reliability_weights,
+            elapsed_ms=elapsed_ms,
         )
 
     @property

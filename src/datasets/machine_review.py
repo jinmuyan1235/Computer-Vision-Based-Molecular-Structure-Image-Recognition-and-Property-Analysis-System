@@ -40,9 +40,11 @@ VERIFICATION_STATUSES = (
 
 MACHINE_REVIEW_FIELDS = (
     "sample_id", "verification_status", "machine_status", "human_review_status",
+    "dataset_root",
     "image_path", "image_sha256", "actual_image_sha256", "perceptual_hash", "duplicate_of",
     "source_kind", "source_id", "source_document", "source_url", "source_license", "attribution",
     "source_page_path", "page_width", "page_height",
+    "ground_truth_origin", "ground_truth_smiles", "ground_truth_inchikey", "source_compound_id", "source_structure_file",
     "category", "machine_category", "expected_action", "bbox", "bbox_valid", "bbox_edge_contact",
     "source_canonical_smiles", "source_inchikey", "source_formula", "scaffold_key", "split",
     "molscribe_raw", "molscribe_smiles", "molscribe_canonical_smiles", "molscribe_inchikey", "molscribe_formula",
@@ -256,12 +258,16 @@ class MachineReviewProcessor:
         )
         human_status = str(row.get("review_status") or "").strip().lower()
         verification_status = self._final_status(machine_status, human_status)
+        ground_truth_origin = str(row.get("ground_truth_origin") or "").strip().lower()
+        if not ground_truth_origin and row.get("source_kind") == "pubchem" and source_structure["valid"]:
+            ground_truth_origin = "pubchem"
 
         return {
             "sample_id": sample_id,
             "verification_status": verification_status,
             "machine_status": machine_status,
             "human_review_status": human_status,
+            "dataset_root": str(self.root),
             "image_path": row.get("image_path", ""),
             "image_sha256": image_sha,
             "actual_image_sha256": actual_sha,
@@ -276,6 +282,11 @@ class MachineReviewProcessor:
             "source_page_path": row.get("source_page_path", ""),
             "page_width": row.get("page_width", ""),
             "page_height": row.get("page_height", ""),
+            "ground_truth_origin": ground_truth_origin,
+            "ground_truth_smiles": row.get("ground_truth_smiles") or row.get("reference_smiles", ""),
+            "ground_truth_inchikey": row.get("ground_truth_inchikey") or row.get("reference_inchikey") or source_structure["inchikey"],
+            "source_compound_id": row.get("source_compound_id") or row.get("source_id", ""),
+            "source_structure_file": row.get("source_structure_file", ""),
             "category": category,
             "machine_category": machine_category,
             "expected_action": row.get("expected_action", ""),

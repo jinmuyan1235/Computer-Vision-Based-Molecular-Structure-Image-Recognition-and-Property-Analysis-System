@@ -1,10 +1,16 @@
-"""Single-developer review ledger for the OCSR machine-review human queue."""
+"""Audit ledger for visual OCSR review and trusted structure confirmation.
+
+The ledger intentionally separates what a non-chemist can verify from a
+chemical ground truth.  A model prediction, including one typed by a reviewer,
+is never promoted to an exact-match benchmark label by this module.
+"""
 
 from __future__ import annotations
 
 import csv
 import json
 import random
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,8 +25,23 @@ from src.datasets.splits import scaffold_for_smiles
 from src.utils.file_utils import ensure_directory, safe_stem
 
 
-SOLO_STATUSES = ("machine_verified", "human_verified_single", "rejected", "uncertain")
-REGION_TYPES = ("molecule", "reaction", "text", "table", "invalid_crop")
+VISUAL_REVIEW_STATUSES = (
+    "valid_single_molecule_crop",
+    "reaction",
+    "multiple_molecules",
+    "text",
+    "table",
+    "invalid_crop",
+    "missing_source_file",
+    "uncertain_visual",
+)
+VISUAL_REJECTED_STATUSES = {"reaction", "multiple_molecules", "text", "table", "invalid_crop"}
+TRUSTED_GROUND_TRUTH_ORIGINS = frozenset({
+    "pubchem", "chembl", "supplementary_sdf", "supplementary_smiles", "curated_database", "chemist_manual",
+})
+REGION_TYPES = ("molecule", "reaction", "multiple_molecules", "text", "table", "invalid_crop")
+# Retained as a small compatibility surface for code that imported the old name.
+SOLO_STATUSES = VISUAL_REVIEW_STATUSES
 REVIEW_SCOPES = {
     "pending_human_review": {"pending_human_review"},
     "machine_verified": {"machine_verified"},
@@ -28,15 +49,21 @@ REVIEW_SCOPES = {
     "all_reviewable": {"pending_human_review", "machine_verified", "pending_machine_review"},
 }
 OUTCOME_FIELDS = (
-    "sample_id", "image_path", "ground_truth_smiles", "ground_truth_canonical_smiles", "ground_truth_inchikey",
-    "expected_action", "category", "source", "split", "scaffold_key", "source_document", "source_license",
-    "attribution", "verification_status", "reviewed_at", "reviewer", "original_prediction", "final_smiles",
-    "bbox_before", "bbox_after", "correction_types", "review_notes", "original_queue_status",
+    "sample_id", "dataset_root", "image_path", "source_page_path", "resolved_image_path", "resolved_source_page_path",
+    "visual_review_status", "structure_review_status", "verification_status", "expected_action", "category",
+    "source", "source_document", "source_url", "source_license", "attribution", "split", "scaffold_key",
+    "ground_truth_origin", "ground_truth_smiles", "ground_truth_canonical_smiles", "ground_truth_inchikey",
+    "source_compound_id", "source_structure_file", "molscribe_matches_ground_truth",
+    "decimer_matches_ground_truth", "ensemble_matches_ground_truth", "reviewed_at", "reviewer",
+    "original_prediction", "final_smiles", "bbox_before", "bbox_after", "correction_types", "review_notes",
+    "original_queue_status",
 )
 RECHECK_FIELDS = (
     "recheck_id", "sample_id", "created_at", "recheck_status", "completed_at", "source_document",
     "image_path", "category", "source_license", "review_notes_hidden",
 )
+_WINDOWS_PATH = re.compile(r"^([a-zA-Z]):[\\/](.*)$")
+_WSL_MOUNT_PATH = re.compile(r"^/mnt/([a-zA-Z])/(.*)$")
 
 
 def _now() -> str:
@@ -50,7 +77,7 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
         return [{key: value or "" for key, value in row.items()} for row in csv.DictReader(handle)]
 
 
-def _write_csv(path: Path, rows: Iterable[dict[str, Any]], fields: tuple[str, ...]) -> None:
+def _write_csv(path: Path, rows: Iterable[dict[str, Any]], fields: tuple[str, ...] = OUTCOME_FIELDS) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
@@ -69,11 +96,16 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def _relative_or_absolute(path: Path, root: Path) -> str:
-    try:
-        return path.resolve().relative_to(root.resolve()).as_posix()
-    except ValueError:
-        return str(path.resolve())
+def _native_path(raw_path: str | Path) -> Path:
+    """Translate Windows and WSL mount paths to the current runtime form."""
+    raw = str(raw_path).strip()
+    windows = _WINDOWS_PATH.match(raw)
+    if windows:
+        return Path("/mnt") / windows.group(1).lower() / windows.group(2).replace("\\", "/")
+    wsl_mount = _WSL_MOUNT_PATH.match(raw.replace("\\", "/"))
+    if wsl_mount and Path("/").anchor != "/":
+        return Path(f"{wsl_mount.group(1).upper()}:/{wsl_mount.group(2)}")
+    return Path(raw).expanduser()
 
 
 @dataclass(frozen=True)
@@ -85,7 +117,7 @@ class SoloReviewResult:
 
 
 class SoloReviewStore:
-    """Persist one developer's decisions without modifying source manifests."""
+    """Persist visual decisions and trusted-label confirmation without changing source data."""
 
     def __init__(
         self,
@@ -93,8 +125,8 @@ class SoloReviewStore:
         *,
         review_root: str | Path = config.DATA_DIR / "review",
     ) -> None:
-        self.dataset_root = Path(dataset_root).expanduser().resolve()
-        self.review_root = ensure_directory(Path(review_root).expanduser().resolve())
+        self.dataset_root = _native_path(dataset_root).resolve()
+        self.review_root = ensure_directory(_native_path(review_root).resolve())
         self.machine_manifest_path = self.review_root / "machine_review_manifest.csv"
         self.queue_path = self.review_root / "human_review_queue.csv"
         self.audit_dir = ensure_directory(self.review_root / "single_reviews")
@@ -102,13 +134,8 @@ class SoloReviewStore:
         self.recheck_dir = ensure_directory(self.review_root / "rechecks")
         self.recheck_path = self.review_root / "recheck_queue.csv"
 
-    def list_items(
-        self,
-        *,
-        scope: str = "pending_human_review",
-        include_reviewed: bool = True,
-    ) -> list[dict[str, Any]]:
-        """List reviewable samples from the machine manifest, with queue fallback."""
+    def list_items(self, *, scope: str = "pending_human_review", include_reviewed: bool = True) -> list[dict[str, Any]]:
+        """List rows from the full machine manifest, using the old queue only as a fallback."""
         if scope not in REVIEW_SCOPES:
             raise ValueError(f"Unsupported review scope: {scope}")
         audits = self._audits()
@@ -120,30 +147,22 @@ class SoloReviewStore:
             audit = audits.get(sample_id)
             if audit and not include_reviewed:
                 continue
-            items.append({
-                **row,
-                "audit": audit or {},
-                "effective_status": str((audit or {}).get("verification_status") or row.get("verification_status") or ""),
-                "crop_path_abs": self.resolve_dataset_path(row.get("image_path")),
-                "page_path_abs": self.resolve_dataset_path(row.get("source_page_path")),
-            })
+            items.append(self._enrich_row(row, audit or {}))
         return sorted(items, key=lambda item: (bool(item.get("audit")), str(item.get("sample_id") or "")))
 
     def get_item(self, sample_id: str) -> dict[str, Any] | None:
         return next((item for item in self.list_items(scope="all_reviewable") if item.get("sample_id") == sample_id), None)
 
     def queue_stats(self) -> dict[str, int]:
-        """Return source-state totals plus current single-review outcomes."""
         rows = self._source_rows()
         audits = self._audits()
         rejected_ids = {
-            str(row.get("sample_id") or "")
-            for row in rows
+            str(row.get("sample_id") or "") for row in rows
             if str(row.get("verification_status") or "").startswith("rejected_")
         }
         rejected_ids.update(
             sample_id for sample_id, audit in audits.items()
-            if audit.get("verification_status") == "rejected"
+            if audit.get("visual_review_status") in VISUAL_REJECTED_STATUSES
         )
         return {
             "total": len(rows),
@@ -153,6 +172,93 @@ class SoloReviewStore:
             "reviewed": len(audits),
             "rejected": len({sample_id for sample_id in rejected_ids if sample_id}),
         }
+
+    def submit_visual(
+        self,
+        sample_id: str,
+        *,
+        visual_review_status: str,
+        bbox_after: list[int] | tuple[int, int, int, int] | None = None,
+        region_type: str | None = None,
+        review_notes: str = "",
+        reviewer: str = "local",
+    ) -> SoloReviewResult:
+        """Record an image/region-only decision; no SMILES is accepted here."""
+        if visual_review_status not in VISUAL_REVIEW_STATUSES:
+            raise ValueError(f"Unsupported visual review status: {visual_review_status}")
+        item = self._required_item(sample_id)
+        if not item["files_complete"] and visual_review_status != "missing_source_file":
+            raise ValueError("Missing source files must be recorded as missing_source_file.")
+        before = self._bbox(item.get("bbox"))
+        after = list(bbox_after) if bbox_after is not None else before
+        if after and not self._valid_bbox(after):
+            raise ValueError("bbox_after must be [x1, y1, x2, y2] with a positive area.")
+        final_region = str(region_type or item.get("machine_category") or item.get("category") or "invalid_crop").lower()
+        if final_region not in REGION_TYPES:
+            raise ValueError(f"Unsupported region type: {final_region}")
+        existing = item.get("audit") or {}
+        preserve_structure = (
+            visual_review_status == "valid_single_molecule_crop"
+            and existing.get("structure_review_status") == "structure_ground_truth_verified"
+        )
+        corrections = self._correction_types(item, before, after, final_region)
+        payload = {
+            **existing,
+            "sample_id": sample_id,
+            "reviewed_at": _now(),
+            "visual_reviewed_at": _now(),
+            "reviewer": reviewer.strip() or "local",
+            "verification_status": visual_review_status,
+            "visual_review_status": visual_review_status,
+            "structure_review_status": existing.get("structure_review_status", "") if preserve_structure else "",
+            "original_prediction": self._original_predictions(item),
+            "final_smiles": existing.get("final_smiles", "") if preserve_structure else "",
+            "final_canonical_smiles": existing.get("final_canonical_smiles", "") if preserve_structure else "",
+            "final_inchikey": existing.get("final_inchikey", "") if preserve_structure else "",
+            "bbox_before": before,
+            "bbox_after": after,
+            "region_type_before": item.get("machine_category") or item.get("category"),
+            "region_type_after": final_region,
+            "correction_types": corrections,
+            "review_notes": review_notes,
+            "reviewed_image_path": self._review_image(item, after, before),
+            "source_queue_row": self._source_snapshot(item),
+        }
+        return self._write_audit(payload)
+
+    def submit_structure_ground_truth(
+        self,
+        sample_id: str,
+        *,
+        review_notes: str = "",
+        reviewer: str = "local",
+    ) -> SoloReviewResult:
+        """Confirm an already supplied, whitelisted external structure label."""
+        item = self._required_item(sample_id)
+        if not item["files_complete"]:
+            raise ValueError("Cannot accept ground truth while a source page or crop file is missing.")
+        if not item["trusted_ground_truth_available"]:
+            raise ValueError("No trusted external ground truth is available for this sample.")
+        audit = item.get("audit") or {}
+        if audit.get("visual_review_status") != "valid_single_molecule_crop":
+            raise ValueError("Complete Visual Review as valid_single_molecule_crop before confirming structure ground truth.")
+        truth = self._structure(str(item.get("ground_truth_smiles") or ""))
+        if not truth["valid"]:
+            raise ValueError("Trusted ground-truth SMILES is invalid.")
+        payload = {
+            **audit,
+            "reviewed_at": _now(),
+            "structure_reviewed_at": _now(),
+            "reviewer": reviewer.strip() or "local",
+            "verification_status": "structure_ground_truth_verified",
+            "structure_review_status": "structure_ground_truth_verified",
+            "final_smiles": str(item.get("ground_truth_smiles") or ""),
+            "final_canonical_smiles": truth["canonical_smiles"],
+            "final_inchikey": truth["inchikey"],
+            "review_notes": review_notes or audit.get("review_notes", ""),
+            "source_queue_row": self._source_snapshot(item),
+        }
+        return self._write_audit(payload)
 
     def submit(
         self,
@@ -166,65 +272,38 @@ class SoloReviewStore:
         reviewer: str = "local",
         selected_prediction: str = "",
     ) -> SoloReviewResult:
-        """Save a single-person review decision and regenerate outcome CSVs."""
-        if verification_status not in SOLO_STATUSES:
-            raise ValueError(f"Unsupported single-review status: {verification_status}")
-        item = self.get_item(sample_id)
-        if item is None:
-            raise ValueError(f"Unknown sample_id: {sample_id}")
-        original_bbox = self._bbox(item.get("bbox"))
-        final_bbox = list(bbox_after) if bbox_after is not None else original_bbox
-        if final_bbox and not self._valid_bbox(final_bbox):
-            raise ValueError("bbox_after must be [x1, y1, x2, y2] with a positive area.")
-        final_region = str(region_type or item.get("machine_category") or item.get("category") or "invalid_crop").lower()
-        if final_region not in REGION_TYPES:
-            raise ValueError(f"Unsupported region type: {final_region}")
-        baseline_smiles = self._prediction_smiles(item, selected_prediction)
-        final_smiles = str(final_smiles or baseline_smiles or "").strip()
-        structure = self._structure(final_smiles) if verification_status == "human_verified_single" else self._structure("")
-        if verification_status == "human_verified_single" and not structure["valid"]:
-            raise ValueError("A valid final SMILES is required for human_verified_single.")
-        correction_types: list[str] = []
-        if structure["canonical_smiles"] and structure["canonical_smiles"] != self._structure(baseline_smiles)["canonical_smiles"]:
-            correction_types.append("smiles")
-        if final_bbox != original_bbox:
-            correction_types.append("bbox")
-        if final_region != str(item.get("machine_category") or item.get("category") or ""):
-            correction_types.append("region_type")
-        image_path = self._review_image(item, final_bbox, original_bbox)
-        payload = {
-            "sample_id": sample_id,
-            "reviewed_at": _now(),
-            "reviewer": reviewer.strip() or "local",
-            "verification_status": verification_status,
-            "original_prediction": self._original_predictions(item),
-            "selected_prediction": selected_prediction,
-            "final_smiles": final_smiles,
-            "final_canonical_smiles": structure["canonical_smiles"],
-            "final_inchikey": structure["inchikey"],
-            "bbox_before": original_bbox,
-            "bbox_after": final_bbox,
-            "region_type_before": item.get("machine_category") or item.get("category"),
-            "region_type_after": final_region,
-            "correction_types": correction_types,
-            "review_notes": review_notes,
-            "reviewed_image_path": image_path,
-            "source_queue_row": {key: value for key, value in item.items() if key not in {"audit", "crop_path_abs", "page_path_abs"}},
+        """Compatibility wrapper for the former single-review API.
+
+        The wrapper deliberately refuses to convert a typed or model SMILES into
+        ground truth.  New callers should use ``submit_visual`` and, where
+        allowed, ``submit_structure_ground_truth``.
+        """
+        legacy = {
+            "rejected": "invalid_crop",
+            "uncertain": "uncertain_visual",
+            "human_verified_single": "valid_single_molecule_crop",
         }
-        audit_path = self.audit_dir / f"{safe_stem(sample_id)}.json"
-        audit_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.export_outcomes()
-        return SoloReviewResult(sample_id, verification_status, audit_path, image_path)
+        if verification_status not in legacy:
+            raise ValueError(f"Unsupported single-review status: {verification_status}")
+        result = self.submit_visual(
+            sample_id,
+            visual_review_status=legacy[verification_status],
+            bbox_after=bbox_after,
+            region_type=region_type,
+            review_notes=review_notes,
+            reviewer=reviewer,
+        )
+        if verification_status == "human_verified_single":
+            return self.submit_structure_ground_truth(sample_id, review_notes=review_notes, reviewer=reviewer)
+        return result
 
     def create_recheck_queue(self, proportion: float, *, seed: int | None = None) -> dict[str, Any]:
-        """Randomly select completed single reviews for a blinded delayed recheck."""
         if not 0.0 <= proportion <= 1.0:
             raise ValueError("proportion must be between 0 and 1.")
-        verified = [audit for audit in self._audits().values() if audit.get("verification_status") == "human_verified_single"]
+        verified = [audit for audit in self._audits().values() if audit.get("visual_review_status") == "valid_single_molecule_crop"]
         randomizer = random.Random(seed)
         randomizer.shuffle(verified)
-        count = round(len(verified) * proportion)
-        selected = verified[:count]
+        selected = verified[:round(len(verified) * proportion)]
         existing = {row.get("sample_id"): row for row in _read_csv(self.recheck_path)}
         for audit in selected:
             sample_id = str(audit["sample_id"])
@@ -232,16 +311,11 @@ class SoloReviewStore:
                 continue
             source = audit.get("source_queue_row") or {}
             existing[sample_id] = {
-                "recheck_id": f"recheck_{safe_stem(sample_id)}",
-                "sample_id": sample_id,
-                "created_at": _now(),
-                "recheck_status": "pending",
-                "completed_at": "",
-                "source_document": source.get("source_document", ""),
+                "recheck_id": f"recheck_{safe_stem(sample_id)}", "sample_id": sample_id, "created_at": _now(),
+                "recheck_status": "pending", "completed_at": "", "source_document": source.get("source_document", ""),
                 "image_path": audit.get("reviewed_image_path") or source.get("image_path", ""),
                 "category": audit.get("region_type_after") or source.get("category", ""),
-                "source_license": source.get("source_license", ""),
-                "review_notes_hidden": "true",
+                "source_license": source.get("source_license", ""), "review_notes_hidden": "true",
             }
         rows = sorted(existing.values(), key=lambda row: str(row.get("sample_id") or ""))
         _write_csv(self.recheck_path, rows, RECHECK_FIELDS)
@@ -256,7 +330,6 @@ class SoloReviewStore:
             item = self.get_item(str(row.get("sample_id") or ""))
             if item is None:
                 continue
-            # Deliberately omit the first review's final answer and notes.
             item["recheck"] = row
             item["audit"] = {}
             item["first_review_hidden"] = True
@@ -267,34 +340,24 @@ class SoloReviewStore:
         self,
         sample_id: str,
         *,
-        verification_status: str,
-        final_smiles: str = "",
+        visual_review_status: str,
         bbox_after: list[int] | tuple[int, int, int, int] | None = None,
         region_type: str | None = None,
         review_notes: str = "",
     ) -> Path:
-        if verification_status not in {"human_verified_single", "rejected", "uncertain"}:
-            raise ValueError("Recheck status must be human_verified_single, rejected, or uncertain.")
+        if visual_review_status not in VISUAL_REVIEW_STATUSES:
+            raise ValueError("Unsupported recheck visual status.")
         item = next((candidate for candidate in self.list_recheck_items(pending_only=False) if candidate.get("sample_id") == sample_id), None)
         if item is None:
             raise ValueError(f"Sample is not in the recheck queue: {sample_id}")
-        original_bbox = self._bbox(item.get("bbox"))
-        final_bbox = list(bbox_after) if bbox_after is not None else original_bbox
-        if final_bbox and not self._valid_bbox(final_bbox):
+        before = self._bbox(item.get("bbox"))
+        after = list(bbox_after) if bbox_after is not None else before
+        if after and not self._valid_bbox(after):
             raise ValueError("bbox_after must have a positive area.")
         final_region = str(region_type or item.get("machine_category") or item.get("category") or "invalid_crop").lower()
-        structure = self._structure(final_smiles) if verification_status == "human_verified_single" else self._structure("")
-        if verification_status == "human_verified_single" and not structure["valid"]:
-            raise ValueError("A valid final SMILES is required for a positive recheck.")
         payload = {
-            "sample_id": sample_id,
-            "reviewed_at": _now(),
-            "verification_status": verification_status,
-            "final_smiles": final_smiles,
-            "final_canonical_smiles": structure["canonical_smiles"],
-            "bbox_after": final_bbox,
-            "region_type_after": final_region,
-            "review_notes": review_notes,
+            "sample_id": sample_id, "reviewed_at": _now(), "visual_review_status": visual_review_status,
+            "bbox_after": after, "region_type_after": final_region, "review_notes": review_notes,
         }
         path = self.recheck_dir / f"{safe_stem(sample_id)}.json"
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -310,31 +373,47 @@ class SoloReviewStore:
     def export_outcomes(self) -> dict[str, Path]:
         outcomes = [self._outcome_row(audit) for audit in self._audits().values()]
         paths = {
-            "human_verified_single": self.review_root / "human_verified_single.csv",
-            "rejected": self.review_root / "human_rejected.csv",
-            "uncertain": self.review_root / "uncertain.csv",
+            "visual_verified": self.review_root / "visual_verified.csv",
+            "visual_rejected": self.review_root / "visual_rejected.csv",
+            "missing_files": self.review_root / "missing_files.csv",
+            "structure_ground_truth_verified": self.review_root / "structure_ground_truth_verified.csv",
+            "chemistry_review_required": self.review_root / "chemistry_review_required.csv",
         }
-        _write_csv(paths["human_verified_single"], [row for row in outcomes if row["verification_status"] == "human_verified_single"], OUTCOME_FIELDS)
-        _write_csv(paths["rejected"], [row for row in outcomes if row["verification_status"] == "rejected"], OUTCOME_FIELDS)
-        _write_csv(paths["uncertain"], [row for row in outcomes if row["verification_status"] == "uncertain"], OUTCOME_FIELDS)
+        _write_csv(paths["visual_verified"], [row for row in outcomes if row["visual_review_status"] == "valid_single_molecule_crop"])
+        _write_csv(paths["visual_rejected"], [row for row in outcomes if row["visual_review_status"] in VISUAL_REJECTED_STATUSES])
+        _write_csv(paths["missing_files"], [row for row in outcomes if row["visual_review_status"] == "missing_source_file"])
+        _write_csv(paths["structure_ground_truth_verified"], [row for row in outcomes if row["structure_review_status"] == "structure_ground_truth_verified"])
+        _write_csv(paths["chemistry_review_required"], [
+            row for row in outcomes
+            if row["visual_review_status"] == "valid_single_molecule_crop"
+            and row["structure_review_status"] != "structure_ground_truth_verified"
+        ])
         return paths
 
-    def resolve_dataset_path(self, raw_path: str | None) -> str | None:
-        if not raw_path:
-            return None
-        path = Path(str(raw_path)).expanduser()
-        if not path.is_absolute():
-            path = self.dataset_root / path
-        return str(path.resolve()) if path.is_file() else None
+    def resolve_dataset_path(self, raw_path: str | None, *, dataset_root: str | None = None) -> str | None:
+        info = self.resolve_dataset_path_info(raw_path, dataset_root=dataset_root)
+        return str(info["resolved_path"]) if info["exists"] else None
 
-    def _source_rows(self) -> list[dict[str, str]]:
-        """Prefer the complete machine manifest; keep queue compatibility for old runs."""
-        if self.machine_manifest_path.is_file():
-            return _read_csv(self.machine_manifest_path)
-        return _read_csv(self.queue_path)
+    def resolve_dataset_path_info(self, raw_path: str | None, *, dataset_root: str | None = None) -> dict[str, str | bool]:
+        raw = str(raw_path or "").strip()
+        roots = self._candidate_roots(dataset_root)
+        if not raw:
+            return {"manifest_path": "", "dataset_root": str(roots[0]), "resolved_path": "", "exists": False}
+        path = _native_path(raw)
+        candidates = [path.resolve()] if path.is_absolute() else [(root / path).resolve() for root in roots]
+        selected = candidates[0]
+        selected_root = roots[0]
+        for candidate in candidates:
+            if candidate.is_file():
+                selected = candidate
+                selected_root = next((root for root in roots if candidate == root or root in candidate.parents), roots[0])
+                break
+        return {
+            "manifest_path": raw, "dataset_root": str(selected_root), "resolved_path": str(selected), "exists": selected.is_file(),
+        }
 
     def prediction_redraw(self, sample_id: str, backend: str, smiles: str) -> str | None:
-        """Render a prediction lazily for the Streamlit review page."""
+        """Render a model prediction separately from source images."""
         from src.chem.mol_drawer import draw_molecule
 
         if not self._structure(smiles)["valid"]:
@@ -346,6 +425,65 @@ class SoloReviewStore:
             except Exception:
                 return None
         return str(path.resolve())
+
+    def _enrich_row(self, row: dict[str, str], audit: dict[str, Any]) -> dict[str, Any]:
+        explicit_root = str(row.get("dataset_root") or "")
+        crop_info = self.resolve_dataset_path_info(row.get("crop_path") or row.get("image_path"), dataset_root=explicit_root)
+        image_info = self.resolve_dataset_path_info(row.get("image_path"), dataset_root=explicit_root)
+        page_info = self.resolve_dataset_path_info(row.get("source_page_path"), dataset_root=explicit_root)
+        root = str(crop_info["dataset_root"] or page_info["dataset_root"] or self.dataset_root)
+        truth_origin = str(row.get("ground_truth_origin") or "").strip().lower()
+        truth_smiles = str(row.get("ground_truth_smiles") or row.get("source_canonical_smiles") or "")
+        truth = self._structure(truth_smiles)
+        trusted = truth_origin in TRUSTED_GROUND_TRUTH_ORIGINS and truth["valid"]
+        item: dict[str, Any] = {
+            **row,
+            "audit": audit,
+            "dataset_root_resolved": root,
+            "crop_path_info": crop_info,
+            "image_path_info": image_info,
+            "page_path_info": page_info,
+            "crop_path_abs": str(crop_info["resolved_path"]) if crop_info["exists"] else None,
+            "image_path_abs": str(image_info["resolved_path"]) if image_info["exists"] else None,
+            "page_path_abs": str(page_info["resolved_path"]) if page_info["exists"] else None,
+            "files_complete": bool(crop_info["exists"] and image_info["exists"] and page_info["exists"]),
+            "missing_source_files": [
+                name for name, info in (("source_page_path", page_info), ("image_path", image_info), ("crop", crop_info))
+                if not info["exists"]
+            ],
+            "ground_truth_origin": truth_origin,
+            "ground_truth_smiles": truth_smiles if trusted else "",
+            "ground_truth_canonical_smiles": truth["canonical_smiles"] if trusted else "",
+            "ground_truth_inchikey": str(row.get("ground_truth_inchikey") or row.get("source_inchikey") or truth["inchikey"]) if trusted else "",
+            "trusted_ground_truth_available": trusted,
+            "effective_status": str(audit.get("visual_review_status") or row.get("verification_status") or ""),
+        }
+        for backend in ("molscribe", "decimer", "ensemble"):
+            predicted = str(row.get(f"{backend}_inchikey") or self._structure(str(row.get(f"{backend}_smiles") or ""))["inchikey"])
+            item[f"{backend}_matches_ground_truth"] = bool(trusted and predicted and predicted == item["ground_truth_inchikey"])
+        return item
+
+    def _candidate_roots(self, explicit_root: str | None) -> list[Path]:
+        roots: list[Path] = []
+        for value in (
+            explicit_root or "", self.dataset_root, config.DATA_DIR / "ocsr_first_batch_final",
+            config.DATA_DIR / "ocsr_first_batch", config.DATA_DIR / "ocsr_collections",
+        ):
+            if not str(value):
+                continue
+            root = _native_path(value).resolve()
+            if root not in roots:
+                roots.append(root)
+        return roots or [self.dataset_root]
+
+    def _required_item(self, sample_id: str) -> dict[str, Any]:
+        item = self.get_item(sample_id)
+        if item is None:
+            raise ValueError(f"Unknown sample_id: {sample_id}")
+        return item
+
+    def _source_rows(self) -> list[dict[str, str]]:
+        return _read_csv(self.machine_manifest_path) if self.machine_manifest_path.is_file() else _read_csv(self.queue_path)
 
     def _audits(self) -> dict[str, dict[str, Any]]:
         audits: dict[str, dict[str, Any]] = {}
@@ -380,25 +518,11 @@ class SoloReviewStore:
         if not validation.get("valid"):
             return {"valid": False, "canonical_smiles": "", "inchikey": ""}
         molecule = Chem.MolFromSmiles(canonical)
-        return {
-            "valid": molecule is not None,
-            "canonical_smiles": canonical,
-            "inchikey": Chem.MolToInchiKey(molecule) if molecule is not None else "",
-        }
-
-    @staticmethod
-    def _prediction_smiles(item: dict[str, Any], selected: str) -> str:
-        selected = selected.lower().strip()
-        if selected in {"molscribe", "decimer", "ensemble"}:
-            return str(item.get(f"{selected}_smiles") or "")
-        return str(item.get("ensemble_smiles") or item.get("molscribe_smiles") or item.get("decimer_smiles") or "")
+        return {"valid": molecule is not None, "canonical_smiles": canonical, "inchikey": Chem.MolToInchiKey(molecule) if molecule is not None else ""}
 
     @staticmethod
     def _original_predictions(item: dict[str, Any]) -> dict[str, Any]:
-        return {
-            backend: _parse_json(item.get(f"{backend}_raw"), {"smiles": item.get(f"{backend}_smiles") or ""})
-            for backend in ("molscribe", "decimer", "ensemble")
-        }
+        return {backend: _parse_json(item.get(f"{backend}_raw"), {"smiles": item.get(f"{backend}_smiles") or ""}) for backend in ("molscribe", "decimer", "ensemble")}
 
     def _review_image(self, item: dict[str, Any], bbox_after: list[int], bbox_before: list[int]) -> str:
         if bbox_after != bbox_before and item.get("page_path_abs") and bbox_after:
@@ -407,7 +531,7 @@ class SoloReviewStore:
                 with Image.open(page) as image:
                     x1, y1, x2, y2 = bbox_after
                     if x2 > image.width or y2 > image.height:
-                        raise ValueError("bbox_after exceeds the source page.")
+                        raise ValueError("bbox_after exceeds the source page")
                     output = self.crop_dir / f"{safe_stem(str(item['sample_id']))}.png"
                     image.crop((x1, y1, x2, y2)).convert("RGB").save(output)
                     return str(output.resolve())
@@ -415,33 +539,51 @@ class SoloReviewStore:
                 raise ValueError(f"Could not create corrected crop: {exc}") from exc
         return str(item.get("crop_path_abs") or "")
 
+    def _correction_types(self, item: dict[str, Any], before: list[int], after: list[int], region: str) -> list[str]:
+        corrections: list[str] = []
+        if after != before:
+            corrections.append("bbox")
+        if region != str(item.get("machine_category") or item.get("category") or ""):
+            corrections.append("region_type")
+        return corrections
+
+    @staticmethod
+    def _source_snapshot(item: dict[str, Any]) -> dict[str, Any]:
+        omit = {"audit", "crop_path_info", "image_path_info", "page_path_info", "crop_path_abs", "image_path_abs", "page_path_abs", "missing_source_files"}
+        return {key: value for key, value in item.items() if key not in omit}
+
+    def _write_audit(self, payload: dict[str, Any]) -> SoloReviewResult:
+        audit_path = self.audit_dir / f"{safe_stem(str(payload['sample_id']))}.json"
+        audit_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.export_outcomes()
+        return SoloReviewResult(str(payload["sample_id"]), str(payload["verification_status"]), audit_path, str(payload.get("reviewed_image_path") or ""))
+
     def _outcome_row(self, audit: dict[str, Any]) -> dict[str, Any]:
         source = audit.get("source_queue_row") or {}
-        final_smiles = str(audit.get("final_smiles") or "")
-        structure = self._structure(final_smiles)
+        structure_verified = audit.get("structure_review_status") == "structure_ground_truth_verified"
+        truth = self._structure(str(audit.get("final_smiles") or "")) if structure_verified else self._structure("")
+        origin = str(source.get("ground_truth_origin") or "").lower()
         return {
-            "sample_id": audit.get("sample_id", ""),
-            "image_path": audit.get("reviewed_image_path", ""),
-            "ground_truth_smiles": final_smiles if audit.get("verification_status") == "human_verified_single" else "",
-            "ground_truth_canonical_smiles": audit.get("final_canonical_smiles") or structure["canonical_smiles"],
-            "ground_truth_inchikey": audit.get("final_inchikey") or structure["inchikey"],
-            "expected_action": "recognize" if audit.get("verification_status") == "human_verified_single" else "reject",
-            "category": audit.get("region_type_after") or source.get("machine_category") or source.get("category", ""),
-            "source": source.get("source_kind", ""),
-            "split": source.get("split", ""),
-            "scaffold_key": scaffold_for_smiles(audit.get("final_canonical_smiles") or ""),
-            "source_document": source.get("source_document", ""),
-            "source_license": source.get("source_license", ""),
-            "attribution": source.get("attribution", ""),
-            "verification_status": audit.get("verification_status", ""),
-            "reviewed_at": audit.get("reviewed_at", ""),
-            "reviewer": audit.get("reviewer", ""),
-            "original_prediction": _json(audit.get("original_prediction") or {}),
-            "final_smiles": final_smiles,
-            "bbox_before": _json(audit.get("bbox_before") or []),
-            "bbox_after": _json(audit.get("bbox_after") or []),
-            "correction_types": _json(audit.get("correction_types") or []),
-            "review_notes": audit.get("review_notes", ""),
+            "sample_id": audit.get("sample_id", ""), "dataset_root": source.get("dataset_root_resolved") or source.get("dataset_root", ""),
+            "image_path": audit.get("reviewed_image_path", "") or source.get("image_path", ""),
+            "source_page_path": source.get("source_page_path", ""), "resolved_image_path": source.get("crop_path_abs", ""),
+            "resolved_source_page_path": source.get("page_path_abs", ""), "visual_review_status": audit.get("visual_review_status", ""),
+            "structure_review_status": audit.get("structure_review_status", ""), "verification_status": audit.get("verification_status", ""),
+            "expected_action": "recognize" if structure_verified else "", "category": audit.get("region_type_after") or source.get("machine_category") or source.get("category", ""),
+            "source": source.get("source_kind", ""), "source_document": source.get("source_document", ""), "source_url": source.get("source_url", ""),
+            "source_license": source.get("source_license", ""), "attribution": source.get("attribution", ""), "split": source.get("split", ""),
+            "scaffold_key": scaffold_for_smiles(truth["canonical_smiles"]) if structure_verified else "",
+            "ground_truth_origin": origin if structure_verified else "", "ground_truth_smiles": audit.get("final_smiles", "") if structure_verified else "",
+            "ground_truth_canonical_smiles": truth["canonical_smiles"] if structure_verified else "", "ground_truth_inchikey": truth["inchikey"] if structure_verified else "",
+            "source_compound_id": source.get("source_compound_id") or source.get("source_id", "") if structure_verified else "",
+            "source_structure_file": source.get("source_structure_file", "") if structure_verified else "",
+            "molscribe_matches_ground_truth": str(source.get("molscribe_matches_ground_truth", "")).lower() if structure_verified else "",
+            "decimer_matches_ground_truth": str(source.get("decimer_matches_ground_truth", "")).lower() if structure_verified else "",
+            "ensemble_matches_ground_truth": str(source.get("ensemble_matches_ground_truth", "")).lower() if structure_verified else "",
+            "reviewed_at": audit.get("reviewed_at", ""), "reviewer": audit.get("reviewer", ""),
+            "original_prediction": _json(audit.get("original_prediction") or {}), "final_smiles": audit.get("final_smiles", "") if structure_verified else "",
+            "bbox_before": _json(audit.get("bbox_before") or []), "bbox_after": _json(audit.get("bbox_after") or []),
+            "correction_types": _json(audit.get("correction_types") or []), "review_notes": audit.get("review_notes", ""),
             "original_queue_status": source.get("verification_status", ""),
         }
 
@@ -458,25 +600,12 @@ class SoloReviewStore:
             first = audits.get(str(recheck.get("sample_id") or ""))
             if not first:
                 continue
-            same_status = first.get("verification_status") == recheck.get("verification_status")
-            same_smiles = str(first.get("final_canonical_smiles") or "") == str(recheck.get("final_canonical_smiles") or "")
+            same_visual = first.get("visual_review_status") == recheck.get("visual_review_status")
             same_bbox = list(first.get("bbox_after") or []) == list(recheck.get("bbox_after") or [])
             same_region = first.get("region_type_after") == recheck.get("region_type_after")
-            comparisons.append({
-                "sample_id": recheck.get("sample_id"),
-                "same_status": same_status,
-                "same_smiles": same_smiles,
-                "same_bbox": same_bbox,
-                "same_region_type": same_region,
-                "consistent": same_status and same_smiles and same_bbox and same_region,
-            })
+            comparisons.append({"sample_id": recheck.get("sample_id"), "same_visual_status": same_visual, "same_bbox": same_bbox, "same_region_type": same_region, "consistent": same_visual and same_bbox and same_region})
         total = len(comparisons)
-        report = {
-            "completed_rechecks": total,
-            "consistent_rechecks": sum(item["consistent"] for item in comparisons),
-            "consistency_rate": (sum(item["consistent"] for item in comparisons) / total) if total else None,
-            "comparisons": comparisons,
-        }
+        report = {"completed_rechecks": total, "consistent_rechecks": sum(item["consistent"] for item in comparisons), "consistency_rate": sum(item["consistent"] for item in comparisons) / total if total else None, "comparisons": comparisons}
         path = self.review_root / "review_consistency_report.json"
         path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         return path

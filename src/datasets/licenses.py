@@ -27,6 +27,25 @@ def normalize_license(value: str | None) -> str:
         return "public-domain-pubchem"
     if "cc0" in text or "cc zero" in text:
         return "cc0-1.0"
+
+    # PMC/JATS metadata often supplies only the canonical Creative Commons URL,
+    # such as https://creativecommons.org/licenses/by/4.0/. Treat only an
+    # explicit recognized URL plus version as an allow-list candidate.
+    cc0_url_match = re.search(
+        r"creativecommons\.org/publicdomain/zero/(\d(?:\.\d)?)(?:/|\b)",
+        text,
+    )
+    if cc0_url_match:
+        return f"cc0-{cc0_url_match.group(1)}"
+
+    cc_url_match = re.search(
+        r"creativecommons\.org/licenses/(by(?:-sa)?)/(\d(?:\.\d)?)(?:/|\b)",
+        text,
+    )
+    if cc_url_match:
+        family, version = cc_url_match.groups()
+        return f"cc-{family}-{version}"
+
     match = re.search(r"cc\s*by(?:\s*-?\s*(sa))?\s*(?:version\s*)?(\d(?:\.\d)?)?", text)
     if not match:
         return ""

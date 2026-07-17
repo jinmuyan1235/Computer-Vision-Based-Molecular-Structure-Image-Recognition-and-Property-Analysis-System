@@ -20,6 +20,8 @@ from src.datasets.pubchem import PubChemCollector, PubChemStructure
 from src.datasets.review import PENDING_FIELDS, DatasetReviewStore
 from src.documents.processor import DocumentOCSRProcessor
 from src.feedback.store import save_review_queue_item
+from src.ocsr.base import OCSRResult
+from src.ocsr.ensemble import combine_ensemble_results
 from src.ocsr.recognizer import MoleculeRecognizer
 from src.utils.file_utils import ensure_directory, safe_stem
 
@@ -176,7 +178,7 @@ class DatasetPipeline:
         reference_inchikey: str = "",
         notes: str = "",
     ) -> CandidateResult:
-        """Persist a candidate and all model outputs; no prediction becomes a label here."""
+        """Persist a candidate; run OCSR only for plausible molecule positives."""
         if not source.license_allowed:
             raise PermissionError("Cannot save a candidate image for a non-whitelisted source license.")
         category = category if category in {"molecule", *NEGATIVE_CATEGORIES} else "invalid_crop"
@@ -194,7 +196,10 @@ class DatasetPipeline:
                 relative_image = destination.relative_to(self.root).as_posix()
                 image_sha = sha256_file(destination)
                 phash = perceptual_hash(destination)
-                predictions = self._predict_all(destination)
+                if category == "molecule":
+                    predictions = self._predict_all(destination)
+                else:
+                    predictions = self._not_applicable_predictions(category)
             else:
                 category = "invalid_crop"
                 notes = f"{notes} Input image is missing: {source_image}".strip()
@@ -323,16 +328,34 @@ class DatasetPipeline:
             return path
 
     def _predict_all(self, image_path: Path) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for backend in ("molscribe", "decimer", "ensemble"):
+        raw_results: list[OCSRResult] = []
+        for backend in ("molscribe", "decimer"):
             try:
                 result = self.recognizer_factory(backend).recognize(image_path)
                 payload = result.to_dict() if hasattr(result, "to_dict") else dict(result)
-                payload["backend"] = backend
-                records.append(payload)
+                raw_results.append(self._result_from_payload(backend, payload))
             except Exception as exc:
-                records.append({"backend": backend, "status": "failed", "smiles": None, "message": str(exc)})
-        return records
+                raw_results.append(OCSRResult(None, None, backend, "failed", str(exc)))
+        ensemble = combine_ensemble_results(raw_results, enabled_backends=["molscribe", "decimer"])
+        return [result.to_dict() for result in [*raw_results, ensemble]]
+
+    @staticmethod
+    def _result_from_payload(backend: str, payload: dict[str, Any]) -> OCSRResult:
+        fields = OCSRResult.__dataclass_fields__
+        values = {field: payload.get(field) for field in fields}
+        values["backend"] = backend
+        values["status"] = values.get("status") if values.get("status") in {"success", "failed"} else "failed"
+        values["message"] = str(values.get("message") or "")
+        return OCSRResult(**values)
+
+    @staticmethod
+    def _not_applicable_predictions(category: str) -> list[dict[str, Any]]:
+        """Keep negative candidates auditable without running expensive OCSR models."""
+        message = f"OCSR inference was not run for automatically generated {category} negative candidate."
+        return [
+            {"backend": backend, "status": "not_applicable", "smiles": None, "message": message}
+            for backend in ("molscribe", "decimer", "ensemble")
+        ]
 
     def _find_duplicate(self, image_sha: str, phash: str, canonical_smiles: str, inchikey: str) -> str | None:
         for row in _read_csv(self.pending_manifest):

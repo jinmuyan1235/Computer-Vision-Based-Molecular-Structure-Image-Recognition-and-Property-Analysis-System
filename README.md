@@ -876,12 +876,16 @@ Machine statuses are `rejected_invalid`, `rejected_license`, `pending_machine_re
 
 Open **Data Management / OCSR Dataset Review** in Streamlit after generating `data/review/machine_review_manifest.csv`. This is intentionally a single-person workflow: it has no user accounts, second-review gate, or arbitration system. The Queue view defaults to `pending_human_review` and can switch between pending-human, machine-verified spot checks, pending-machine failures, and all reviewable samples. `machine_review_manifest.csv` is the page's primary source; `human_review_queue.csv` contains only the `pending_human_review` subset and is retained as a stage-two handoff artifact and compatibility fallback.
 
-For each candidate, the page displays its source page and bbox when available, crop, MolScribe/DECIMER/ensemble predictions, one RDKit redraw per valid prediction, quality/risk details, source attribution, and license. It accepts a selected prediction, manual SMILES, bbox and region-type edits, rejection, uncertain status, and notes.
+The page separates **Visual Review** from **Structure Ground Truth Review**. Visual Review only classifies the page region as `valid_single_molecule_crop`, `reaction`, `multiple_molecules`, `text`, `table`, `invalid_crop`, `missing_source_file`, or `uncertain_visual`; it never asks a non-chemist to supply a SMILES. It shows the original document page with bbox, the source crop, a crop generated from the original page, and model redraws explicitly labelled as redraws rather than source images. It also displays the manifest path, chosen dataset root, resolved local path, and file-existence state for every source image.
 
-Each decision writes an independent JSON record under `data/review/single_reviews/` with `reviewed_at`, `original_prediction`, `final_smiles`, `bbox_before`, `bbox_after`, `correction_types`, and `review_notes`. It regenerates evaluation-oriented outputs without changing the machine queue or prior annotations:
+Structure confirmation is available only when an existing external ground-truth record has an origin of `pubchem`, `chembl`, `supplementary_sdf`, `supplementary_smiles`, `curated_database`, or `chemist_manual`. The reviewer confirms that supplied record after a valid visual review; the page compares each model prediction against it. Empty origins and `model_prediction` are never accepted as ground truth, so those visually valid samples may support detector/rejector work but cannot enter an OCSR exact-match benchmark.
 
-- `data/review/human_verified_single.csv`
-- `data/review/human_rejected.csv`
-- `data/review/uncertain.csv`
+Each decision writes an independent JSON record under `data/review/single_reviews/` with timestamps, predictions, bbox edits, region classification, and notes. It regenerates these outputs without changing the machine queue or prior annotations:
 
-Single-review statuses are `machine_verified`, `human_verified_single`, `rejected`, and `uncertain`. The delayed recheck mode selects a seeded random proportion of `human_verified_single` samples into `data/review/recheck_queue.csv`, hides the first review answer and notes, and writes `data/review/review_consistency_report.json` with status, structure, bbox, and region-type agreement.
+- `data/review/visual_verified.csv`
+- `data/review/visual_rejected.csv`
+- `data/review/missing_files.csv`
+- `data/review/structure_ground_truth_verified.csv`
+- `data/review/chemistry_review_required.csv`
+
+Only `structure_ground_truth_verified.csv` is eligible for an OCSR release benchmark. The delayed recheck mode samples visually verified crops, hides the first visual decision and notes, and writes `data/review/review_consistency_report.json` with visual status, bbox, and region-type agreement.

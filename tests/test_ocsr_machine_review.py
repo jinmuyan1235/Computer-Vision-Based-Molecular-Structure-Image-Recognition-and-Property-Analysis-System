@@ -119,6 +119,9 @@ def test_valid_candidate_becomes_machine_verified_without_mutating_pending_manif
     assert rows[0]["verification_status"] == "machine_verified"
     assert rows[0]["models_agree"] == "true"
     assert rows[0]["source_formula"] == "C2H6O"
+    assert rows[0]["dataset_root"] == str(root.resolve())
+    assert rows[0]["ground_truth_origin"] == "pubchem"
+    assert rows[0]["ground_truth_smiles"] == "CCO"
     assert (root / "pending_manifest.csv").read_text(encoding="utf-8") == before
     assert Path(str(result["review_report"])).is_file()
     assert set(rows[0]).issuperset(MACHINE_REVIEW_FIELDS)
