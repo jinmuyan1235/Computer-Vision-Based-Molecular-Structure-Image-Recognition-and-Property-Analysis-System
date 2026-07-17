@@ -821,6 +821,27 @@ python scripts/collect_ocsr_dataset.py --dataset-root data/ocsr_collections pubc
 python scripts/collect_ocsr_dataset.py --dataset-root data/ocsr_collections pmc --pmcid PMC1234567
 ```
 
+#### Small PMC Trial
+
+Start with one or two PMC articles, rather than a large batch. Replace the example IDs with PMC Open Access articles you are permitted to collect:
+
+```bash
+# Check PMC OA status and license metadata only. No PDF, page, crop, or candidate is saved.
+python scripts/collect_ocsr_dataset.py \
+  --dataset-root data/ocsr_collections \
+  --max-downloads 2 \
+  --dry-run \
+  pmc --pmcid PMC1234567 --pmcid PMC2345678
+
+# After checking the registry, materialize at most two approved sources.
+python scripts/collect_ocsr_dataset.py \
+  --dataset-root data/ocsr_collections \
+  --max-downloads 2 \
+  pmc --pmcid PMC1234567 --pmcid PMC2345678
+```
+
+`--dry-run` still requests the OA metadata so that the source and license can be registered; it deliberately stops before saving a document resource or training candidate. After a non-dry run, inspect `data/ocsr_collections/source_registry.csv`, `pending_manifest.csv`, `collection_state.json`, and `collection_log.jsonl`. An empty pending manifest is valid when no candidate region was detected or the source was blocked by the license policy.
+
 The collector has response caching, limits, rate intervals, retries, logs, and resume state. PubChem material retains CID, input/canonical SMILES, InChIKey, SDF, and 2D PNG. Approved PMC PDF resources, or an explicit approved PNG/JPEG page resource, pass through the existing renderer and region detector. Candidate images receive MolScribe, DECIMER, and ensemble predictions, but those predictions are never promoted to labels automatically.
 
 `pending_manifest.csv` records molecule candidates and detected `text`, `table`, `reaction`, `blank`, and `invalid_crop` negatives. SHA-256, perceptual hash, canonical SMILES, and InChIKey prevent duplicate work. Two independent reviewers must agree before `verified_manifest.csv` is written:
@@ -845,7 +866,7 @@ python scripts/run_ocsr_machine_review.py \
   --output-dir data/review
 ```
 
-Use `--reuse-predictions` to evaluate the saved model outputs only. Otherwise the command reruns MolScribe, DECIMER, and ensemble. It writes `machine_review_manifest.csv`, `rejected_manifest.csv`, `human_review_queue.csv`, `review_summary.json`, and `review_report.md`.
+Use `--reuse-predictions` to evaluate the saved model outputs only. Otherwise the command reruns MolScribe, DECIMER, and ensemble. It writes `machine_review_manifest.csv`, `rejected_manifest.csv`, `human_review_queue.csv`, `review_summary.json`, and `review_report.md`. Run it only after a non-empty `pending_manifest.csv` has been produced; retaining saved predictions avoids an unnecessary second model run.
 
 Machine review validates image paths and decoding, SHA-256, duplicate and perceptual hashes, bbox integrity, source metadata and license, RDKit SMILES/canonical/InChIKey/formula fields, and explicit split leakage. It records every raw prediction, model agreement, redraw similarity, quality score, category, structure risk, and rejection reason. `machine_verified` is only a technical gate, never human ground truth.
 
@@ -853,7 +874,7 @@ Machine statuses are `rejected_invalid`, `rejected_license`, `pending_machine_re
 
 ### Single-Developer Dataset Review
 
-Open **Data Management / OCSR Dataset Review** in Streamlit after generating `data/review/machine_review_manifest.csv`. This is intentionally a single-person workflow: it has no user accounts, second-review gate, or arbitration system. The Queue view defaults to `pending_human_review` and can switch between pending-human, machine-verified spot checks, pending-machine failures, and all reviewable samples. `human_review_queue.csv` remains the stage-two handoff output and a compatibility fallback, but is not the page's only data source.
+Open **Data Management / OCSR Dataset Review** in Streamlit after generating `data/review/machine_review_manifest.csv`. This is intentionally a single-person workflow: it has no user accounts, second-review gate, or arbitration system. The Queue view defaults to `pending_human_review` and can switch between pending-human, machine-verified spot checks, pending-machine failures, and all reviewable samples. `machine_review_manifest.csv` is the page's primary source; `human_review_queue.csv` contains only the `pending_human_review` subset and is retained as a stage-two handoff artifact and compatibility fallback.
 
 For each candidate, the page displays its source page and bbox when available, crop, MolScribe/DECIMER/ensemble predictions, one RDKit redraw per valid prediction, quality/risk details, source attribution, and license. It accepts a selected prediction, manual SMILES, bbox and region-type edits, rejection, uncertain status, and notes.
 
