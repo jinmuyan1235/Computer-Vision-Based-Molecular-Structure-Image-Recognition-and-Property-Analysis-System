@@ -805,3 +805,62 @@ Each document run writes an isolated output directory containing:
 - `document_results.zip`
 
 The heuristic detector is intentionally conservative and is not a trained layout model. It can miss low-resolution structures, split dense diagrams, merge nearby structures, or mark complex reaction schemes as `reaction_like`. Use the manual region editor for review before treating document-level outputs as curated data.
+
+## Auditable OCSR Dataset Collection
+
+The audit-first collection pipeline has a deliberately narrow source boundary:
+
+- **PubChem**: public-domain 2D structure records only.
+- **PMC Open Access**: the article must be listed by the NCBI PMC Open Access service and state `CC0-1.0`, `CC-BY-3.0`, `CC-BY-4.0`, `CC-BY-SA-3.0`, or `CC-BY-SA-4.0`.
+
+Unknown, versionless, or unapproved licenses are a hard stop: the source registry records URL, identifier, license, retrieval time, SHA-256, and attribution, but does not retain any PDF, page image, crop, or training sample. `data/ocsr_collections/` and `data/review/` are ignored by Git.
+
+```bash
+python scripts/collect_ocsr_dataset.py --dry-run pubchem --cid 2244
+python scripts/collect_ocsr_dataset.py --dataset-root data/ocsr_collections pubchem --cid 2244 --cid 5957
+python scripts/collect_ocsr_dataset.py --dataset-root data/ocsr_collections pmc --pmcid PMC1234567
+```
+
+The collector has response caching, limits, rate intervals, retries, logs, and resume state. PubChem material retains CID, input/canonical SMILES, InChIKey, SDF, and 2D PNG. Approved PMC PDF resources, or an explicit approved PNG/JPEG page resource, pass through the existing renderer and region detector. Candidate images receive MolScribe, DECIMER, and ensemble predictions, but those predictions are never promoted to labels automatically.
+
+`pending_manifest.csv` records molecule candidates and detected `text`, `table`, `reaction`, `blank`, and `invalid_crop` negatives. SHA-256, perceptual hash, canonical SMILES, and InChIKey prevent duplicate work. Two independent reviewers must agree before `verified_manifest.csv` is written:
+
+```bash
+python scripts/collect_ocsr_dataset.py --dataset-root data/ocsr_collections review \
+  --sample-id <sample_id> --reviewer reviewer_a --decision approve --smiles "CCO"
+python scripts/collect_ocsr_dataset.py --dataset-root data/ocsr_collections review \
+  --sample-id <sample_id> --reviewer reviewer_b --decision approve --smiles "CCO"
+python scripts/collect_ocsr_dataset.py --dataset-root data/ocsr_collections export-verified
+```
+
+The verified split groups source document, molecule identity, and Bemis-Murcko scaffold to prevent leakage. Do not commit downloaded data, PDFs, model weights, or API keys.
+
+### Automated Machine Review
+
+The machine-review stage reads `data/ocsr_collections/pending_manifest.csv` and writes separate technical artifacts under `data/review/`; it does not modify the pending manifest, human votes, or verified manifest.
+
+```bash
+python scripts/run_ocsr_machine_review.py \
+  --dataset-root data/ocsr_collections \
+  --output-dir data/review
+```
+
+Use `--reuse-predictions` to evaluate the saved model outputs only. Otherwise the command reruns MolScribe, DECIMER, and ensemble. It writes `machine_review_manifest.csv`, `rejected_manifest.csv`, `human_review_queue.csv`, `review_summary.json`, and `review_report.md`.
+
+Machine review validates image paths and decoding, SHA-256, duplicate and perceptual hashes, bbox integrity, source metadata and license, RDKit SMILES/canonical/InChIKey/formula fields, and explicit split leakage. It records every raw prediction, model agreement, redraw similarity, quality score, category, structure risk, and rejection reason. `machine_verified` is only a technical gate, never human ground truth.
+
+Machine statuses are `rejected_invalid`, `rejected_license`, `pending_machine_review`, `machine_verified`, `pending_human_review`, `human_verified`, and `human_rejected`. Disagreement, a negative sample with a valid SMILES, complex chemistry, low quality, cropped structures, unknown licenses, or low redraw similarity route samples to human review.
+
+### Single-Developer Dataset Review
+
+Open **Data Management / OCSR Dataset Review** in Streamlit after generating `data/review/human_review_queue.csv`. This is intentionally a single-person workflow: it has no user accounts, second-review gate, or arbitration system.
+
+For each candidate, the page displays its source page and bbox when available, crop, MolScribe/DECIMER/ensemble predictions, one RDKit redraw per valid prediction, quality/risk details, source attribution, and license. It accepts a selected prediction, manual SMILES, bbox and region-type edits, rejection, uncertain status, and notes.
+
+Each decision writes an independent JSON record under `data/review/single_reviews/` with `reviewed_at`, `original_prediction`, `final_smiles`, `bbox_before`, `bbox_after`, `correction_types`, and `review_notes`. It regenerates evaluation-oriented outputs without changing the machine queue or prior annotations:
+
+- `data/review/human_verified_single.csv`
+- `data/review/human_rejected.csv`
+- `data/review/uncertain.csv`
+
+Single-review statuses are `machine_verified`, `human_verified_single`, `rejected`, and `uncertain`. The delayed recheck mode selects a seeded random proportion of `human_verified_single` samples into `data/review/recheck_queue.csv`, hides the first review answer and notes, and writes `data/review/review_consistency_report.json` with status, structure, bbox, and region-type agreement.
