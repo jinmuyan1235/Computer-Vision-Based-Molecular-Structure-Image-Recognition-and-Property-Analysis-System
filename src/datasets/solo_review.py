@@ -21,6 +21,12 @@ from src.utils.file_utils import ensure_directory, safe_stem
 
 SOLO_STATUSES = ("machine_verified", "human_verified_single", "rejected", "uncertain")
 REGION_TYPES = ("molecule", "reaction", "text", "table", "invalid_crop")
+REVIEW_SCOPES = {
+    "pending_human_review": {"pending_human_review"},
+    "machine_verified": {"machine_verified"},
+    "pending_machine_review": {"pending_machine_review"},
+    "all_reviewable": {"pending_human_review", "machine_verified", "pending_machine_review"},
+}
 OUTCOME_FIELDS = (
     "sample_id", "image_path", "ground_truth_smiles", "ground_truth_canonical_smiles", "ground_truth_inchikey",
     "expected_action", "category", "source", "split", "scaffold_key", "source_document", "source_license",
@@ -89,16 +95,27 @@ class SoloReviewStore:
     ) -> None:
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         self.review_root = ensure_directory(Path(review_root).expanduser().resolve())
+        self.machine_manifest_path = self.review_root / "machine_review_manifest.csv"
         self.queue_path = self.review_root / "human_review_queue.csv"
         self.audit_dir = ensure_directory(self.review_root / "single_reviews")
         self.crop_dir = ensure_directory(self.review_root / "single_review_crops")
         self.recheck_dir = ensure_directory(self.review_root / "rechecks")
         self.recheck_path = self.review_root / "recheck_queue.csv"
 
-    def list_items(self, *, include_reviewed: bool = True) -> list[dict[str, Any]]:
+    def list_items(
+        self,
+        *,
+        scope: str = "pending_human_review",
+        include_reviewed: bool = True,
+    ) -> list[dict[str, Any]]:
+        """List reviewable samples from the machine manifest, with queue fallback."""
+        if scope not in REVIEW_SCOPES:
+            raise ValueError(f"Unsupported review scope: {scope}")
         audits = self._audits()
         items: list[dict[str, Any]] = []
-        for row in _read_csv(self.queue_path):
+        for row in self._source_rows():
+            if str(row.get("verification_status") or "") not in REVIEW_SCOPES[scope]:
+                continue
             sample_id = str(row.get("sample_id") or "")
             audit = audits.get(sample_id)
             if audit and not include_reviewed:
@@ -113,7 +130,29 @@ class SoloReviewStore:
         return sorted(items, key=lambda item: (bool(item.get("audit")), str(item.get("sample_id") or "")))
 
     def get_item(self, sample_id: str) -> dict[str, Any] | None:
-        return next((item for item in self.list_items() if item.get("sample_id") == sample_id), None)
+        return next((item for item in self.list_items(scope="all_reviewable") if item.get("sample_id") == sample_id), None)
+
+    def queue_stats(self) -> dict[str, int]:
+        """Return source-state totals plus current single-review outcomes."""
+        rows = self._source_rows()
+        audits = self._audits()
+        rejected_ids = {
+            str(row.get("sample_id") or "")
+            for row in rows
+            if str(row.get("verification_status") or "").startswith("rejected_")
+        }
+        rejected_ids.update(
+            sample_id for sample_id, audit in audits.items()
+            if audit.get("verification_status") == "rejected"
+        )
+        return {
+            "total": len(rows),
+            "pending_human": sum(row.get("verification_status") == "pending_human_review" for row in rows),
+            "machine_verified": sum(row.get("verification_status") == "machine_verified" for row in rows),
+            "pending_machine": sum(row.get("verification_status") == "pending_machine_review" for row in rows),
+            "reviewed": len(audits),
+            "rejected": len({sample_id for sample_id in rejected_ids if sample_id}),
+        }
 
     def submit(
         self,
@@ -287,6 +326,12 @@ class SoloReviewStore:
         if not path.is_absolute():
             path = self.dataset_root / path
         return str(path.resolve()) if path.is_file() else None
+
+    def _source_rows(self) -> list[dict[str, str]]:
+        """Prefer the complete machine manifest; keep queue compatibility for old runs."""
+        if self.machine_manifest_path.is_file():
+            return _read_csv(self.machine_manifest_path)
+        return _read_csv(self.queue_path)
 
     def prediction_redraw(self, sample_id: str, backend: str, smiles: str) -> str | None:
         """Render a prediction lazily for the Streamlit review page."""
