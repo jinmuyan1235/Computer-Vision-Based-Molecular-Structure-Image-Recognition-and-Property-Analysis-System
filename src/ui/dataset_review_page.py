@@ -25,16 +25,34 @@ def render_dataset_review_page() -> None:
 
 
 def _render_queue_workspace(store: SoloReviewStore) -> None:
-    controls = st.columns([0.25, 0.18, 0.18, 0.39])
-    show_reviewed = controls[0].toggle("Show reviewed", value=False, key="solo_show_reviewed")
-    items = store.list_items(include_reviewed=show_reviewed)
-    controls[1].metric("Queue", len(items))
-    controls[2].metric("Reviewed", sum(bool(item.get("audit")) for item in items))
+    stats = store.queue_stats()
+    metrics = st.columns(6)
+    metrics[0].metric("Total", stats["total"])
+    metrics[1].metric("Pending human", stats["pending_human"])
+    metrics[2].metric("Machine verified", stats["machine_verified"])
+    metrics[3].metric("Pending machine", stats["pending_machine"])
+    metrics[4].metric("Reviewed", stats["reviewed"])
+    metrics[5].metric("Rejected", stats["rejected"])
+    controls = st.columns([0.36, 0.22, 0.42])
+    scope_label = controls[0].selectbox(
+        "Review range",
+        ["Pending human review", "Machine verified", "Pending machine review", "All reviewable"],
+        index=0,
+        key="solo_review_scope",
+    )
+    scope = {
+        "Pending human review": "pending_human_review",
+        "Machine verified": "machine_verified",
+        "Pending machine review": "pending_machine_review",
+        "All reviewable": "all_reviewable",
+    }[scope_label]
+    show_reviewed = controls[1].toggle("Show reviewed", value=False, key="solo_show_reviewed")
+    items = store.list_items(scope=scope, include_reviewed=show_reviewed)
     if not items:
-        st.info("No items in data/review/human_review_queue.csv.")
+        st.info("No matching reviewable samples in data/review/machine_review_manifest.csv.")
         return
     ids = [str(item["sample_id"]) for item in items]
-    selected = controls[3].selectbox("Sample", ids, key="solo_queue_sample")
+    selected = controls[2].selectbox("Sample", ids, key="solo_queue_sample")
     item = next(item for item in items if item["sample_id"] == selected)
     _render_item(store, item, recheck=False)
 
@@ -66,11 +84,18 @@ def _render_item(store: SoloReviewStore, item: dict[str, Any], *, recheck: bool)
     status_columns[3].metric("Category", item.get("machine_category") or item.get("category") or "-")
     _render_images(item)
     _render_predictions(store, item)
-    details = st.columns(2)
+    details = st.columns(3)
     with details[0]:
         st.caption("Risks")
         st.json(_parse_json(item.get("risk_reasons"), []))
     with details[1]:
+        st.caption("Deterministic checks")
+        st.json(_parse_json(item.get("deterministic_errors"), []))
+        failures = _model_failures(item)
+        if failures:
+            st.caption("Model failures")
+            st.json(failures)
+    with details[2]:
         st.caption("Source")
         st.json({
             "document": item.get("source_document"),
@@ -193,3 +218,18 @@ def _parse_json(raw: str | None, default: Any) -> Any:
         return json.loads(raw or "")
     except (TypeError, ValueError):
         return default
+
+
+def _model_failures(item: dict[str, Any]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for backend in ("molscribe", "decimer", "ensemble"):
+        raw = _parse_json(item.get(f"{backend}_raw"), {})
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("status") or "").lower() not in {"", "success"} or raw.get("message"):
+            failures.append({
+                "backend": backend,
+                "status": raw.get("status"),
+                "message": raw.get("message"),
+            })
+    return failures

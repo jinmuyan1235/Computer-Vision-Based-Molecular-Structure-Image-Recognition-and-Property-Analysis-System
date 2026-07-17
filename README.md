@@ -853,7 +853,7 @@ Machine statuses are `rejected_invalid`, `rejected_license`, `pending_machine_re
 
 ### Single-Developer Dataset Review
 
-Open **Data Management / OCSR Dataset Review** in Streamlit after generating `data/review/human_review_queue.csv`. This is intentionally a single-person workflow: it has no user accounts, second-review gate, or arbitration system.
+Open **Data Management / OCSR Dataset Review** in Streamlit after generating `data/review/machine_review_manifest.csv`. This is intentionally a single-person workflow: it has no user accounts, second-review gate, or arbitration system. The Queue view defaults to `pending_human_review` and can switch between pending-human, machine-verified spot checks, pending-machine failures, and all reviewable samples. `human_review_queue.csv` remains the stage-two handoff output and a compatibility fallback, but is not the page's only data source.
 
 For each candidate, the page displays its source page and bbox when available, crop, MolScribe/DECIMER/ensemble predictions, one RDKit redraw per valid prediction, quality/risk details, source attribution, and license. It accepts a selected prediction, manual SMILES, bbox and region-type edits, rejection, uncertain status, and notes.
 
