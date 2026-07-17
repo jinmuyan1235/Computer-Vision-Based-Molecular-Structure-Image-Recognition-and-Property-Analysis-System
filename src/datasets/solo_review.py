@@ -193,6 +193,7 @@ class SoloReviewStore:
     ) -> list[dict[str, str]]:
         """Return lightweight fields for filtering and batch thumbnail pages."""
         allowed_ids = set(self.list_item_ids(scope=scope, include_reviewed=include_reviewed))
+        audits = self._audits()
         summaries = [
             {
                 "sample_id": str(row.get("sample_id") or ""),
@@ -201,6 +202,9 @@ class SoloReviewStore:
                 "image_quality_level": str(row.get("image_quality_level") or ""),
                 "dataset_root": str(row.get("dataset_root") or ""),
                 "image_path": str(row.get("image_path") or ""),
+                "visual_review_status": str(
+                    audits.get(str(row.get("sample_id") or ""), {}).get("visual_review_status") or ""
+                ),
             }
             for row in self._source_rows()
             if str(row.get("sample_id") or "") in allowed_ids
