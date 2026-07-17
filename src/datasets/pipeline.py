@@ -19,6 +19,7 @@ from src.datasets.provenance import SourceRecord, SourceRegistry, sha256_file
 from src.datasets.pubchem import PubChemCollector, PubChemStructure
 from src.datasets.review import PENDING_FIELDS, DatasetReviewStore
 from src.documents.processor import DocumentOCSRProcessor
+from src.documents.candidate_screening import CandidateScreeningConfig, get_screening_config, screen_region_candidate
 from src.feedback.store import save_review_queue_item
 from src.ocsr.base import OCSRResult
 from src.ocsr.ensemble import combine_ensemble_results
@@ -94,6 +95,7 @@ class DatasetPipeline:
         max_downloads: int = 100,
         dry_run: bool = False,
         resume: bool = True,
+        screening_config: str | CandidateScreeningConfig = "baseline",
     ) -> None:
         self.root = ensure_directory(Path(root).expanduser().resolve())
         self.registry = SourceRegistry(self.root)
@@ -104,6 +106,7 @@ class DatasetPipeline:
         self.max_downloads = max(0, int(max_downloads))
         self.dry_run = dry_run
         self.resume = resume
+        self.screening_config = get_screening_config(screening_config)
         self.material_root = ensure_directory(self.root / "sources")
         self.candidate_root = ensure_directory(self.root / "candidates")
         self.pending_manifest = self.root / "pending_manifest.csv"
@@ -165,6 +168,7 @@ class DatasetPipeline:
             backend="ensemble",
             output_dir=self.root / "document_runs",
             review_output_dir=config.DATA_DIR,
+            screening_config=self.screening_config,
         )
         document = processor.process(result.document_path, run_ocsr=False)
         candidates = self._document_candidates(document, result.source)
@@ -254,9 +258,23 @@ class DatasetPipeline:
         pages = {int(page["page_number"]): page for page in document.get("pages") or []}
         results: list[CandidateResult] = []
         for region in document.get("regions") or []:
-            category = REGION_CATEGORY.get(str(region.get("region_type") or ""), "invalid_crop")
             page = pages.get(int(region.get("page_number") or 0))
             page_path = Path(page["image_path"]) if page else None
+            initial_type = str(region.get("region_type") or "")
+            category = REGION_CATEGORY.get(initial_type, "invalid_crop")
+            screening = None
+            if page_path is not None and page_path.is_file():
+                try:
+                    screening = screen_region_candidate(
+                        page_path,
+                        region.get("bbox") or [],
+                        initial_type,
+                        region.get("detection_confidence"),
+                        config=self.screening_config,
+                    )
+                    category = REGION_CATEGORY.get(screening.recommended_region_type, "invalid_crop")
+                except (OSError, TypeError, ValueError):
+                    category = "invalid_crop"
             crop = self._crop_region(page_path, region.get("bbox")) if page_path else None
             results.append(self.add_candidate(
                 crop,
@@ -266,7 +284,11 @@ class DatasetPipeline:
                 bbox=region.get("bbox"),
                 source_page_path=page_path,
                 page_size=self._image_size(page_path),
-                notes=f"Document detector region {region.get('region_id')}; type={region.get('region_type')}",
+                notes=(
+                    f"Document detector region {region.get('region_id')}; initial_type={initial_type}; "
+                    f"screening_config={self.screening_config.name}; "
+                    f"screening_reasons={','.join(screening.reason_codes) if screening else 'screening_failed'}"
+                ),
             ))
         for page in pages.values():
             blank = self._blank_crop(Path(page["image_path"]))

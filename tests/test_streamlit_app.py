@@ -21,12 +21,16 @@ def test_dataset_batch_classification_workspace_renders() -> None:
     assert any(item.value == "Batch visual classification" for item in app.subheader)
     checkbox_labels = [item.label for item in app.checkbox]
     info_messages = [item.value for item in app.info]
-    assert "Select image" in checkbox_labels or "No samples are waiting for visual review." in info_messages
+    assert "Select image" in checkbox_labels or any(
+        message.startswith("No unreviewed samples in ") for message in info_messages
+    )
     assert app.title[0].value == "分子结构识别与性质分析"
     assert len(app.tabs) == 0
     source = app_path.read_text(encoding="utf-8")
     review_source = (app_path.parent / "src" / "ui" / "dataset_review_page.py").read_text(encoding="utf-8")
     assert 'st.checkbox("Select image"' in review_source
+    assert '"Machine rejected"' in review_source
+    assert "submit_recheck_batch" in review_source
     assert "PAGE_LABELS" in source
     assert "active_page" in source
     assert "st.tabs" not in source

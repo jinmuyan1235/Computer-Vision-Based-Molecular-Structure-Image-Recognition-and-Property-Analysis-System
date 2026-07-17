@@ -1,0 +1,165 @@
+"""Regression tests for shared visual candidate screening and evaluation."""
+
+from __future__ import annotations
+
+import csv
+import hashlib
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pytest
+from PIL import Image, ImageDraw
+
+import src.datasets.pipeline as dataset_pipeline_module
+import src.documents.candidate_screening as screening_module
+import src.documents.detectors as detectors_module
+import src.documents.processor as processor_module
+from src.documents.candidate_screening import get_screening_config, screen_region_candidate
+from src.evaluation.visual_detector import evaluate_visual_detector
+from src.evaluation.visual_detector_compare import compare_visual_detector_runs
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+FROZEN_CHECKSUM_FILE_SHA256 = "74e0999340ccb99e50ed0970957d6cd6a532131c3dd28c7e164f851ac88ef9ab"
+
+
+def _screen(image: Image.Image, initial: str = "molecule") -> str:
+    array = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    return screen_region_candidate(
+        array, (0, 0, image.width, image.height), initial, 0.9, config="candidate",
+    ).recommended_region_type
+
+
+def _arrow(size: tuple[int, int] = (500, 180)) -> Image.Image:
+    image = Image.new("RGB", size, "white")
+    draw = ImageDraw.Draw(image)
+    draw.line((60, size[1] // 2, size[0] - 70, size[1] // 2), fill="black", width=4)
+    x, y = size[0] - 70, size[1] // 2
+    draw.polygon([(x, y), (x - 30, y - 15), (x - 30, y + 15)], fill="black")
+    return image
+
+
+def _molecule() -> Image.Image:
+    return Image.open(PROJECT_ROOT / "data" / "samples" / "caffeine.png").convert("RGB")
+
+
+def test_reaction_arrow_is_not_a_molecule() -> None:
+    assert _screen(_arrow()) == "reaction"
+
+
+def test_molecule_plus_arrow_routes_to_reaction_or_uncertain() -> None:
+    image = Image.new("RGB", (700, 220), "white")
+    image.paste(_molecule().resize((250, 180)), (20, 20))
+    draw = ImageDraw.Draw(image)
+    draw.line((330, 110, 650, 110), fill="black", width=4)
+    draw.polygon([(650, 110), (620, 95), (620, 125)], fill="black")
+    assert _screen(image) in {"reaction", "uncertain"}
+
+
+def test_plain_text_is_classified_as_text() -> None:
+    image = Image.new("RGB", (700, 220), "white")
+    draw = ImageDraw.Draw(image)
+    for index in range(5):
+        draw.text((20, 20 + index * 35), "This is ordinary article text and not a molecule.", fill="black")
+    assert _screen(image) == "text"
+
+
+def test_grid_is_classified_as_table() -> None:
+    image = Image.new("RGB", (500, 300), "white")
+    draw = ImageDraw.Draw(image)
+    for y in range(20, 281, 65):
+        draw.line((20, y, 480, y), fill="black", width=3)
+    for x in range(20, 481, 115):
+        draw.line((x, 20, x, 280), fill="black", width=3)
+    assert _screen(image) == "table"
+
+
+def test_single_clear_molecule_passes_candidate_gate() -> None:
+    assert _screen(_molecule()) == "molecule"
+
+
+def test_two_separate_molecules_do_not_pass_single_molecule_gate() -> None:
+    molecule = _molecule().resize((240, 180))
+    image = Image.new("RGB", (600, 220), "white")
+    image.paste(molecule, (20, 20))
+    image.paste(molecule, (340, 20))
+    assert _screen(image) == "multiple_molecules"
+
+
+def test_interactive_and_collection_flows_import_the_same_screening_function() -> None:
+    assert processor_module.screen_region_candidate is screening_module.screen_region_candidate
+    assert dataset_pipeline_module.screen_region_candidate is screening_module.screen_region_candidate
+    assert detectors_module.screen_region_candidate is screening_module.screen_region_candidate
+
+
+def test_baseline_and_candidate_profiles_are_distinct_and_selectable() -> None:
+    baseline = get_screening_config("baseline")
+    candidate = get_screening_config("candidate")
+    assert baseline.name == "baseline"
+    assert candidate.name == "candidate"
+    assert baseline.dilation_kernel != candidate.dilation_kernel
+    assert baseline.merge_overlap_ratio != candidate.merge_overlap_ratio
+    with pytest.raises(ValueError, match="Unknown candidate-screening config"):
+        get_screening_config("missing")  # type: ignore[arg-type]
+
+
+def _evaluation_manifest(tmp_path: Path) -> Path:
+    molecule_path = tmp_path / "molecule.png"
+    text_path = tmp_path / "text.png"
+    _molecule().save(molecule_path)
+    text = Image.new("RGB", (500, 180), "white")
+    draw = ImageDraw.Draw(text)
+    for index in range(4):
+        draw.text((20, 20 + index * 34), "ordinary article text", fill="black")
+    text.save(text_path)
+    manifest = tmp_path / "detector_training_manifest.csv"
+    fields = ["sample_id", "image_path", "visual_review_status", "source_document", "source_page_path"]
+    with manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows([
+            {
+                "sample_id": "pmc_demo_molecule_abcdef", "image_path": str(molecule_path),
+                "visual_review_status": "valid_single_molecule_crop", "source_document": "doc-a",
+                "source_page_path": "page-1.png",
+            },
+            {
+                "sample_id": "pmc_demo_text_123abc", "image_path": str(text_path),
+                "visual_review_status": "text", "source_document": "doc-a",
+                "source_page_path": "page-1.png",
+            },
+        ])
+    return manifest
+
+
+def test_evaluation_and_comparison_write_required_fields(tmp_path: Path) -> None:
+    manifest = _evaluation_manifest(tmp_path)
+    baseline_dir = tmp_path / "baseline"
+    candidate_dir = tmp_path / "candidate"
+    baseline = evaluate_visual_detector(manifest, baseline_dir, config_name="baseline")
+    candidate = evaluate_visual_detector(manifest, candidate_dir, config_name="candidate")
+    required = {
+        "metrics.json", "predictions.csv", "confusion_matrix.csv", "per_class_metrics.csv",
+        "per_document_metrics.csv", "errors.csv", "report.md",
+    }
+    assert required == {path.name for path in baseline_dir.iterdir()}
+    assert baseline["molecule_vs_non_molecule"]["precision"] == 1.0
+    assert "macro_f1" in candidate["multiclass"]
+    assert "cannot measure complete-page molecule detection recall" in candidate["scope_limitation"]
+    comparison = compare_visual_detector_runs(baseline_dir, candidate_dir, tmp_path / "comparison")
+    assert "molecule_precision" in comparison["metrics"]
+    assert "development_set_improved" in comparison
+    assert (tmp_path / "comparison" / "comparison.json").is_file()
+    assert (tmp_path / "comparison" / "comparison.md").is_file()
+
+
+def test_frozen_visual_development_snapshot_is_unchanged_when_present() -> None:
+    checksum_file = PROJECT_ROOT / "data" / "datasets" / "visual-dev-v0.1" / "checksums.sha256"
+    if not checksum_file.is_file():
+        pytest.skip("Local frozen development dataset is intentionally not committed.")
+    assert hashlib.sha256(checksum_file.read_bytes()).hexdigest() == FROZEN_CHECKSUM_FILE_SHA256
+    root = checksum_file.parent
+    for line in checksum_file.read_text(encoding="utf-8").splitlines():
+        expected, relative = line.split("  ", 1)
+        assert hashlib.sha256((root / relative).read_bytes()).hexdigest() == expected

@@ -236,6 +236,42 @@ def test_batch_visual_classification_requires_selection(tmp_path: Path) -> None:
         store.submit_visual_batch([], visual_review_status="text", region_type="text")
 
 
+def test_visual_remaining_counts_only_machine_routed_samples_without_audit(tmp_path: Path) -> None:
+    _, _, store = _setup(tmp_path, ("first", "second", "third"))
+
+    before = store.queue_stats()
+    assert before["machine_routed_visual"] == 3
+    assert before["visual_remaining"] == 3
+    assert before["reviewed"] == 0
+
+    store.submit_visual_batch(
+        ["first", "second", "third"], visual_review_status="text", region_type="text",
+    )
+    after = store.queue_stats()
+    assert after["machine_routed_visual"] == 3
+    assert after["visual_remaining"] == 0
+    assert after["reviewed"] == 3
+
+
+def test_machine_rejected_samples_are_available_to_batch_review(tmp_path: Path) -> None:
+    _, review, store = _setup(tmp_path, ("rejected-a", "rejected-b"))
+    rows = _read_rows(store.machine_manifest_path)
+    for row in rows:
+        row["verification_status"] = "rejected_invalid"
+    with store.machine_manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=QUEUE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    fresh = SoloReviewStore(store.dataset_root, review_root=review)
+
+    summaries = fresh.list_item_summaries(scope="machine_rejected", include_reviewed=False)
+    assert {row["sample_id"] for row in summaries} == {"rejected-a", "rejected-b"}
+    result = fresh.submit_visual_batch(
+        ["rejected-a", "rejected-b"], visual_review_status="text", region_type="text",
+    )
+    assert result["reviewed_count"] == 2
+
+
 def test_batch_thumbnail_uses_fixed_canvas_for_different_aspect_ratios(tmp_path: Path) -> None:
     wide = tmp_path / "wide.png"
     tall = tmp_path / "tall.png"
@@ -262,3 +298,28 @@ def test_delayed_recheck_hides_first_visual_decision_and_compares_visual_results
     report = json.loads((review / "review_consistency_report.json").read_text(encoding="utf-8"))
     assert report["completed_rechecks"] == 1
     assert report["consistency_rate"] == 1.0
+    assert report["by_visual_review_status"]["valid_single_molecule_crop"]["consistency_rate"] == 1.0
+
+
+def test_delayed_recheck_stratifies_all_visual_classes_and_supports_batch(tmp_path: Path) -> None:
+    _, review, store = _setup(tmp_path, ("molecule", "text-a", "text-b", "reaction"))
+    store.submit_visual("molecule", visual_review_status="valid_single_molecule_crop", region_type="molecule")
+    store.submit_visual("text-a", visual_review_status="text", region_type="text")
+    store.submit_visual("text-b", visual_review_status="text", region_type="text")
+    store.submit_visual("reaction", visual_review_status="reaction", region_type="reaction")
+
+    selected = store.create_recheck_queue(1.0, seed=11, max_samples=3)
+    assert selected["selected"] == 3
+    assert selected["selected_by_visual_status"] == {
+        "reaction": 1, "text": 1, "valid_single_molecule_crop": 1,
+    }
+    pending_ids = [str(item["sample_id"]) for item in store.list_recheck_items()]
+    result = store.submit_recheck_batch(
+        pending_ids, visual_review_status="text", region_type="text", review_notes="Independent batch.",
+    )
+    assert result["reviewed_count"] == 3
+    report = json.loads((review / "review_consistency_report.json").read_text(encoding="utf-8"))
+    assert set(report["by_visual_review_status"]) == {
+        "reaction", "text", "valid_single_molecule_crop",
+    }
+    assert report["completed_rechecks"] == 3

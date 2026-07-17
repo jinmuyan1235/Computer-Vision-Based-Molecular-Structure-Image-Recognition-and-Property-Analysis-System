@@ -72,7 +72,7 @@ OUTCOME_FIELDS = (
 )
 RECHECK_FIELDS = (
     "recheck_id", "sample_id", "created_at", "recheck_status", "completed_at", "source_document",
-    "image_path", "category", "source_license", "review_notes_hidden",
+    "image_path", "category", "first_visual_review_status", "source_license", "review_notes_hidden",
 )
 _WINDOWS_PATH = re.compile(r"^([a-zA-Z]):[\\/](.*)$")
 _WSL_MOUNT_PATH = re.compile(r"^/mnt/([a-zA-Z])/(.*)$")
@@ -216,6 +216,10 @@ class SoloReviewStore:
     def queue_stats(self) -> dict[str, int]:
         rows = self._source_rows()
         audits = self._audits()
+        machine_routed_ids = {
+            str(row.get("sample_id") or "") for row in rows
+            if row.get("verification_status") == "pending_human_review" and row.get("sample_id")
+        }
         rejected_ids = {
             str(row.get("sample_id") or "") for row in rows
             if str(row.get("verification_status") or "").startswith("rejected_")
@@ -232,7 +236,10 @@ class SoloReviewStore:
         )
         return {
             "total": len(rows),
-            "pending_human": sum(row.get("verification_status") == "pending_human_review" for row in rows),
+            "machine_routed_visual": len(machine_routed_ids),
+            "visual_remaining": len(machine_routed_ids.difference(audits)),
+            # Compatibility alias for callers written before the statistic was clarified.
+            "pending_human": len(machine_routed_ids),
             "machine_verified": sum(row.get("verification_status") == "machine_verified" for row in rows),
             "pending_machine": sum(row.get("verification_status") == "pending_machine_review" for row in rows),
             "reviewed": len(audits),
@@ -433,13 +440,41 @@ class SoloReviewStore:
             return self.submit_structure_ground_truth(sample_id, review_notes=review_notes, reviewer=reviewer)
         return result
 
-    def create_recheck_queue(self, proportion: float, *, seed: int | None = None) -> dict[str, Any]:
+    def create_recheck_queue(
+        self,
+        proportion: float,
+        *,
+        seed: int | None = None,
+        max_samples: int | None = None,
+    ) -> dict[str, Any]:
         if not 0.0 <= proportion <= 1.0:
             raise ValueError("proportion must be between 0 and 1.")
-        verified = [audit for audit in self._audits().values() if audit.get("visual_review_status") == "valid_single_molecule_crop"]
+        if max_samples is not None and max_samples < 1:
+            raise ValueError("max_samples must be positive when supplied.")
+        eligible = [
+            audit for audit in self._audits().values()
+            if audit.get("visual_review_status") in VISUAL_REVIEW_STATUSES
+        ]
         randomizer = random.Random(seed)
-        randomizer.shuffle(verified)
-        selected = verified[:round(len(verified) * proportion)]
+        target = round(len(eligible) * proportion)
+        if proportion > 0.0 and eligible:
+            target = max(1, target)
+        if max_samples is not None:
+            target = min(target, max_samples)
+        target = min(target, len(eligible))
+        strata: dict[str, list[dict[str, Any]]] = {}
+        for audit in eligible:
+            strata.setdefault(str(audit["visual_review_status"]), []).append(audit)
+        for audits in strata.values():
+            randomizer.shuffle(audits)
+        statuses = sorted(strata)
+        randomizer.shuffle(statuses)
+        selected: list[dict[str, Any]] = []
+        for status in statuses[:target]:
+            selected.append(strata[status].pop())
+        remainder = [audit for status in statuses for audit in strata[status]]
+        randomizer.shuffle(remainder)
+        selected.extend(remainder[:max(0, target - len(selected))])
         existing = {row.get("sample_id"): row for row in _read_csv(self.recheck_path)}
         for audit in selected:
             sample_id = str(audit["sample_id"])
@@ -451,12 +486,20 @@ class SoloReviewStore:
                 "recheck_status": "pending", "completed_at": "", "source_document": source.get("source_document", ""),
                 "image_path": audit.get("reviewed_image_path") or source.get("image_path", ""),
                 "category": audit.get("region_type_after") or source.get("category", ""),
+                "first_visual_review_status": audit.get("visual_review_status", ""),
                 "source_license": source.get("source_license", ""), "review_notes_hidden": "true",
             }
         rows = sorted(existing.values(), key=lambda row: str(row.get("sample_id") or ""))
         _write_csv(self.recheck_path, rows, RECHECK_FIELDS)
         report = self._write_consistency_report()
-        return {"selected": len(selected), "queue_size": len(rows), "recheck_queue": str(self.recheck_path), "consistency_report": str(report)}
+        selected_by_status = {
+            status: sum(audit.get("visual_review_status") == status for audit in selected)
+            for status in sorted({str(audit.get("visual_review_status") or "") for audit in selected})
+        }
+        return {
+            "selected": len(selected), "selected_by_visual_status": selected_by_status,
+            "queue_size": len(rows), "recheck_queue": str(self.recheck_path), "consistency_report": str(report),
+        }
 
     def list_recheck_items(self, *, pending_only: bool = True) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -481,31 +524,87 @@ class SoloReviewStore:
         region_type: str | None = None,
         review_notes: str = "",
     ) -> Path:
+        payload = self._recheck_payload(
+            sample_id,
+            visual_review_status=visual_review_status,
+            bbox_after=bbox_after,
+            region_type=region_type,
+            review_notes=review_notes,
+        )
+        path = self.recheck_dir / f"{safe_stem(sample_id)}.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._mark_rechecks_completed({sample_id: payload["reviewed_at"]})
+        self._write_consistency_report()
+        return path
+
+    def submit_recheck_batch(
+        self,
+        sample_ids: Iterable[str],
+        *,
+        visual_review_status: str,
+        region_type: str,
+        review_notes: str = "",
+    ) -> dict[str, Any]:
+        """Validate and persist a delayed-recheck batch, then report consistency once."""
+        identifiers = list(dict.fromkeys(str(sample_id) for sample_id in sample_ids if str(sample_id)))
+        if not identifiers:
+            raise ValueError("Select at least one sample for batch recheck.")
+        payloads = [
+            self._recheck_payload(
+                sample_id,
+                visual_review_status=visual_review_status,
+                region_type=region_type,
+                review_notes=review_notes,
+            )
+            for sample_id in identifiers
+        ]
+        for payload in payloads:
+            path = self.recheck_dir / f"{safe_stem(str(payload['sample_id']))}.json"
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._mark_rechecks_completed({str(payload["sample_id"]): str(payload["reviewed_at"]) for payload in payloads})
+        report_path = self._write_consistency_report()
+        return {
+            "reviewed_count": len(payloads), "sample_ids": identifiers,
+            "visual_review_status": visual_review_status, "region_type": region_type,
+            "consistency_report": str(report_path),
+        }
+
+    def _recheck_payload(
+        self,
+        sample_id: str,
+        *,
+        visual_review_status: str,
+        bbox_after: list[int] | tuple[int, int, int, int] | None = None,
+        region_type: str | None = None,
+        review_notes: str = "",
+    ) -> dict[str, Any]:
         if visual_review_status not in VISUAL_REVIEW_STATUSES:
             raise ValueError("Unsupported recheck visual status.")
-        queued = any(row.get("sample_id") == sample_id for row in _read_csv(self.recheck_path))
-        item = self.get_item(sample_id) if queued else None
-        if not queued or item is None:
-            raise ValueError(f"Sample is not in the recheck queue: {sample_id}")
+        queued = {
+            str(row.get("sample_id") or "") for row in _read_csv(self.recheck_path)
+            if row.get("recheck_status") == "pending"
+        }
+        item = self.get_item(sample_id) if sample_id in queued else None
+        if item is None:
+            raise ValueError(f"Sample is not pending in the recheck queue: {sample_id}")
         before = self._bbox(item.get("bbox"))
         after = list(bbox_after) if bbox_after is not None else before
         if after and not self._valid_bbox(after):
             raise ValueError("bbox_after must have a positive area.")
         final_region = str(region_type or item.get("machine_category") or item.get("category") or "invalid_crop").lower()
-        payload = {
+        return {
             "sample_id": sample_id, "reviewed_at": _now(), "visual_review_status": visual_review_status,
             "bbox_after": after, "region_type_after": final_region, "review_notes": review_notes,
         }
-        path = self.recheck_dir / f"{safe_stem(sample_id)}.json"
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _mark_rechecks_completed(self, completed: dict[str, str]) -> None:
         rows = _read_csv(self.recheck_path)
         for row in rows:
-            if row.get("sample_id") == sample_id:
+            sample_id = str(row.get("sample_id") or "")
+            if sample_id in completed:
                 row["recheck_status"] = "completed"
-                row["completed_at"] = payload["reviewed_at"]
+                row["completed_at"] = completed[sample_id]
         _write_csv(self.recheck_path, rows, RECHECK_FIELDS)
-        self._write_consistency_report()
-        return path
 
     def export_outcomes(self) -> dict[str, Path]:
         outcomes = [self._outcome_row(audit) for audit in self._audits().values()]
@@ -763,9 +862,27 @@ class SoloReviewStore:
             same_visual = first.get("visual_review_status") == recheck.get("visual_review_status")
             same_bbox = list(first.get("bbox_after") or []) == list(recheck.get("bbox_after") or [])
             same_region = first.get("region_type_after") == recheck.get("region_type_after")
-            comparisons.append({"sample_id": recheck.get("sample_id"), "same_visual_status": same_visual, "same_bbox": same_bbox, "same_region_type": same_region, "consistent": same_visual and same_bbox and same_region})
+            comparisons.append({
+                "sample_id": recheck.get("sample_id"),
+                "first_visual_review_status": first.get("visual_review_status"),
+                "same_visual_status": same_visual, "same_bbox": same_bbox,
+                "same_region_type": same_region, "consistent": same_visual and same_bbox and same_region,
+            })
         total = len(comparisons)
-        report = {"completed_rechecks": total, "consistent_rechecks": sum(item["consistent"] for item in comparisons), "consistency_rate": sum(item["consistent"] for item in comparisons) / total if total else None, "comparisons": comparisons}
+        by_status: dict[str, dict[str, Any]] = {}
+        for item in comparisons:
+            status = str(item.get("first_visual_review_status") or "unknown")
+            aggregate = by_status.setdefault(status, {"completed_rechecks": 0, "consistent_rechecks": 0})
+            aggregate["completed_rechecks"] += 1
+            aggregate["consistent_rechecks"] += int(bool(item["consistent"]))
+        for aggregate in by_status.values():
+            aggregate["consistency_rate"] = aggregate["consistent_rechecks"] / aggregate["completed_rechecks"]
+        consistent = sum(item["consistent"] for item in comparisons)
+        report = {
+            "completed_rechecks": total, "consistent_rechecks": consistent,
+            "consistency_rate": consistent / total if total else None,
+            "by_visual_review_status": by_status, "comparisons": comparisons,
+        }
         path = self.review_root / "review_consistency_report.json"
         path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
