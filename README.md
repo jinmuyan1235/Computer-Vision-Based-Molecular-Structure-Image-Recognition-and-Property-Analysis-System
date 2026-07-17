@@ -889,7 +889,7 @@ Each decision writes an independent JSON record under `data/review/single_review
 - `data/review/structure_ground_truth_verified.csv`
 - `data/review/chemistry_review_required.csv`
 
-Only `structure_ground_truth_verified.csv` is eligible for an OCSR release benchmark. `Machine-routed visual` reports the fixed number routed by the machine gate, while `Visual remaining` subtracts samples that already have a human audit and therefore reaches zero when that routed queue is complete. Batch classification supports both machine-routed and machine-rejected samples. Delayed recheck uses stratified sampling across every non-empty human visual class, hides the first decision and notes, supports checkbox-based batch rechecks, and writes overall and per-class agreement to `data/review/review_consistency_report.json`.
+Only `structure_ground_truth_verified.csv` is eligible for an OCSR release benchmark. `Machine-routed visual` reports the fixed number routed by the machine gate, while `Visual remaining` subtracts samples that already have a human audit and therefore reaches zero when that routed queue is complete. Batch classification supports machine-routed, machine-rejected, and already reviewed samples. Use `Reviewed samples` plus the current visual-class filter to select accidental labels and replace them in bulk; corrected audits immediately rebuild the exported manifests. Delayed recheck uses stratified sampling across every non-empty human visual class, hides the first decision and notes, supports checkbox-based batch rechecks, and writes overall and per-class agreement to `data/review/review_consistency_report.json`.
 
 Analyze and freeze a completed first visual-review round with:
 
