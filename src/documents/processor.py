@@ -18,6 +18,7 @@ import config
 from src.analysis.batch_analyzer import flatten_report
 from src.analysis.molecule_report import MoleculeReportGenerator
 from src.documents.detectors import BaseMoleculeRegionDetector, HeuristicMoleculeRegionDetector, HybridMoleculeRegionDetector
+from src.documents.candidate_screening import CandidateScreeningConfig, get_screening_config, screen_region_candidate
 from src.documents.input_loader import DocumentInputLoader
 from src.documents.models import DocumentPage, DocumentRegion, normalize_bbox, relative_path
 from src.documents.region_editing import apply_region_edits, is_region_confirmed, summarize_regions
@@ -42,10 +43,14 @@ class DocumentOCSRProcessor:
         loader: DocumentInputLoader | None = None,
         runtime_config: dict[str, Any] | None = None,
         review_output_dir: str | Path | None = None,
+        screening_config: str | CandidateScreeningConfig = "baseline",
     ) -> None:
         self.output_dir = ensure_directory(output_dir)
         self.backend = backend
-        self.detector = detector or HybridMoleculeRegionDetector()
+        self.screening_config = get_screening_config(screening_config)
+        self.detector = detector or HybridMoleculeRegionDetector(
+            fallback=HeuristicMoleculeRegionDetector(screening_config=self.screening_config),
+        )
         self.loader = loader or DocumentInputLoader(self.output_dir)
         self.report_generator = MoleculeReportGenerator(
             backend=backend,
@@ -236,7 +241,7 @@ class DocumentOCSRProcessor:
             return False
         try:
             page = self._find_page(pages, region.page_number)
-            passed, screening = self._screen_region_candidate(page, region)
+            passed, screening = self._shared_screen_region_candidate(page, region)
         except Exception as exc:
             region.status = "skipped"
             region.message = f"区域检查失败，已跳过识别：{exc}"
@@ -374,6 +379,35 @@ class DocumentOCSRProcessor:
             return False, base
         base["reason"] = "通过分子区域二次筛选。"
         return True, base
+
+    def _shared_screen_region_candidate(
+        self,
+        page: DocumentPage | dict[str, Any],
+        region: DocumentRegion,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Use the same public visual gate as offline collection and evaluation."""
+        page_path = Path(page.image_path if isinstance(page, DocumentPage) else page["image_path"])
+        page_width = int(page.width if isinstance(page, DocumentPage) else page["width"])
+        page_height = int(page.height if isinstance(page, DocumentPage) else page["height"])
+        bbox = normalize_bbox(region.bbox, page_width, page_height)
+        region.bbox = bbox
+        result = screen_region_candidate(
+            page_path,
+            bbox,
+            region.region_type,
+            region.detection_confidence,
+            config=self.screening_config,
+        )
+        payload = result.to_dict()
+        payload["passed"] = result.molecule_candidate
+        if "too_small" in result.reason_codes:
+            payload["reason"] = "区域尺寸过小，已跳过识别。"
+        elif "text_like" in result.reason_codes:
+            payload["reason"] = "区域疑似文字，已跳过单分子识别。"
+        else:
+            payload["reason"] = ", ".join(result.reason_codes)
+        payload.update(result.diagnostics)
+        return result.molecule_candidate, payload
 
     def _heuristic_detector(self) -> HeuristicMoleculeRegionDetector | None:
         if isinstance(self.detector, HeuristicMoleculeRegionDetector):

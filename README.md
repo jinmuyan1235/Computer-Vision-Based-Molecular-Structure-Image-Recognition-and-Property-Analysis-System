@@ -889,4 +889,39 @@ Each decision writes an independent JSON record under `data/review/single_review
 - `data/review/structure_ground_truth_verified.csv`
 - `data/review/chemistry_review_required.csv`
 
-Only `structure_ground_truth_verified.csv` is eligible for an OCSR release benchmark. The delayed recheck mode samples visually verified crops, hides the first visual decision and notes, and writes `data/review/review_consistency_report.json` with visual status, bbox, and region-type agreement.
+Only `structure_ground_truth_verified.csv` is eligible for an OCSR release benchmark. `Machine-routed visual` reports the fixed number routed by the machine gate, while `Visual remaining` subtracts samples that already have a human audit and therefore reaches zero when that routed queue is complete. Batch classification supports both machine-routed and machine-rejected samples. Delayed recheck uses stratified sampling across every non-empty human visual class, hides the first decision and notes, supports checkbox-based batch rechecks, and writes overall and per-class agreement to `data/review/review_consistency_report.json`.
+
+Analyze and freeze a completed first visual-review round with:
+
+```bash
+python scripts/analyze_visual_review.py --review-dir data/review
+python scripts/snapshot_visual_dataset.py \
+  --version visual-dev-v0.1 \
+  --review-dir data/review \
+  --output data/datasets/visual-dev-v0.1
+```
+
+The analysis writes class counts, machine-to-human confusion, rejection reasons, per-document/page metrics, bbox corrections, and `visual_review_report.md` under `data/review/analysis/`. It analyzes only candidates present in the review ledger and cannot estimate complete-page detector recall. A snapshot copies the review manifests, independent audit JSON files, consistency report, and analysis directory, then generates `dataset_summary.json` and `checksums.sha256`. Existing version directories are never overwritten.
+
+### Visual Candidate Detector Regression
+
+The document processor and PMC collection pipeline share `src/documents/candidate_screening.py`; neither path invokes MolScribe or DECIMER during visual screening. `baseline` retains the production defaults and `candidate` contains development thresholds motivated by the `visual-dev-v0.1` confusion matrix. Candidate formation settings (dilation, padding, and overlap merging) and classification thresholds (arrow, reaction condition, text, table, merged structures, density, and molecule score) are named dataclass fields rather than inline tuning constants. Baseline remains the default until a separate frozen holdout confirms the candidate rules.
+
+```bash
+python scripts/evaluate_visual_detector.py \
+  --manifest data/datasets/visual-dev-v0.1/detector_training_manifest.csv \
+  --config baseline \
+  --output data/evaluation/visual-dev-v0.1/baseline
+
+python scripts/evaluate_visual_detector.py \
+  --manifest data/datasets/visual-dev-v0.1/detector_training_manifest.csv \
+  --config candidate \
+  --output data/evaluation/visual-dev-v0.1/candidate
+
+python scripts/compare_visual_detector_runs.py \
+  --baseline data/evaluation/visual-dev-v0.1/baseline \
+  --candidate data/evaluation/visual-dev-v0.1/candidate \
+  --output data/evaluation/visual-dev-v0.1/comparison
+```
+
+All evaluation outputs live under ignored `data/evaluation/`. These manifests contain only regions already proposed by the detector, so the reports cannot compute complete-page molecule detection recall or count molecules missed entirely on a page. `visual-dev-v0.1` is a development set only. Future holdout evaluation uses the same command with `data/datasets/visual-holdout-v0.1/detector_training_manifest.csv`; if that snapshot does not exist, no holdout result is fabricated and no generalization improvement is claimed.

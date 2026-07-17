@@ -22,6 +22,10 @@ data/ocsr_collections/
 data/ocsr_first_batch/
 data/ocsr_first_batch_final/
 data/review/
+data/datasets/
+data/evaluation/
+data/runs/
+document_runs/
 data/feedback/
 data/app.db
 data/app.db-*

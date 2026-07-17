@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 import config
+from src.documents.candidate_screening import CandidateScreeningConfig, get_screening_config, screen_region_candidate
 from src.documents.models import DocumentPage, DocumentRegion, normalize_bbox
 
 
@@ -179,10 +180,12 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         min_area: int = config.DOCUMENT_MIN_REGION_AREA,
         max_area_ratio: float = config.DOCUMENT_MAX_REGION_AREA_RATIO,
         max_regions: int = config.DOCUMENT_MAX_REGIONS,
+        screening_config: str | CandidateScreeningConfig = "baseline",
     ) -> None:
         self.min_area = min_area
         self.max_area_ratio = max_area_ratio
         self.max_regions = max_regions
+        self.screening_config = get_screening_config(screening_config)
 
     def detect(self, page: DocumentPage) -> list[DocumentRegion]:
         image = cv2.imdecode(np.fromfile(str(Path(page.image_path)), dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -196,7 +199,15 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         contours = self._candidate_contours(binary, image.shape[1], image.shape[0])
         regions: list[DocumentRegion] = []
         for bbox in contours:
-            region_type, confidence, message = self._classify(binary, bbox, image.shape[1], image.shape[0])
+            screening = screen_region_candidate(
+                image, bbox, "molecule", None, config=self.screening_config,
+            )
+            recommended = screening.recommended_region_type
+            region_type = "reaction_like" if recommended == "reaction" else (
+                "unknown" if recommended == "uncertain" else recommended
+            )
+            confidence = screening.screening_score
+            message = ", ".join(screening.reason_codes)
             if region_type == "unknown" and confidence < 0.28:
                 continue
             region_id = f"p{page.page_number:03d}_r{len(regions) + 1:03d}"
@@ -213,7 +224,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             if len(regions) >= self.max_regions:
                 break
         if not regions:
-            fallback = self._whole_page_region(page, binary, image.shape[1], image.shape[0])
+            fallback = self._whole_page_region(page, image, binary, image.shape[1], image.shape[0])
             if fallback is not None:
                 regions.append(fallback)
         return regions
@@ -228,7 +239,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
 
     def _candidate_contours(self, binary: np.ndarray, width: int, height: int) -> list[tuple[int, int, int, int]]:
         # A moderate dilation joins bonds, atom labels, and nearby ring strokes into one region.
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (23, 17))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, self.screening_config.dilation_kernel)
         merged = cv2.dilate(binary, kernel, iterations=1)
         contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         candidates: list[tuple[int, int, int, int]] = []
@@ -246,7 +257,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
                 continue
             if h / max(w, 1) > 6:
                 continue
-            padding = 8
+            padding = self.screening_config.bbox_padding
             x1 = max(0, x - padding)
             y1 = max(0, y - padding)
             x2 = min(width, x + w + padding)
@@ -254,8 +265,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             candidates.append((x1, y1, x2, y2))
         return self._merge_overlapping_boxes(sorted(candidates, key=lambda item: (item[1], item[0])))
 
-    @staticmethod
-    def _merge_overlapping_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    def _merge_overlapping_boxes(self, boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
         """Merge highly overlapping boxes and discard near-duplicates."""
         merged: list[tuple[int, int, int, int]] = []
         for box in boxes:
@@ -266,7 +276,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
                 remaining: list[tuple[int, int, int, int]] = []
                 for existing in merged:
                     overlap = HeuristicMoleculeRegionDetector._overlap_ratio(current, existing)
-                    if overlap >= 0.72:
+                    if overlap >= self.screening_config.merge_overlap_ratio:
                         current = (
                             min(current[0], existing[0]),
                             min(current[1], existing[1]),
@@ -386,6 +396,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
     def _whole_page_region(
         self,
         page: DocumentPage,
+        image: np.ndarray,
         binary: np.ndarray,
         page_width: int,
         page_height: int,
@@ -401,8 +412,12 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             min(page_width, x + width + padding),
             min(page_height, y + height + padding),
         )
-        region_type, confidence, message = self._classify(binary, bbox, page_width, page_height)
-        if region_type != "molecule" or confidence < 0.68:
+        screening = screen_region_candidate(
+            image, bbox, "molecule", None, config=self.screening_config,
+        )
+        confidence = screening.screening_score
+        message = ", ".join(screening.reason_codes)
+        if not screening.molecule_candidate:
             return None
         return DocumentRegion(
             document_id=page.document_id,

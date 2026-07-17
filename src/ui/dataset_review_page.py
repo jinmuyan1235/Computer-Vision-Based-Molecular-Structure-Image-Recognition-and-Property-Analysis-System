@@ -48,11 +48,17 @@ def render_dataset_review_page() -> None:
 
 def _render_queue_workspace(store: SoloReviewStore) -> None:
     stats = store.queue_stats()
-    metrics = st.columns(7)
+    metrics = st.columns(8)
     for column, label, key in zip(
         metrics,
-        ("Total", "Pending visual", "Machine gate passed", "Pending machine", "Visual reviewed", "Machine rejected", "Visual negatives"),
-        ("total", "pending_human", "machine_verified", "pending_machine", "reviewed", "machine_rejected", "visual_negative"),
+        (
+            "Total", "Machine-routed visual", "Visual remaining", "Machine gate passed",
+            "Pending machine", "Visual reviewed", "Machine rejected", "Visual negatives",
+        ),
+        (
+            "total", "machine_routed_visual", "visual_remaining", "machine_verified",
+            "pending_machine", "reviewed", "machine_rejected", "visual_negative",
+        ),
     ):
         column.metric(label, stats[key])
     st.caption(
@@ -62,12 +68,12 @@ def _render_queue_workspace(store: SoloReviewStore) -> None:
     controls = st.columns([0.36, 0.22, 0.42])
     scope_label = controls[0].selectbox(
         "Review range",
-        ["Pending visual review", "Machine gate passed", "Pending machine review", "Machine rejected", "All samples"],
+        ["Visual remaining", "Machine gate passed", "Pending machine review", "Machine rejected", "All samples"],
         index=0,
         key="solo_review_scope",
     )
     scope = {
-        "Pending visual review": "pending_human_review", "Machine gate passed": "machine_verified",
+        "Visual remaining": "pending_human_review", "Machine gate passed": "machine_verified",
         "Pending machine review": "pending_machine_review", "Machine rejected": "machine_rejected",
         "All samples": "all_samples",
     }[scope_label]
@@ -85,28 +91,59 @@ def _render_queue_workspace(store: SoloReviewStore) -> None:
 
 
 def _render_recheck_workspace(store: SoloReviewStore) -> None:
-    controls = st.columns([0.20, 0.16, 0.16, 0.48])
+    controls = st.columns([0.18, 0.14, 0.18, 0.18, 0.32])
     proportion = controls[0].number_input("Recheck ratio", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
     seed = controls[1].number_input("Seed", min_value=0, value=7, step=1)
-    if controls[2].button("Create recheck queue", type="secondary"):
-        result = store.create_recheck_queue(float(proportion), seed=int(seed))
+    max_samples = int(controls[2].number_input("Maximum samples", min_value=0, value=0, step=1, help="0 means no additional cap."))
+    if controls[3].button("Create recheck queue", type="secondary"):
+        result = store.create_recheck_queue(
+            float(proportion), seed=int(seed), max_samples=max_samples or None,
+        )
         st.success(f"Selected {result['selected']} samples")
         st.rerun()
     items = store.list_recheck_items()
-    controls[3].metric("Pending rechecks", len(items))
+    controls[4].metric("Pending rechecks", len(items))
     if not items:
         st.info("No pending delayed rechecks.")
         return
-    selected = st.selectbox("Recheck sample", [str(item["sample_id"]) for item in items], key="solo_recheck_sample")
-    _render_item(store, next(item for item in items if item["sample_id"] == selected), recheck=True)
+    mode = st.segmented_control("Recheck mode", ["Batch recheck", "Single recheck"], default="Batch recheck", key="recheck_mode")
+    if mode == "Single recheck":
+        selected = st.selectbox("Recheck sample", [str(item["sample_id"]) for item in items], key="solo_recheck_sample")
+        _render_item(store, next(item for item in items if item["sample_id"] == selected), recheck=True)
+        return
+    displayed = items[:32]
+    checkbox_keys = {str(item["sample_id"]): f"recheck_batch_pick_{item['sample_id']}" for item in displayed}
+    selection_controls = st.columns([0.20, 0.20, 0.60])
+    if selection_controls[0].button("Select displayed", key="select_recheck_batch"):
+        for key in checkbox_keys.values():
+            st.session_state[key] = True
+    if selection_controls[1].button("Clear selection", key="clear_recheck_batch"):
+        for key in checkbox_keys.values():
+            st.session_state[key] = False
+    selected_ids = _render_batch_thumbnails(store, displayed, checkbox_keys)
+    selection_controls[2].metric("Selected rechecks", len(selected_ids))
+    with st.form("batch_recheck_form", border=True):
+        action = st.columns([0.30, 0.30, 0.40])
+        action[0].selectbox("Apply recheck class", REGION_TYPES, key="batch_recheck_target")
+        action[1].text_input("Recheck notes", key="batch_recheck_notes")
+        action[2].warning(f"This independently rechecks {len(selected_ids)} selected sample(s).")
+        st.form_submit_button(
+            "Save batch recheck", type="primary", disabled=not selected_ids,
+            on_click=_save_batch_recheck,
+            args=(store, selected_ids, "batch_recheck_target", "batch_recheck_notes", checkbox_keys),
+        )
 
 
 def _render_batch_workspace(store: SoloReviewStore) -> None:
     st.subheader("Batch visual classification")
-    st.caption("Filter and inspect one thumbnail page, select samples, then apply one visual class to the selection.")
-    summaries = store.list_item_summaries(scope="pending_human_review", include_reviewed=False)
+    st.caption("Filter and inspect one thumbnail page, including machine rejections, then apply one visual class to the selection.")
+    source_label = st.selectbox(
+        "Batch source", ["Machine-routed visual", "Machine rejected"], key="batch_source",
+    )
+    source_scope = "pending_human_review" if source_label == "Machine-routed visual" else "machine_rejected"
+    summaries = store.list_item_summaries(scope=source_scope, include_reviewed=False)
     if not summaries:
-        st.info("No samples are waiting for visual review.")
+        st.info(f"No unreviewed samples in {source_label}.")
         return
     categories = sorted({row["category"] for row in summaries})
     filters = st.columns([0.34, 0.22, 0.22, 0.22])
@@ -125,8 +162,8 @@ def _render_batch_workspace(store: SoloReviewStore) -> None:
     filters[3].metric("Matching", len(filtered))
     displayed = filtered[(page_number - 1) * page_size:page_number * page_size]
     displayed_ids = [row["sample_id"] for row in displayed]
-    page_key = f"{category}_{page_size}_{page_number}"
-    checkbox_keys = {sample_id: f"batch_pick_{sample_id}" for sample_id in displayed_ids}
+    page_key = f"{source_scope}_{category}_{page_size}_{page_number}"
+    checkbox_keys = {sample_id: f"batch_pick_{source_scope}_{sample_id}" for sample_id in displayed_ids}
     selection_controls = st.columns([0.20, 0.20, 0.60])
     if selection_controls[0].button("Select displayed", key=f"select_batch_page_{page_key}"):
         for key in checkbox_keys.values():
@@ -228,6 +265,30 @@ def _save_batch_review(
         for key in checkbox_keys.values():
             st.session_state[key] = False
         st.session_state["solo_review_notice"] = f"Batch classified {result['reviewed_count']} samples as {region_type}."
+        st.session_state.pop("solo_review_error", None)
+    except Exception as exc:
+        st.session_state["solo_review_error"] = str(exc)
+
+
+def _save_batch_recheck(
+    store: SoloReviewStore,
+    selected_ids: list[str],
+    target_key: str,
+    notes_key: str,
+    checkbox_keys: dict[str, str],
+) -> None:
+    """Persist one independent delayed-review class for selected images."""
+    try:
+        region_type = str(st.session_state[target_key])
+        result = store.submit_recheck_batch(
+            selected_ids,
+            visual_review_status=BATCH_CLASS_TO_VISUAL_STATUS[region_type],
+            region_type=region_type,
+            review_notes=str(st.session_state.get(notes_key) or ""),
+        )
+        for key in checkbox_keys.values():
+            st.session_state[key] = False
+        st.session_state["solo_review_notice"] = f"Batch rechecked {result['reviewed_count']} samples as {region_type}."
         st.session_state.pop("solo_review_error", None)
     except Exception as exc:
         st.session_state["solo_review_error"] = str(exc)

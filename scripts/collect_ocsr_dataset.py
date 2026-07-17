@@ -29,6 +29,7 @@ def _pipeline(args: argparse.Namespace) -> DatasetPipeline:
         max_downloads=args.max_downloads,
         dry_run=bool(args.dry_run),
         resume=bool(args.resume),
+        screening_config=args.screening_config,
     )
 
 
@@ -40,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-interval", type=float, default=0.34)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--screening-config", choices=["baseline", "candidate"], default="baseline")
     parser.add_argument("--resume", dest="resume", action="store_true", default=True, help="Skip source tasks marked completed in collection_state.json.")
     parser.add_argument("--no-resume", dest="resume", action="store_false", help="Ignore completion state for this run.")
     subparsers = parser.add_subparsers(dest="command", required=True)
