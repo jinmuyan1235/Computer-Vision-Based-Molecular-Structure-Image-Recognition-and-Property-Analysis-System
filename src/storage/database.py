@@ -9,7 +9,7 @@ from typing import Callable
 import config
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 Migration = Callable[[sqlite3.Connection], None]
 
 
@@ -120,6 +120,13 @@ def _migrate_v2(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX IF NOT EXISTS idx_analyses_delete_status ON analyses(delete_status)")
 
 
+def _migrate_v3(connection: sqlite3.Connection) -> None:
+    """Persist the complete model-candidate audit alongside the searchable index."""
+    columns = _column_names(connection, "analyses")
+    if "recognition_audit" not in columns:
+        connection.execute("ALTER TABLE analyses ADD COLUMN recognition_audit TEXT NOT NULL DEFAULT '{}'")
+
+
 def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -127,4 +134,5 @@ def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
 MIGRATIONS: dict[int, Migration] = {
     1: _migrate_v1,
     2: _migrate_v2,
+    3: _migrate_v3,
 }

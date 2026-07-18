@@ -24,6 +24,8 @@ from src.analysis.correction import (
     sha256_file,
 )
 from src.ocsr.base import OCSRResult
+from src.ocsr.ensemble import candidate_from_result
+from src.ocsr.production_routing import build_recognition_audit, route_model_candidates
 from src.ocsr.recognizer import MoleculeRecognizer
 from src.ml.admet_baseline import ConfiguredADMETPredictor
 from src.preprocess.image_preprocessor import ImagePreprocessor
@@ -74,6 +76,8 @@ class MoleculeReportGenerator:
             },
             "image_quality": None,
             "recognition_decision": None,
+            "production_routing": None,
+            "recognition_audit": None,
         }
 
     def generate(
@@ -117,15 +121,59 @@ class MoleculeReportGenerator:
             report["image_quality"],
         )
         result = recognition.result
+        routing_candidates = [candidate_from_result(result)]
+        if self.backend == "decimer" and not routing_candidates[0].get("valid"):
+            try:
+                fallback_recognizer = MoleculeRecognizer("molscribe")
+                fallback_recognition = recognize_with_fallback_strategies(
+                    fallback_recognizer,
+                    path,
+                    stages,
+                    stage_paths,
+                    report["image_quality"],
+                )
+                routing_candidates.append(candidate_from_result(fallback_recognition.result))
+            except Exception as exc:
+                routing_candidates.append(candidate_from_result(OCSRResult(
+                    smiles=None,
+                    confidence=None,
+                    backend="molscribe",
+                    status="failed",
+                    message=f"fallback unavailable: {type(exc).__name__}",
+                    result_origin="production_fallback",
+                )))
         ocsr_block = result.to_dict()
         ocsr_block.update(recognition.report_fields())
+        if len(routing_candidates) > 1:
+            ocsr_block["candidates"] = routing_candidates
         report["ocsr"] = normalize_ocsr_block(ocsr_block)
-        if result.status != "success" or not result.smiles:
+        if result.backend == "demo":
+            if result.status != "success" or not result.smiles:
+                report["message"] = result.message
+                report["validation"]["error"] = "demo_backend_failed"
+                return apply_recognition_decision(report)
+            return apply_recognition_decision(
+                self._complete_chemistry(report, result.smiles, prefix, final_source="ocsr")
+            )
+        route = route_model_candidates(list(result.candidates or routing_candidates))
+        report["production_routing"] = route
+        report["recognition_audit"] = build_recognition_audit(route)
+        if route["decision"] == "recognition_failed":
             report["message"] = result.message
             report["validation"]["error"] = "未获得可校验的 SMILES。"
             return apply_recognition_decision(report)
-        final_source = "ensemble_recommendation" if result.backend == "ensemble" else "ocsr"
-        return apply_recognition_decision(self._complete_chemistry(report, result.smiles, prefix, final_source=final_source))
+        if not route["property_analysis_allowed"]:
+            report["message"] = "A model candidate was produced but requires review before property analysis."
+            report["validation"]["error"] = "unverified_model_candidate"
+            return apply_recognition_decision(report)
+        return apply_recognition_decision(
+            self._complete_chemistry(
+                report,
+                str(route["selected_smiles"]),
+                prefix,
+                final_source="primary_model_candidate",
+            )
+        )
 
     def _from_smiles(self, smiles: str, analysis_id: str | None = None) -> dict[str, Any]:
         report = self._base_report({"type": "smiles", "smiles": smiles}, analysis_id=analysis_id)
@@ -177,7 +225,7 @@ class MoleculeReportGenerator:
             report["lipinski"] = lipinski
             report["admet"] = self.admet_predictor.predict(analysis_smiles)
             report["images"]["redrawn_molecule"] = draw_molecule(analysis_smiles, drawing_path)
-            if final_source in {"ocsr", "ensemble_recommendation"}:
+            if final_source in {"ocsr", "ensemble_recommendation", "primary_model_candidate"}:
                 report["images"]["predicted_molecule"] = report["images"]["redrawn_molecule"]
             report["final"] = {
                 "smiles": analysis_smiles,

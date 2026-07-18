@@ -59,13 +59,13 @@ class AnalysisRepository:
                     analysis_id, created_at, updated_at, input_type, filename, input_path,
                     image_sha256, backend, decision, status, final_smiles, inchikey,
                     report_path, is_favorite, delete_status, delete_errors, delete_requested_at,
-                    delete_updated_at
+                    delete_updated_at, recognition_audit
                 )
                 VALUES (
                     :analysis_id, :created_at, :updated_at, :input_type, :filename, :input_path,
                     :image_sha256, :backend, :decision, :status, :final_smiles, :inchikey,
                     :report_path, :is_favorite, :delete_status, :delete_errors, :delete_requested_at,
-                    :delete_updated_at
+                    :delete_updated_at, :recognition_audit
                 )
                 ON CONFLICT(analysis_id) DO UPDATE SET
                     updated_at = excluded.updated_at,
@@ -83,7 +83,8 @@ class AnalysisRepository:
                     delete_status = excluded.delete_status,
                     delete_errors = excluded.delete_errors,
                     delete_requested_at = excluded.delete_requested_at,
-                    delete_updated_at = excluded.delete_updated_at
+                    delete_updated_at = excluded.delete_updated_at,
+                    recognition_audit = excluded.recognition_audit
                 """,
                 record,
             )
@@ -388,6 +389,7 @@ def analysis_record_from_report(report: Mapping[str, Any], report_path: str | Pa
     decision = _block(report, "recognition_decision")
     identity = _block(report, "chemical_identity")
     validation = _block(report, "validation")
+    recognition_audit = _block(report, "recognition_audit")
     analysis_id = str(report.get("analysis_id") or uuid4().hex)
     created = str(report.get("created_at") or utc_now())
     path = report_path or _report_path_from_report(report)
@@ -410,6 +412,7 @@ def analysis_record_from_report(report: Mapping[str, Any], report_path: str | Pa
         "delete_errors": "",
         "delete_requested_at": None,
         "delete_updated_at": None,
+        "recognition_audit": json.dumps(dict(recognition_audit), ensure_ascii=False, default=str),
     }
 
 

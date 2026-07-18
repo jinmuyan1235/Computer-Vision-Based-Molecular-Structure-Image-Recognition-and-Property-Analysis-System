@@ -22,6 +22,7 @@ from src.export.pdf_exporter import save_pdf
 from src.export.structure_exporter import copyable_structure_fields, export_structure_files
 from src.runtime.run_store import mark_run_protected_from_report, report_output_dir, save_report_for_existing_run
 from src.storage.analysis_repository import AnalysisRepository, record_report
+from src.ui.model_capability_view import capability_panel_data, model_result_status
 from src.ui.image_viewer import show_preprocess_thumbnail, show_structure
 from src.ui.labels import backend_label, status_label
 from src.ui.records import render_records
@@ -341,6 +342,47 @@ def show_structure_exports(report: dict[str, Any], key_prefix: str) -> None:
             )
 
 
+def show_model_trust_and_capabilities(report: dict[str, Any]) -> None:
+    """Show execution, parsing, and verification as separate production states."""
+    if not report.get("production_routing"):
+        return
+    status = model_result_status(report)
+    st.subheader(status["candidate_role"])
+    if status["candidate_smiles"]:
+        st.code(status["candidate_smiles"], language=None)
+    states = st.columns(3)
+    states[0].metric("Backend execution succeeded", "Yes" if status["backend_execution_succeeded"] else "No")
+    states[1].metric("Valid SMILES produced", "Yes" if status["valid_smiles_produced"] else "No")
+    states[2].metric("Structure verified", "Yes" if status["structure_verified"] else "No")
+    st.warning(status["prediction_notice"])
+    if status["requires_review"]:
+        st.warning("Requires review")
+    if status["agreement_status"] == "agreement":
+        st.info("Model agreement was recorded, but it does not increase the verification level.")
+    if status["risk_flags"]:
+        st.error("High-risk structure flags: " + ", ".join(status["risk_flags"]))
+
+    capabilities = capability_panel_data()
+    with st.expander("模型能力与限制 / Model capabilities and limitations", expanded=False):
+        defaults = capabilities["production_defaults"]
+        st.write(
+            f"Current model: DECIMER primary (profile={defaults['decimer_profile']}); "
+            "MolScribe fallback candidate; Experimental ensemble disabled by default."
+        )
+        st.write(f"Dataset: {capabilities['dataset']} ({capabilities['dataset_role']})")
+        for name in ("decimer", "molscribe"):
+            model = capabilities["models"][name]
+            st.write(
+                f"{name.upper()}: connectivity={model['connectivity_exact']:.4f}, "
+                f"full InChIKey={model['full_inchikey_exact']:.4f}, "
+                f"canonical={model['canonical_exact']:.4f}, parse={model['parse_rate']:.4f}; "
+                f"fine tuning={model['fine_tuning_status']}."
+            )
+        st.warning(capabilities["style_notice"])
+        st.warning("Reliable local fine-tuning is not currently supported in this project environment.")
+        st.warning(capabilities["scope_notice"])
+
+
 def _render_result_message(report: dict[str, Any], ocsr: dict[str, Any]) -> None:
     st.success(report.get("message", "分析完成。"))
     if ocsr.get("backend") == "demo":
@@ -539,8 +581,10 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
     """Render a molecule analysis report in Streamlit."""
     if report.get("status") != "success":
         ocsr = report.get("ocsr") or {}
+        show_model_trust_and_capabilities(report)
         consensus = ocsr.get("consensus") or {}
-        if consensus.get("decision") == "review_needed":
+        routing = report.get("production_routing") or {}
+        if consensus.get("decision") == "review_needed" or routing.get("review_required"):
             st.warning(report.get("message", "多个后端结果不一致，需要人工确认。"))
         else:
             st.error(report.get("message", "分析失败。"))
@@ -555,6 +599,7 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
         return
 
     ocsr = report.get("ocsr") or {}
+    show_model_trust_and_capabilities(report)
     correction = report.get("correction") or {}
     final = report.get("final") or {}
     validation = report.get("validation") or {}
