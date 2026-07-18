@@ -1089,4 +1089,38 @@ python scripts/compare_trusted_ocsr_runs.py
 
 Only the fixed `test` split is used for formal results. It must not be used to tune model settings or ensemble rules. PubChem/RDKit clean depictions and deterministic perturbations are not substitutes for real paper crops, so these results cannot be presented as PMC-paper accuracy.
 
+### Trusted OCSR input-domain validation
+
+Failure diagnostics and preprocessing selection default to `train`/`dev`; reading the frozen v0.1 test requires an explicit flag and is prohibited for profile/router selection:
+
+```bash
+python scripts/run_trusted_ocsr_preprocessing_experiment.py \
+  --manifest data/datasets/ocsr-trusted-v0.1/manifest.csv \
+  --splits dev --execute
+
+python scripts/analyze_trusted_ocsr_failures.py \
+  --manifest data/datasets/ocsr-trusted-v0.1/manifest.csv \
+  --evaluation-root data/evaluation/ocsr-trusted-v0.1 \
+  --output data/evaluation/ocsr-trusted-v0.1/diagnostics
+```
+
+The evaluator reports backend execution success separately from parseable/valid SMILES. A model-returned but unparsable string is `output_parse_failure`, not an inference or CUDA crash. Only retriable process, timeout, CUDA, dependency, or inference failures receive one isolated-worker retry. Overall exact-match metrics include every sample and remain the primary result; conditional metrics are supplementary.
+
+Input profiles (`raw`, `alpha_flatten`, `autocrop_and_pad`, `scale_normalized`, `contrast_normalized`, `line_enhanced`, and `combined_normalized`) are deterministic, ground-truth independent, versioned, and hashed. They never overwrite source images. The current ensemble remains a frozen baseline; model agreement is not treated as evidence of correctness.
+
+After `best_profiles.json` is selected and frozen using only development data, build the non-overlapping external holdout:
+
+```bash
+python scripts/build_trusted_ocsr_v2.py \
+  --reference-manifest data/datasets/ocsr-trusted-v0.1/manifest.csv \
+  --frozen-profiles data/evaluation/ocsr-trusted-v0.1/dev_preprocessing/best_profiles.json \
+  --output data/datasets/ocsr-trusted-v0.2
+
+python scripts/validate_trusted_ocsr_v2.py \
+  --dataset data/datasets/ocsr-trusted-v0.2 \
+  --reference data/datasets/ocsr-trusted-v0.1
+```
+
+`ocsr-trusted-v0.2` contains new PubChem identities only, uses the single `external_holdout` split, records one explicit perturbation type per CID, and refuses overwrite. Freeze it before any model prediction is viewed. Formal external evaluation output directories are also write-once. Neither trusted benchmark estimates performance on real PMC crops, Markush structures, handwritten chemistry, dense schemes, or scan artifacts not represented by the declared perturbations.
+
 When the MolScribe and DECIMER prediction files already exist beside the ensemble output directory, the ensemble command replays the frozen agreement/abstention rule over those exact outputs. This avoids duplicate GPU inference and does not tune the rule.

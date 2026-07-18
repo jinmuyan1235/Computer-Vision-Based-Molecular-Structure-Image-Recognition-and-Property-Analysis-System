@@ -412,6 +412,8 @@ class DECIMERAdapter(BaseOCSRAdapter):
         message: str,
         inference_time_ms: float | None,
         raw_output: str | None = None,
+        failure_category: str | None = None,
+        exception: BaseException | None = None,
     ) -> OCSRResult:
         return OCSRResult(
             smiles=smiles,
@@ -428,6 +430,9 @@ class DECIMERAdapter(BaseOCSRAdapter):
             dependency_versions=dependency_versions(),
             result_origin="real_model",
             raw_output=raw_output,
+            failure_category=failure_category,
+            exception_type=type(exception).__name__ if exception else None,
+            exception_summary=str(exception) if exception else None,
         )
 
     def _path_for_subprocess(self, image_path_or_array: Any) -> tuple[str, Path | None]:
@@ -490,10 +495,16 @@ class DECIMERAdapter(BaseOCSRAdapter):
         elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
         self.last_inference_time_ms = elapsed_ms
         if completed.timed_out:
-            return self._result(None, None, "failed", f"DECIMER 隔离子进程超过 {max(self.timeout_seconds + 90, 180):.1f} 秒超时。", elapsed_ms)
+            return self._result(
+                None, None, "failed", f"DECIMER 隔离子进程超过 {max(self.timeout_seconds + 90, 180):.1f} 秒超时。",
+                elapsed_ms, failure_category="timeout",
+            )
         if completed.returncode != 0 or completed.payload is None:
             message = completed.last_output_line() or f"子进程退出码 {completed.returncode}"
-            return self._result(None, None, "failed", f"DECIMER 隔离子进程失败：{message}", elapsed_ms)
+            return self._result(
+                None, None, "failed", f"DECIMER 隔离子进程失败：{message}",
+                elapsed_ms, failure_category="subprocess_failure",
+            )
         data = completed.payload
         result = OCSRResult(**{key: data.get(key) for key in OCSRResult.__dataclass_fields__})
         result.inference_time_ms = elapsed_ms
@@ -527,6 +538,7 @@ class DECIMERAdapter(BaseOCSRAdapter):
                         "模型返回的结构字符串异常过长，已拒绝作为有效 SMILES。",
                         elapsed_ms,
                         raw_output=raw_output[: self.max_smiles_length],
+                        failure_category="output_parse_failure",
                     )
                 validation = validate_smiles(raw_output)
                 if not validation["valid"]:
@@ -537,6 +549,7 @@ class DECIMERAdapter(BaseOCSRAdapter):
                         "模型返回了无法解析的结构字符串，请调整区域或使用人工修正。",
                         elapsed_ms,
                         raw_output=raw_output,
+                        failure_category="output_parse_failure",
                     )
                 return self._result(raw_output, confidence, "success", "DECIMER 识别完成。", elapsed_ms, raw_output=raw_output)
             if not smiles:
@@ -545,11 +558,20 @@ class DECIMERAdapter(BaseOCSRAdapter):
         except DECIMERAdapterError as exc:
             elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
             self.last_inference_time_ms = elapsed_ms
-            return self._result(None, None, "failed", str(exc), elapsed_ms)
+            text = str(exc).lower()
+            category = "timeout" if "timeout" in text else (
+                "dependency_failure" if isinstance(exc, (DECIMERDependencyError, DECIMERInitializationError))
+                else "input_preprocessing_failure" if isinstance(exc, DECIMERConfigurationError)
+                else "model_inference_failure"
+            )
+            return self._result(None, None, "failed", str(exc), elapsed_ms, failure_category=category, exception=exc)
         except Exception as exc:
             elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
             self.last_inference_time_ms = elapsed_ms
-            return self._result(None, None, "failed", f"DECIMER 推理失败：{exc}", elapsed_ms)
+            return self._result(
+                None, None, "failed", f"DECIMER 推理失败：{exc}", elapsed_ms,
+                failure_category="model_inference_failure", exception=exc,
+            )
 
     @property
     def is_available(self) -> bool:

@@ -32,6 +32,12 @@ class OCSRResult:
     risk_level: Literal["low", "medium", "high"] | None = None
     manual_review_recommended: bool | None = None
     raw_output: str | None = None
+    failure_category: str | None = None
+    exception_type: str | None = None
+    exception_summary: str | None = None
+    attempt_count: int = 1
+    first_attempt: dict[str, Any] | None = None
+    retry_attempt: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert this result to a JSON-serializable dictionary."""
