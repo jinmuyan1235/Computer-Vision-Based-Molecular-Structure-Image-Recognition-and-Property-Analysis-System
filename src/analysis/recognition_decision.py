@@ -61,6 +61,20 @@ def decide_recognition(report: dict[str, Any]) -> dict[str, Any]:
             "手动 SMILES 输入由用户负责，不作为图像识别结果评估。",
         )
 
+    routing = report.get("production_routing") or {}
+    if routing:
+        reasons = list(routing.get("reason_codes") or [])
+        if routing.get("decision") == "recognition_failed":
+            return _decision_payload(
+                "rejected", "high", reasons, True, None, None,
+                "Recognition failed: neither model produced a parseable candidate.",
+            )
+        if routing.get("review_required") or routing.get("decision") == "fallback_candidate":
+            return _decision_payload(
+                "review_needed", "high", reasons, True, None, None,
+                "The model candidate requires review and is not verified ground truth.",
+            )
+
     ocsr = report.get("ocsr") or {}
     validation = report.get("validation") or {}
     image_quality = report.get("image_quality") or {}
@@ -189,6 +203,16 @@ def _decision_from_consensus(
     status = str(consensus.get("status") or "")
     reasons = list(quality_reasons)
     reasons.extend([str(item) for item in consensus.get("reason_codes") or []])
+    if decision in {"accepted", "accepted_with_warning"} and status == "agreement":
+        return _decision_payload(
+            "accepted_with_warning",
+            "medium",
+            sorted(set(reasons + ["multi_backend_agreement", "agreement_not_ground_truth"])),
+            True,
+            calibrated_confidence,
+            quality_score,
+            "Model agreement is recorded, but it is not verified ground truth.",
+        )
     if quality_score is not None and quality_score < config.DECISION_MIN_IMAGE_QUALITY:
         return _decision_payload(
             "review_needed",
@@ -198,16 +222,6 @@ def _decision_from_consensus(
             calibrated_confidence,
             quality_score,
             "即使候选可解析，图片质量不足，仍需人工确认。",
-        )
-    if decision == "accepted" and status == "agreement":
-        return _decision_payload(
-            "accepted",
-            "low",
-            sorted(set(reasons + ["multi_backend_agreement"])),
-            False,
-            calibrated_confidence,
-            quality_score,
-            "多个真实后端返回同一标准化分子，可低风险接受。",
         )
     if decision == "accepted_with_warning" and config.DECISION_REQUIRE_CALIBRATED_CONFIDENCE:
         return _decision_payload(

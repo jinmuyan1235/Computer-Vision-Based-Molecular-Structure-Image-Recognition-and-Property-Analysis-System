@@ -44,7 +44,7 @@ def test_uncalibrated_single_model_requires_review_when_configured(monkeypatch) 
     assert "calibrated_confidence_missing" in decision["reason_codes"]
 
 
-def test_multi_backend_agreement_can_be_accepted() -> None:
+def test_multi_backend_agreement_is_not_automatic_verification() -> None:
     report = _base_report()
     report["ocsr"] = {
         "backend": "ensemble",
@@ -54,9 +54,10 @@ def test_multi_backend_agreement_can_be_accepted() -> None:
         "consensus": {"status": "agreement", "decision": "accepted", "reason_codes": ["multi_backend_agreement"]},
     }
     decision = decide_recognition(report)
-    assert decision["decision"] == "accepted"
-    assert decision["risk_level"] == "low"
-    assert decision["manual_review_recommended"] is False
+    assert decision["decision"] == "accepted_with_warning"
+    assert decision["risk_level"] == "medium"
+    assert decision["manual_review_recommended"] is True
+    assert "agreement_not_ground_truth" in decision["reason_codes"]
 
 
 def test_single_valid_ensemble_candidate_requires_review_when_configured(monkeypatch) -> None:

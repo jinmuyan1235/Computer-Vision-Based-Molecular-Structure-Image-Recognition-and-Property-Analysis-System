@@ -61,8 +61,10 @@ def test_ensemble_agreement_for_same_canonical_smiles() -> None:
     assert result.status == "success"
     assert result.smiles == "CCO"
     assert result.consensus["status"] == "agreement"
-    assert result.consensus["decision"] == "accepted"
+    assert result.consensus["decision"] == "accepted_with_warning"
     assert result.consensus["recommended_backend"] == "consensus"
+    assert result.consensus["manual_review_recommended"] is True
+    assert "agreement_not_ground_truth" in result.consensus["reason_codes"]
     assert {candidate["backend"] for candidate in result.candidates} == {"molscribe", "decimer"}
     assert result.similarity_analysis[0]["canonical_smiles_equal"] is True
 

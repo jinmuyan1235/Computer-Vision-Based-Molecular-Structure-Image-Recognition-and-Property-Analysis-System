@@ -177,7 +177,11 @@ def load_settings() -> Settings:
         run_retention_days=_env_int("RUN_RETENTION_DAYS", 30, minimum=1),
         run_max_storage_gb=_env_float("RUN_MAX_STORAGE_GB", 10.0, minimum=0.1),
         default_image_size=(512, 512),
-        ocsr_backend=_choice(_env_lower("OCSR_BACKEND", "demo"), {"demo", "molscribe", "decimer", "ensemble"}, "demo"),  # type: ignore[arg-type]
+        ocsr_backend=_choice(
+            _env_lower("OCSR_BACKEND", "decimer" if app_mode == "production" else "demo"),
+            {"demo", "molscribe", "decimer", "ensemble"},
+            "decimer" if app_mode == "production" else "demo",
+        ),  # type: ignore[arg-type]
         ocsr_device=_env_lower("OCSR_DEVICE", "auto"),
         ocsr_timeout_seconds=_env_float("OCSR_TIMEOUT_SECONDS", 120.0, minimum=0.0),
         ocsr_use_preprocessed_image=_env_bool("OCSR_USE_PREPROCESSED_IMAGE", False),
@@ -200,8 +204,8 @@ def load_settings() -> Settings:
         decimer_model_version=_env_text("DECIMER_MODEL_VERSION", "") or None,
         decimer_strict_mode=_env_bool("DECIMER_STRICT_MODE", _env_bool("OCSR_STRICT_MODE", False)),
         decimer_isolated_subprocess=_env_bool("DECIMER_ISOLATED_SUBPROCESS", True),
-        ocsr_ensemble_backends=_csv_tuple("OCSR_ENSEMBLE_BACKENDS", "molscribe,decimer"),
-        ocsr_ensemble_backend_priority=_csv_tuple("OCSR_ENSEMBLE_BACKEND_PRIORITY", "molscribe,decimer"),
+        ocsr_ensemble_backends=_csv_tuple("OCSR_ENSEMBLE_BACKENDS", "decimer,molscribe"),
+        ocsr_ensemble_backend_priority=_csv_tuple("OCSR_ENSEMBLE_BACKEND_PRIORITY", "decimer,molscribe"),
         ocsr_ensemble_parallel=_env_bool("OCSR_ENSEMBLE_PARALLEL", False),
         ocsr_ensemble_continue_on_error=_env_bool("OCSR_ENSEMBLE_CONTINUE_ON_ERROR", True),
         ocsr_ensemble_total_timeout_seconds=_env_float("OCSR_ENSEMBLE_TOTAL_TIMEOUT_SECONDS", _env_float("OCSR_TIMEOUT_SECONDS", 240.0, minimum=0.0), minimum=0.0),

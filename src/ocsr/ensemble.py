@@ -235,13 +235,14 @@ def rank_candidates(
         representative = sorted(group, key=lambda candidate: _priority_index(str(candidate.get("backend")), priority))[0]
         return {
             "status": "agreement",
-            "decision": "accepted",
-            "risk_level": "low",
-            "reason_codes": ["multi_backend_agreement"],
-            "manual_review_recommended": False,
+            "decision": "accepted_with_warning",
+            "risk_level": "medium",
+            "reason_codes": ["multi_backend_agreement", "agreement_not_ground_truth"],
+            "manual_review_recommended": True,
             "recommended_smiles": representative.get("canonical_smiles"),
             "recommended_backend": "consensus",
             "supporting_backends": [candidate.get("backend") for candidate in group],
+            "warning": "Model agreement is not verified ground truth and does not raise the trust level.",
             "reason": "多个后端生成相同标准化分子。",
             "confidence_policy": "未比较跨模型 confidence；一致性来自 RDKit 标准化/InChIKey。",
         }
