@@ -18,7 +18,10 @@ import config
 from src.analysis.batch_analyzer import flatten_report
 from src.analysis.molecule_report import MoleculeReportGenerator
 from src.documents.detectors import BaseMoleculeRegionDetector, HeuristicMoleculeRegionDetector, HybridMoleculeRegionDetector
-from src.documents.candidate_screening import CandidateScreeningConfig, get_screening_config, screen_region_candidate
+from src.documents.candidate_screening import (
+    CandidateProposalConfig, CandidateScreeningConfig, CropScreeningConfig,
+    get_crop_screening_config, get_proposal_config, screen_region_candidate,
+)
 from src.documents.input_loader import DocumentInputLoader
 from src.documents.models import DocumentPage, DocumentRegion, normalize_bbox, relative_path
 from src.documents.region_editing import apply_region_edits, is_region_confirmed, summarize_regions
@@ -43,13 +46,28 @@ class DocumentOCSRProcessor:
         loader: DocumentInputLoader | None = None,
         runtime_config: dict[str, Any] | None = None,
         review_output_dir: str | Path | None = None,
-        screening_config: str | CandidateScreeningConfig = "baseline",
+        proposal_config: str | CandidateProposalConfig = "baseline",
+        crop_screening_config: str | CropScreeningConfig = "candidate",
+        screening_config: str | CandidateScreeningConfig | None = None,
     ) -> None:
         self.output_dir = ensure_directory(output_dir)
         self.backend = backend
-        self.screening_config = get_screening_config(screening_config)
+        if screening_config is not None:
+            import warnings
+            warnings.warn(
+                "screening_config is deprecated; use proposal_config and crop_screening_config",
+                DeprecationWarning, stacklevel=2,
+            )
+            legacy_name = screening_config.name if isinstance(screening_config, CandidateScreeningConfig) else screening_config
+            proposal_config = legacy_name
+            crop_screening_config = legacy_name
+        self.proposal_config = get_proposal_config(proposal_config)
+        self.crop_screening_config = get_crop_screening_config(crop_screening_config)
         self.detector = detector or HybridMoleculeRegionDetector(
-            fallback=HeuristicMoleculeRegionDetector(screening_config=self.screening_config),
+            fallback=HeuristicMoleculeRegionDetector(
+                proposal_config=self.proposal_config,
+                crop_screening_config=self.crop_screening_config,
+            ),
         )
         self.loader = loader or DocumentInputLoader(self.output_dir)
         self.report_generator = MoleculeReportGenerator(
@@ -396,10 +414,11 @@ class DocumentOCSRProcessor:
             bbox,
             region.region_type,
             region.detection_confidence,
-            config=self.screening_config,
+            config=self.crop_screening_config,
         )
         payload = result.to_dict()
-        payload["passed"] = result.molecule_candidate
+        payload["passed"] = result.decision == "accept_molecule"
+        payload["requires_review"] = result.decision == "review_needed"
         if "too_small" in result.reason_codes:
             payload["reason"] = "区域尺寸过小，已跳过识别。"
         elif "text_like" in result.reason_codes:
@@ -407,7 +426,7 @@ class DocumentOCSRProcessor:
         else:
             payload["reason"] = ", ".join(result.reason_codes)
         payload.update(result.diagnostics)
-        return result.molecule_candidate, payload
+        return result.decision == "accept_molecule", payload
 
     def _heuristic_detector(self) -> HeuristicMoleculeRegionDetector | None:
         if isinstance(self.detector, HeuristicMoleculeRegionDetector):

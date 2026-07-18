@@ -135,6 +135,25 @@ def test_negative_candidate_records_not_applicable_predictions_without_model_cal
     assert [item["status"] for item in predictions] == ["not_applicable"] * 3
 
 
+def test_review_needed_is_queued_without_running_ocsr(tmp_path: Path, monkeypatch) -> None:
+    image = tmp_path / "mixed.png"
+    image.write_bytes(_png_bytes())
+    pipeline = DatasetPipeline(tmp_path, recognizer_factory=FakeRecognizer)
+    monkeypatch.setattr(pipeline, "_queue_for_existing_review", lambda row, predictions: "visual-review.json")
+    monkeypatch.setattr(
+        pipeline, "_predict_all",
+        lambda _: (_ for _ in ()).throw(AssertionError("review_needed must not invoke OCSR")),
+    )
+    pipeline.add_candidate(
+        image, _source(), category="uncertain_visual", source_document="doc-1",
+        screening_decision="review_needed", screening_config_version="crop-screening-candidate-v1",
+    )
+    row = next(csv.DictReader(pipeline.pending_manifest.open(encoding="utf-8")))
+    assert row["expected_action"] == "review"
+    assert row["queue_annotation_path"] == "visual-review.json"
+    assert json.loads(row["candidate_predictions"])[0]["status"] == "not_applicable"
+
+
 def test_positive_candidate_builds_ensemble_from_existing_backend_results(tmp_path: Path) -> None:
     image = tmp_path / "molecule.png"
     image.write_bytes(_png_bytes())

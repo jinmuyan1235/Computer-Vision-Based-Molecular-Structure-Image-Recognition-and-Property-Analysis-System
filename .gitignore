@@ -27,6 +27,7 @@ data/review/
 data/review_holdout/
 data/datasets/
 data/evaluation/
+data/page_annotations/
 data/runs/
 document_runs/
 data/feedback/

@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import warnings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -23,13 +24,24 @@ def _pipeline(args: argparse.Namespace) -> DatasetPipeline:
         request_interval=args.request_interval,
         retries=args.retries,
     )
+    proposal_config = args.proposal_config
+    crop_screening_config = args.crop_screening_config
+    if args.screening_config:
+        warnings.warn(
+            "--screening-config is deprecated; use --proposal-config and --crop-screening-config",
+            FutureWarning,
+            stacklevel=2,
+        )
+        proposal_config = args.screening_config
+        crop_screening_config = args.screening_config
     return DatasetPipeline(
         root,
         client=client,
         max_downloads=args.max_downloads,
         dry_run=bool(args.dry_run),
         resume=bool(args.resume),
-        screening_config=args.screening_config,
+        proposal_config=proposal_config,
+        crop_screening_config=crop_screening_config,
     )
 
 
@@ -41,7 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-interval", type=float, default=0.34)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--screening-config", choices=["baseline", "candidate"], default="baseline")
+    parser.add_argument("--proposal-config", choices=["baseline", "candidate"], default="baseline")
+    parser.add_argument("--crop-screening-config", choices=["baseline", "candidate"], default="candidate")
+    parser.add_argument(
+        "--screening-config", choices=["baseline", "candidate"], default=None,
+        help="Deprecated compatibility option that sets both new configuration axes.",
+    )
     parser.add_argument("--resume", dest="resume", action="store_true", default=True, help="Skip source tasks marked completed in collection_state.json.")
     parser.add_argument("--no-resume", dest="resume", action="store_false", help="Ignore completion state for this run.")
     subparsers = parser.add_subparsers(dest="command", required=True)

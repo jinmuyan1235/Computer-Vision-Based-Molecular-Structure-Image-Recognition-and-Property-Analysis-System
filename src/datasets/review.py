@@ -20,6 +20,7 @@ PENDING_FIELDS = (
     "source_kind", "source_id", "source_document", "source_url", "source_license", "attribution",
     "source_page_path", "page_width", "page_height",
     "canonical_smiles", "inchikey", "reference_smiles", "reference_inchikey", "bbox", "candidate_predictions",
+    "screening_decision", "screening_config_version",
     "duplicate_of", "review_status", "queue_annotation_path", "notes",
 )
 VERIFIED_FIELDS = (

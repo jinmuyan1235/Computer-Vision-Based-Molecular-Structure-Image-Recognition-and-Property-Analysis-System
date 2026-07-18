@@ -12,6 +12,7 @@ import streamlit as st
 
 import config
 from src.datasets.solo_review import REGION_TYPES, VISUAL_REVIEW_STATUSES, SoloReviewStore
+from src.ui.page_annotation_page import render_page_annotation_workspace
 
 
 BATCH_CLASS_TO_VISUAL_STATUS = {
@@ -43,11 +44,13 @@ def render_dataset_review_page() -> None:
         st.caption(f"Isolated dataset: {store.dataset_root} | review ledger: {store.review_root}")
     mode = st.segmented_control(
         "Review mode",
-        ["Queue", "Batch classify", "Delayed recheck"],
+        ["Queue", "Batch classify", "Delayed recheck", "Page annotation"],
         default="Queue",
         key="solo_review_mode",
     )
-    if mode == "Delayed recheck":
+    if mode == "Page annotation":
+        render_page_annotation_workspace()
+    elif mode == "Delayed recheck":
         _render_recheck_workspace(store)
     elif mode == "Batch classify":
         _render_batch_workspace(store)
