@@ -1021,7 +1021,8 @@ The annotation UI is mouse-driven; coordinates are never entered manually:
 1. Choose `绘制新框` and the region class, then drag a tight rectangle directly over the page image.
 2. Choose `调整/删除框` to move or resize a selected rectangle. Press Delete/Backspace to remove it; use Undo for a mistaken action.
 3. Draw one box for each separable molecule and exclude labels, arrows, conditions, and captions where possible.
-4. Enter the annotator name and choose `保存当前页并进入下一页`. Save pages with no targets as well.
+4. Drawing is buffered to avoid Streamlit reruns and canvas flicker. When the page is complete, click the leftmost `↓` toolbar icon once to synchronize the boxes.
+5. After the UI confirms synchronization, enter the annotator name and choose `保存已同步方框并进入下一页`. For a page with no visible single molecule, use `确认空页并进入下一页`.
 
 Keep baseline/candidate overlays hidden while creating truth. They are available only for a post-save quality check.
 

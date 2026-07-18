@@ -112,7 +112,8 @@ def render_page_annotation_workspace() -> None:
             "1. 选择 **绘制新框** 和类别，然后直接在图片上按住鼠标拖出矩形。  \n"
             "2. 选择 **调整/删除框**，点击已有框后可拖动、缩放；按 Delete 或 Backspace 删除。画错可点画布工具栏的撤销。  \n"
             "3. 每个可分开的分子画一个紧框，尽量排除编号、箭头、条件和图注。  \n"
-            "4. 填写标注人并点击 **保存当前页并进入下一页**。没有目标的页面也要保存。"
+            "4. 本页完成后，点击画布下方工具栏最左侧的 **↓ 同步按钮**；看到“已同步”后再保存。  \n"
+            "5. 填写标注人并点击 **保存已同步方框并进入下一页**。没有单分子的页面可直接点 **确认空页并进入下一页**。"
         )
     if pending_page := st.session_state.pop("page_annotation_next", None):
         st.session_state["page_annotation_selected"] = pending_page
@@ -123,6 +124,7 @@ def render_page_annotation_workspace() -> None:
     show_candidate = toggles[1].toggle("Show candidate boxes", value=False, key="page_show_candidate")
     toggles[2].caption("机器框仅用于保存后检查：红=baseline，蓝=candidate")
     draft_key = f"page_annotation_draft_{selected}"
+    sync_key = f"page_annotation_synced_{selected}"
     if draft_key not in st.session_state:
         st.session_state[draft_key] = [
             {"bbox": list(item["bbox"]), "class": item["class"]}
@@ -141,6 +143,7 @@ def render_page_annotation_workspace() -> None:
     )
     if controls[2].button("清空本页", key=f"page_clear_{selected}"):
         st.session_state[draft_key] = []
+        st.session_state[sync_key] = False
         st.session_state[f"page_canvas_revision_{selected}"] = st.session_state.get(
             f"page_canvas_revision_{selected}", 0,
         ) + 1
@@ -156,9 +159,10 @@ def render_page_annotation_workspace() -> None:
         "objects": [_canvas_object(item, scale) for item in draft],
     }
     color = CLASS_COLORS[active_class]
+    st.info("流畅标注模式：画框时页面不会刷新。本页完成后，只需点击画布下方最左侧的 ↓ 按钮同步一次。")
     canvas_result = st_canvas_compat(
         fill_color=color + "18", stroke_width=3, stroke_color=color,
-        background_image=background, update_streamlit=True,
+        background_image=background, update_streamlit=False,
         height=canvas_height, width=canvas_width,
         drawing_mode="rect" if interaction == "绘制新框" else "transform",
         initial_drawing=initial_drawing, display_toolbar=True,
@@ -169,12 +173,18 @@ def render_page_annotation_workspace() -> None:
     )
     edited_rows = draft
     if canvas_result.json_data is not None:
-        edited_rows = []
+        canvas_rows = []
         for item in canvas_result.json_data.get("objects", []):
             converted = _annotation_from_canvas_object(item, scale, active_class)
             if converted is not None:
-                edited_rows.append(converted)
-        st.session_state[draft_key] = edited_rows
+                canvas_rows.append(converted)
+        if canvas_rows != draft:
+            edited_rows = canvas_rows
+            st.session_state[draft_key] = canvas_rows
+            st.session_state[sync_key] = True
+    canvas_is_synced = bool(st.session_state.get(sync_key, False))
+    if canvas_is_synced:
+        st.success(f"本页方框已同步：{len(edited_rows)} 个。若继续修改，请再次点击 ↓ 同步。")
     counts: dict[str, int] = {}
     for item in edited_rows:
         counts[item["class"]] = counts.get(item["class"], 0) + 1
@@ -190,14 +200,26 @@ def render_page_annotation_workspace() -> None:
         "页面类型（只描述页面，不参与抽样）",
         LAYOUT_TAGS, default=saved_layout_tags, key=f"page_layout_{selected}",
     )
-    if st.button("保存当前页并进入下一页", type="primary", key=f"page_save_{selected}"):
+    if not canvas_is_synced:
+        st.caption("有单分子时，保存按钮将在点击画布下方最左侧的 ↓ 同步按钮后启用。")
+    save_columns = st.columns([0.62, 0.38])
+    save_clicked = save_columns[0].button(
+        "保存已同步方框并进入下一页", type="primary", key=f"page_save_{selected}",
+        disabled=not canvas_is_synced,
+    )
+    empty_clicked = save_columns[1].button(
+        "确认空页并进入下一页", key=f"page_save_empty_{selected}",
+        help="仅当本页没有任何可见单分子结构时使用。",
+    )
+    if save_clicked or empty_clicked:
+        rows_to_save = [] if empty_clicked else edited_rows
         try:
-            store.save_page(selected, edited_rows, annotator=annotator, layout_tags=layout_tags)
+            store.save_page(selected, rows_to_save, annotator=annotator, layout_tags=layout_tags)
         except (KeyError, TypeError, ValueError) as exc:
             st.error(str(exc))
         else:
             current_index = page_ids.index(selected)
             if current_index + 1 < len(page_ids):
                 st.session_state["page_annotation_next"] = page_ids[current_index + 1]
-            st.session_state["solo_review_notice"] = f"已保存 {selected}：{len(edited_rows)} 个框。"
+            st.session_state["solo_review_notice"] = f"已保存 {selected}：{len(rows_to_save)} 个框。"
             st.rerun()
