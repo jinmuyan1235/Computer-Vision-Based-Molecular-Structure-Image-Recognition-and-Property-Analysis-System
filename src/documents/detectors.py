@@ -10,7 +10,14 @@ import cv2
 import numpy as np
 
 import config
-from src.documents.candidate_screening import CandidateScreeningConfig, get_screening_config, screen_region_candidate
+from src.documents.candidate_screening import (
+    CandidateProposalConfig,
+    CandidateScreeningConfig,
+    CropScreeningConfig,
+    get_crop_screening_config,
+    get_proposal_config,
+    screen_region_candidate,
+)
 from src.documents.models import DocumentPage, DocumentRegion, normalize_bbox
 
 
@@ -180,27 +187,60 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         min_area: int = config.DOCUMENT_MIN_REGION_AREA,
         max_area_ratio: float = config.DOCUMENT_MAX_REGION_AREA_RATIO,
         max_regions: int = config.DOCUMENT_MAX_REGIONS,
-        screening_config: str | CandidateScreeningConfig = "baseline",
+        proposal_config: str | CandidateProposalConfig = "baseline",
+        crop_screening_config: str | CropScreeningConfig = "candidate",
+        screening_config: str | CandidateScreeningConfig | None = None,
     ) -> None:
         self.min_area = min_area
         self.max_area_ratio = max_area_ratio
         self.max_regions = max_regions
-        self.screening_config = get_screening_config(screening_config)
+        if screening_config is not None:
+            import warnings
+            warnings.warn(
+                "screening_config is deprecated; use proposal_config and crop_screening_config",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            legacy_name = screening_config.name if isinstance(screening_config, CandidateScreeningConfig) else screening_config
+            proposal_config = legacy_name
+            crop_screening_config = legacy_name
+        self.proposal_config = get_proposal_config(proposal_config)
+        self.crop_screening_config = get_crop_screening_config(crop_screening_config)
 
-    def detect(self, page: DocumentPage) -> list[DocumentRegion]:
+    def propose(self, page: DocumentPage) -> list[DocumentRegion]:
+        """Form raw page-level boxes without applying crop classification."""
         image = cv2.imdecode(np.fromfile(str(Path(page.image_path)), dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f"Unable to decode page image: {page.image_path}")
+        return self._propose_from_image(page, image)
+
+    def _propose_from_image(self, page: DocumentPage, image: np.ndarray) -> list[DocumentRegion]:
         quality = page_quality(image)
         page.quality = quality
         if quality["blank"] or quality["too_large"]:
             return []
         binary = self._foreground_binary(image)
-        contours = self._candidate_contours(binary, image.shape[1], image.shape[0])
+        boxes = self._candidate_contours(binary, image.shape[1], image.shape[0])
+        return [DocumentRegion(
+            document_id=page.document_id,
+            page_number=page.page_number,
+            region_id=f"p{page.page_number:03d}_r{index:03d}",
+            bbox=bbox,
+            region_type="molecule",
+            detector_name=self.name,
+            message=f"proposal_config={self.proposal_config.name}",
+        ) for index, bbox in enumerate(boxes[: self.max_regions], start=1)]
+
+    def detect(self, page: DocumentPage) -> list[DocumentRegion]:
+        image = cv2.imdecode(np.fromfile(str(Path(page.image_path)), dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f"Unable to decode page image: {page.image_path}")
+        proposed = self._propose_from_image(page, image)
         regions: list[DocumentRegion] = []
-        for bbox in contours:
+        for proposed_region in proposed:
+            bbox = proposed_region.bbox
             screening = screen_region_candidate(
-                image, bbox, "molecule", None, config=self.screening_config,
+                image, bbox, "molecule", None, config=self.crop_screening_config,
             )
             recommended = screening.recommended_region_type
             region_type = "reaction_like" if recommended == "reaction" else (
@@ -224,6 +264,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             if len(regions) >= self.max_regions:
                 break
         if not regions:
+            binary = self._foreground_binary(image)
             fallback = self._whole_page_region(page, image, binary, image.shape[1], image.shape[0])
             if fallback is not None:
                 regions.append(fallback)
@@ -239,7 +280,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
 
     def _candidate_contours(self, binary: np.ndarray, width: int, height: int) -> list[tuple[int, int, int, int]]:
         # A moderate dilation joins bonds, atom labels, and nearby ring strokes into one region.
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, self.screening_config.dilation_kernel)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, self.proposal_config.dilation_kernel)
         merged = cv2.dilate(binary, kernel, iterations=1)
         contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         candidates: list[tuple[int, int, int, int]] = []
@@ -251,13 +292,16 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
                 continue
             if area / max(page_area, 1) > self.max_area_ratio:
                 continue
-            if w < 35 or h < 25:
+            if w < self.proposal_config.min_width or h < self.proposal_config.min_height:
                 continue
-            if w / max(h, 1) > 9 and not (w >= 180 and h >= 18):
+            if w / max(h, 1) > self.proposal_config.max_horizontal_aspect and not (
+                w >= self.proposal_config.wide_line_min_width
+                and h >= self.proposal_config.wide_line_min_height
+            ):
                 continue
-            if h / max(w, 1) > 6:
+            if h / max(w, 1) > self.proposal_config.max_vertical_aspect:
                 continue
-            padding = self.screening_config.bbox_padding
+            padding = self.proposal_config.bbox_padding
             x1 = max(0, x - padding)
             y1 = max(0, y - padding)
             x2 = min(width, x + w + padding)
@@ -276,7 +320,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
                 remaining: list[tuple[int, int, int, int]] = []
                 for existing in merged:
                     overlap = HeuristicMoleculeRegionDetector._overlap_ratio(current, existing)
-                    if overlap >= self.screening_config.merge_overlap_ratio:
+                    if overlap >= self.proposal_config.merge_overlap_ratio:
                         current = (
                             min(current[0], existing[0]),
                             min(current[1], existing[1]),
@@ -405,7 +449,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         if coordinates is None:
             return None
         x, y, width, height = cv2.boundingRect(coordinates)
-        padding = 16
+        padding = self.proposal_config.fallback_padding
         bbox = (
             max(0, x - padding),
             max(0, y - padding),
@@ -413,7 +457,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             min(page_height, y + height + padding),
         )
         screening = screen_region_candidate(
-            image, bbox, "molecule", None, config=self.screening_config,
+            image, bbox, "molecule", None, config=self.crop_screening_config,
         )
         confidence = screening.screening_score
         message = ", ".join(screening.reason_codes)

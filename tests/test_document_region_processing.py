@@ -131,7 +131,7 @@ def test_single_page_pdf_processes_with_fake_renderer(tmp_path: Path) -> None:
     page = _make_page(tmp_path / "aspirin_page.png", ["aspirin"], text="single molecule")
     pdf = _make_pdf(tmp_path / "aspirin_doc.pdf")
     loader = DocumentInputLoader(tmp_path / "out", renderer=FakePDFRenderer([page]))
-    processor = DocumentOCSRProcessor("demo", tmp_path / "out", loader=loader)
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", loader=loader, crop_screening_config="baseline")
     result = processor.process(pdf)
     assert result["summary"]["page_count"] == 1
     assert result["summary"]["molecule_region_count"] >= 1
@@ -184,7 +184,7 @@ def test_multi_page_pdf_and_blank_page(tmp_path: Path) -> None:
     blank_page = _make_page(tmp_path / "blank.png", [])
     pdf = _make_pdf(tmp_path / "aspirin_multi.pdf", pages=2)
     loader = DocumentInputLoader(tmp_path / "out", renderer=FakePDFRenderer([molecule_page, blank_page]))
-    result = DocumentOCSRProcessor("demo", tmp_path / "out", loader=loader).process(pdf, run_ocsr=False)
+    result = DocumentOCSRProcessor("demo", tmp_path / "out", loader=loader, crop_screening_config="baseline").process(pdf, run_ocsr=False)
     assert result["summary"]["page_count"] == 2
     assert any(page["quality"].get("blank") for page in result["pages"])
     assert result["summary"]["molecule_region_count"] >= 1
@@ -195,7 +195,7 @@ def test_detect_only_mode_does_not_call_ocsr(tmp_path: Path) -> None:
     detector = FakeDetector([
         DocumentRegion("doc", 1, "p001_r001", (70, 120, 360, 380), "molecule", 0.9),
     ])
-    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector)
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector, crop_screening_config="baseline")
     fake_generator = FakeReportGenerator()
     processor.report_generator = fake_generator
 
@@ -211,7 +211,7 @@ def test_full_document_mode_does_not_recognize_unconfirmed_regions(tmp_path: Pat
     detector = FakeDetector([
         DocumentRegion("doc", 1, "p001_r001", (70, 120, 360, 380), "molecule", 0.9),
     ])
-    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector)
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector, crop_screening_config="baseline")
     fake_generator = FakeReportGenerator()
     processor.report_generator = fake_generator
 
@@ -237,7 +237,7 @@ def test_full_document_mode_only_recognizes_screened_molecule_regions(tmp_path: 
         DocumentRegion("doc", 1, "p001_r002", (45, 20, 340, 70), "molecule", 0.8, confirmed=True),
         DocumentRegion("doc", 1, "p001_r003", (30, 480, 400, 540), "text", 0.8),
     ])
-    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector)
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector, crop_screening_config="baseline")
     fake_generator = FakeReportGenerator()
     processor.report_generator = fake_generator
 
@@ -281,7 +281,7 @@ def test_damaged_pdf_reports_readable_error(monkeypatch: pytest.MonkeyPatch, tmp
 def test_multi_molecule_page_and_text_not_molecule(tmp_path: Path) -> None:
     page_path = _make_page(tmp_path / "aspirin_benzene_page.png", ["aspirin", "benzene"], text="Two molecule page")
     page = DocumentPage("doc", 1, str(page_path), 900, 600)
-    regions = HeuristicMoleculeRegionDetector().detect(page)
+    regions = HeuristicMoleculeRegionDetector(crop_screening_config="baseline").detect(page)
     molecule_regions = [region for region in regions if region.region_type == "molecule"]
     text_regions = [region for region in regions if region.region_type == "text"]
     assert len(molecule_regions) >= 2
@@ -382,7 +382,7 @@ def test_multiline_text_block_is_filtered_before_ocsr(tmp_path: Path) -> None:
 
     page = DocumentPage("doc", 1, str(page_path), 900, 600)
     region = DocumentRegion("doc", 1, "p001_r001", (50, 50, 820, 310), "molecule", 0.9, confirmed=True)
-    processor = DocumentOCSRProcessor("demo", tmp_path / "out")
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", crop_screening_config="baseline")
     fake_generator = FakeReportGenerator()
     processor.report_generator = fake_generator
 
@@ -436,7 +436,7 @@ def test_zip_image_collection_is_supported(tmp_path: Path) -> None:
 
 def test_region_editing_records_audit_and_reruns(tmp_path: Path) -> None:
     page_path = _make_page(tmp_path / "aspirin_page.png", ["aspirin"])
-    processor = DocumentOCSRProcessor("demo", tmp_path / "out")
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", crop_screening_config="baseline")
     result = processor.process(page_path, run_ocsr=False)
     page = result["pages"][0]
     edited = processor.apply_edits(
@@ -547,7 +547,7 @@ def test_single_region_failure_does_not_stop_other_regions_and_enters_review_que
         DocumentRegion("doc", 1, "p001_r001", (70, 120, 360, 380), "molecule", 0.9, confirmed=True),
         DocumentRegion("doc", 1, "p001_r002", (490, 120, 780, 380), "molecule", 0.9, confirmed=True),
     ])
-    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector, review_output_dir=tmp_path / "data")
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector, review_output_dir=tmp_path / "data", crop_screening_config="baseline")
     failing_generator = FailingReportGenerator()
     processor.report_generator = failing_generator
 
@@ -575,7 +575,7 @@ def test_region_csv_contains_coordinates_and_final_result(tmp_path: Path) -> Non
     detector = FakeDetector([
         DocumentRegion("doc", 1, "p001_r001", (70, 120, 360, 380), "molecule", 0.9, confirmed=True),
     ])
-    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector)
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", detector=detector, crop_screening_config="baseline")
     processor.report_generator = FakeReportGenerator()
     result = processor.process(page_path)
     frame = pd.read_csv(result["exports"]["regions_csv"])

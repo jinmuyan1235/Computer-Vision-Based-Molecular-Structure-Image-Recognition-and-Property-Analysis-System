@@ -11,6 +11,7 @@ import numpy as np
 
 
 ScreeningProfile = Literal["baseline", "candidate"]
+ScreeningDecision = Literal["accept_molecule", "reject_negative", "review_needed"]
 
 
 @dataclass(frozen=True)
@@ -71,8 +72,8 @@ DEFAULT_FEATURE_THRESHOLDS = CandidateFeatureThresholds()
 
 
 @dataclass(frozen=True)
-class CandidateScreeningConfig:
-    """Named thresholds for candidate formation and post-detection classification."""
+class CandidateProposalConfig:
+    """Thresholds used only to form and merge page-level bounding boxes."""
 
     name: ScreeningProfile
     dilation_kernel: tuple[int, int]
@@ -80,6 +81,20 @@ class CandidateScreeningConfig:
     merge_overlap_ratio: float
     min_width: int
     min_height: int
+    max_horizontal_aspect: float
+    max_vertical_aspect: float
+    wide_line_min_width: int
+    wide_line_min_height: int
+    fallback_padding: int
+
+
+@dataclass(frozen=True)
+class CropScreeningConfig:
+    """Thresholds used only to classify an already-proposed crop."""
+
+    name: ScreeningProfile
+    minimum_crop_width: int
+    minimum_crop_height: int
     blank_ink_ratio: float
     dense_ink_ratio: float
     molecule_score_threshold: float
@@ -121,10 +136,22 @@ class CandidateScreeningConfig:
     features: CandidateFeatureThresholds = DEFAULT_FEATURE_THRESHOLDS
 
 
-BASELINE_SCREENING_CONFIG = CandidateScreeningConfig(
-    name="baseline",
-    dilation_kernel=(23, 17), bbox_padding=8, merge_overlap_ratio=0.72,
-    min_width=70, min_height=55, blank_ink_ratio=0.006, dense_ink_ratio=0.38,
+BASELINE_PROPOSAL_CONFIG = CandidateProposalConfig(
+    name="baseline", dilation_kernel=(23, 17), bbox_padding=8,
+    merge_overlap_ratio=0.72, min_width=35, min_height=25,
+    max_horizontal_aspect=9.0, max_vertical_aspect=6.0,
+    wide_line_min_width=180, wide_line_min_height=18, fallback_padding=16,
+)
+CANDIDATE_PROPOSAL_CONFIG = CandidateProposalConfig(
+    name="candidate", dilation_kernel=(17, 11), bbox_padding=6,
+    merge_overlap_ratio=0.82, min_width=35, min_height=25,
+    max_horizontal_aspect=9.0, max_vertical_aspect=6.0,
+    wide_line_min_width=180, wide_line_min_height=18, fallback_padding=16,
+)
+
+BASELINE_CROP_SCREENING_CONFIG = CropScreeningConfig(
+    name="baseline", minimum_crop_width=70, minimum_crop_height=55,
+    blank_ink_ratio=0.006, dense_ink_ratio=0.38,
     molecule_score_threshold=0.68, reclassify_non_molecule=False,
     table_projection_ratio=0.65,
     arrow_min_aspect=2.5, arrow_min_width=180, arrow_max_height=190,
@@ -144,11 +171,9 @@ BASELINE_SCREENING_CONFIG = CandidateScreeningConfig(
     existing_molecule_min_aspect=0.20, existing_molecule_max_aspect=4.5,
 )
 
-CANDIDATE_SCREENING_CONFIG = CandidateScreeningConfig(
-    name="candidate",
-    # Smaller dilation/padding and stricter overlap avoid joining adjacent Scheme structures.
-    dilation_kernel=(17, 11), bbox_padding=6, merge_overlap_ratio=0.82,
-    min_width=64, min_height=50, blank_ink_ratio=0.006, dense_ink_ratio=0.34,
+CANDIDATE_CROP_SCREENING_CONFIG = CropScreeningConfig(
+    name="candidate", minimum_crop_width=64, minimum_crop_height=50,
+    blank_ink_ratio=0.006, dense_ink_ratio=0.34,
     molecule_score_threshold=0.72, reclassify_non_molecule=True,
     table_projection_ratio=0.58,
     # The development confusion has molecule->reaction errors, so mixed arrow boxes are routed early.
@@ -169,10 +194,61 @@ CANDIDATE_SCREENING_CONFIG = CandidateScreeningConfig(
     existing_molecule_min_aspect=0.20, existing_molecule_max_aspect=4.5,
 )
 
-SCREENING_CONFIGS = {
-    "baseline": BASELINE_SCREENING_CONFIG,
-    "candidate": CANDIDATE_SCREENING_CONFIG,
+PROPOSAL_CONFIGS = {
+    "baseline": BASELINE_PROPOSAL_CONFIG,
+    "candidate": CANDIDATE_PROPOSAL_CONFIG,
 }
+CROP_SCREENING_CONFIGS = {
+    "baseline": BASELINE_CROP_SCREENING_CONFIG,
+    "candidate": CANDIDATE_CROP_SCREENING_CONFIG,
+}
+
+
+@dataclass(frozen=True)
+class CandidateScreeningConfig:
+    """Deprecated compatibility view of a same-name proposal/crop pair."""
+
+    name: ScreeningProfile
+    proposal: CandidateProposalConfig
+    crop_screening: CropScreeningConfig
+
+    def __getattr__(self, key: str) -> Any:
+        if hasattr(self.crop_screening, key):
+            return getattr(self.crop_screening, key)
+        if hasattr(self.proposal, key):
+            return getattr(self.proposal, key)
+        raise AttributeError(key)
+
+
+BASELINE_SCREENING_CONFIG = CandidateScreeningConfig(
+    "baseline", BASELINE_PROPOSAL_CONFIG, BASELINE_CROP_SCREENING_CONFIG,
+)
+CANDIDATE_SCREENING_CONFIG = CandidateScreeningConfig(
+    "candidate", CANDIDATE_PROPOSAL_CONFIG, CANDIDATE_CROP_SCREENING_CONFIG,
+)
+SCREENING_CONFIGS = {"baseline": BASELINE_SCREENING_CONFIG, "candidate": CANDIDATE_SCREENING_CONFIG}
+
+
+def get_proposal_config(config: ScreeningProfile | CandidateProposalConfig) -> CandidateProposalConfig:
+    if isinstance(config, CandidateProposalConfig):
+        return config
+    try:
+        return PROPOSAL_CONFIGS[config]
+    except KeyError as exc:
+        raise ValueError(f"Unknown proposal config: {config}") from exc
+
+
+def get_crop_screening_config(
+    config: ScreeningProfile | CropScreeningConfig | CandidateScreeningConfig,
+) -> CropScreeningConfig:
+    if isinstance(config, CandidateScreeningConfig):
+        return config.crop_screening
+    if isinstance(config, CropScreeningConfig):
+        return config
+    try:
+        return CROP_SCREENING_CONFIGS[config]
+    except KeyError as exc:
+        raise ValueError(f"Unknown crop-screening config: {config}") from exc
 
 
 def get_screening_config(config: ScreeningProfile | CandidateScreeningConfig) -> CandidateScreeningConfig:
@@ -186,19 +262,27 @@ def get_screening_config(config: ScreeningProfile | CandidateScreeningConfig) ->
 
 @dataclass(frozen=True)
 class CandidateScreeningResult:
+    decision: ScreeningDecision
     recommended_region_type: str
-    molecule_candidate: bool
     screening_score: float
     reason_codes: tuple[str, ...]
     diagnostics: dict[str, Any]
+    config_version: str
+
+    @property
+    def molecule_candidate(self) -> bool:
+        """Compatibility alias; only accepted crops may invoke OCSR."""
+        return self.decision == "accept_molecule"
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "decision": self.decision,
             "recommended_region_type": self.recommended_region_type,
             "molecule_candidate": self.molecule_candidate,
             "screening_score": self.screening_score,
             "reason_codes": list(self.reason_codes),
             "diagnostics": self.diagnostics,
+            "config_version": self.config_version,
         }
 
 
@@ -243,7 +327,7 @@ def _text_line_count(binary: np.ndarray) -> int:
     return lines + int(run >= minimum_run)
 
 
-def _line_diagnostics(binary: np.ndarray, config: CandidateScreeningConfig) -> dict[str, Any]:
+def _line_diagnostics(binary: np.ndarray, config: CropScreeningConfig) -> dict[str, Any]:
     height, width = binary.shape[:2]
     edges = cv2.Canny(binary, 60, 180)
     lines = cv2.HoughLinesP(
@@ -278,7 +362,7 @@ def _line_diagnostics(binary: np.ndarray, config: CandidateScreeningConfig) -> d
     }
 
 
-def _structure_cluster_count(binary: np.ndarray, config: CandidateScreeningConfig) -> int:
+def _structure_cluster_count(binary: np.ndarray, config: CropScreeningConfig) -> int:
     height, width = binary.shape[:2]
     merged = cv2.dilate(
         binary,
@@ -305,10 +389,10 @@ def screen_region_candidate(
     initial_region_type: str,
     initial_detector_confidence: float | None,
     *,
-    config: ScreeningProfile | CandidateScreeningConfig = "baseline",
+    config: ScreeningProfile | CropScreeningConfig | CandidateScreeningConfig = "candidate",
 ) -> CandidateScreeningResult:
     """Classify one proposed page region without invoking any OCSR model."""
-    settings = get_screening_config(config)
+    settings = get_crop_screening_config(config)
     image = _read_image(page_image)
     page_height, page_width = image.shape[:2]
     if len(bbox) != 4:
@@ -361,16 +445,23 @@ def screen_region_candidate(
     initial = _normalize_initial(initial_region_type)
 
     def result(label: str, score: float, *reasons: str) -> CandidateScreeningResult:
+        if label == "molecule":
+            decision: ScreeningDecision = "accept_molecule"
+        elif label in {"blank", "text", "table", "reaction", "logo"}:
+            decision = "reject_negative"
+        else:
+            decision = "review_needed"
         return CandidateScreeningResult(
+            decision=decision,
             recommended_region_type=label,
-            molecule_candidate=label == "molecule",
             screening_score=round(max(0.0, min(score, 1.0)), 4),
             reason_codes=tuple(dict.fromkeys(reasons)), diagnostics=diagnostics,
+            config_version=f"crop-screening-{settings.name}-v1",
         )
 
     if ink_ratio < settings.blank_ink_ratio:
         return result("blank", 1.0 - ink_ratio, "blank")
-    if width < settings.min_width or height < settings.min_height:
+    if width < settings.minimum_crop_width or height < settings.minimum_crop_height:
         return result("text", 0.75, "too_small", "text_like")
     table_like = (
         thresholds.table_min_aspect <= aspect <= thresholds.table_max_aspect
@@ -433,7 +524,7 @@ def screen_region_candidate(
         return result("molecule", 0.89, "possible_molecule")
     reaction_condition = (
         settings.reaction_condition_min_aspect <= aspect <= thresholds.reaction_condition_max_aspect
-        and settings.min_height <= height <= settings.reaction_condition_max_height
+        and settings.minimum_crop_height <= height <= settings.reaction_condition_max_height
         and thresholds.reaction_condition_min_ink_ratio <= ink_ratio <= thresholds.reaction_condition_max_ink_ratio
         and thresholds.reaction_condition_min_text_lines <= text_lines <= thresholds.reaction_condition_max_text_lines
         and thresholds.reaction_condition_min_components <= len(significant) <= thresholds.reaction_condition_max_components

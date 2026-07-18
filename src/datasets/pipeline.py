@@ -19,7 +19,10 @@ from src.datasets.provenance import SourceRecord, SourceRegistry, sha256_file
 from src.datasets.pubchem import PubChemCollector, PubChemStructure
 from src.datasets.review import PENDING_FIELDS, DatasetReviewStore
 from src.documents.processor import DocumentOCSRProcessor
-from src.documents.candidate_screening import CandidateScreeningConfig, get_screening_config, screen_region_candidate
+from src.documents.candidate_screening import (
+    CandidateProposalConfig, CandidateScreeningConfig, CropScreeningConfig,
+    get_crop_screening_config, get_proposal_config, screen_region_candidate,
+)
 from src.feedback.store import save_review_queue_item
 from src.ocsr.base import OCSRResult
 from src.ocsr.ensemble import combine_ensemble_results
@@ -43,6 +46,7 @@ REGION_CATEGORY = {
     "logo": "logo",
     "blank": "blank",
     "multiple_molecules": "multiple_molecules",
+    "uncertain": "uncertain_visual",
 }
 
 
@@ -95,7 +99,9 @@ class DatasetPipeline:
         max_downloads: int = 100,
         dry_run: bool = False,
         resume: bool = True,
-        screening_config: str | CandidateScreeningConfig = "baseline",
+        proposal_config: str | CandidateProposalConfig = "baseline",
+        crop_screening_config: str | CropScreeningConfig = "candidate",
+        screening_config: str | CandidateScreeningConfig | None = None,
     ) -> None:
         self.root = ensure_directory(Path(root).expanduser().resolve())
         self.registry = SourceRegistry(self.root)
@@ -106,7 +112,17 @@ class DatasetPipeline:
         self.max_downloads = max(0, int(max_downloads))
         self.dry_run = dry_run
         self.resume = resume
-        self.screening_config = get_screening_config(screening_config)
+        if screening_config is not None:
+            import warnings
+            warnings.warn(
+                "screening_config is deprecated; use proposal_config and crop_screening_config",
+                DeprecationWarning, stacklevel=2,
+            )
+            legacy_name = screening_config.name if isinstance(screening_config, CandidateScreeningConfig) else screening_config
+            proposal_config = legacy_name
+            crop_screening_config = legacy_name
+        self.proposal_config = get_proposal_config(proposal_config)
+        self.crop_screening_config = get_crop_screening_config(crop_screening_config)
         self.material_root = ensure_directory(self.root / "sources")
         self.candidate_root = ensure_directory(self.root / "candidates")
         self.pending_manifest = self.root / "pending_manifest.csv"
@@ -168,7 +184,8 @@ class DatasetPipeline:
             backend="ensemble",
             output_dir=self.root / "document_runs",
             review_output_dir=config.DATA_DIR,
-            screening_config=self.screening_config,
+            proposal_config=self.proposal_config,
+            crop_screening_config=self.crop_screening_config,
         )
         document = processor.process(result.document_path, run_ocsr=False)
         candidates = self._document_candidates(document, result.source)
@@ -188,11 +205,13 @@ class DatasetPipeline:
         reference_smiles: str = "",
         reference_inchikey: str = "",
         notes: str = "",
+        screening_decision: str = "",
+        screening_config_version: str = "",
     ) -> CandidateResult:
         """Persist a candidate; run OCSR only for plausible molecule positives."""
         if not source.license_allowed:
             raise PermissionError("Cannot save a candidate image for a non-whitelisted source license.")
-        category = category if category in {"molecule", *NEGATIVE_CATEGORIES} else "invalid_crop"
+        category = category if category in {"molecule", "uncertain_visual", *NEGATIVE_CATEGORIES} else "invalid_crop"
         sample_id = f"{safe_stem(source.source_key)}_{category}_{uuid4().hex[:12]}"
         relative_image = ""
         image_sha = ""
@@ -207,7 +226,7 @@ class DatasetPipeline:
                 relative_image = destination.relative_to(self.root).as_posix()
                 image_sha = sha256_file(destination)
                 phash = perceptual_hash(destination)
-                if category == "molecule":
+                if category == "molecule" and screening_decision != "review_needed":
                     predictions = self._predict_all(destination)
                 else:
                     predictions = self._not_applicable_predictions(category)
@@ -218,7 +237,11 @@ class DatasetPipeline:
             category = "invalid_crop"
 
         duplicate_of = self._find_duplicate(image_sha, phash, reference_smiles, reference_inchikey)
-        expected_action = "reject" if category in NEGATIVE_CATEGORIES else "recognize"
+        expected_action = (
+            "review" if screening_decision == "review_needed"
+            else "reject" if category in NEGATIVE_CATEGORIES
+            else "recognize"
+        )
         row = {
             "sample_id": sample_id,
             "image_path": relative_image,
@@ -241,6 +264,8 @@ class DatasetPipeline:
             "reference_inchikey": reference_inchikey,
             "bbox": json.dumps(list(bbox) if bbox else []),
             "candidate_predictions": json.dumps(predictions, ensure_ascii=False),
+            "screening_decision": screening_decision,
+            "screening_config_version": screening_config_version,
             "duplicate_of": duplicate_of or "",
             "review_status": "duplicate" if duplicate_of else "pending",
             "queue_annotation_path": "",
@@ -270,7 +295,7 @@ class DatasetPipeline:
                         region.get("bbox") or [],
                         initial_type,
                         region.get("detection_confidence"),
-                        config=self.screening_config,
+                        config=self.crop_screening_config,
                     )
                     category = REGION_CATEGORY.get(screening.recommended_region_type, "invalid_crop")
                 except (OSError, TypeError, ValueError):
@@ -284,9 +309,12 @@ class DatasetPipeline:
                 bbox=region.get("bbox"),
                 source_page_path=page_path,
                 page_size=self._image_size(page_path),
+                screening_decision=screening.decision if screening else "review_needed",
+                screening_config_version=screening.config_version if screening else "",
                 notes=(
                     f"Document detector region {region.get('region_id')}; initial_type={initial_type}; "
-                    f"screening_config={self.screening_config.name}; "
+                    f"proposal_config={self.proposal_config.name}; "
+                    f"crop_screening_config={self.crop_screening_config.name}; "
                     f"screening_reasons={','.join(screening.reason_codes) if screening else 'screening_failed'}"
                 ),
             ))

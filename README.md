@@ -990,3 +990,52 @@ python scripts/compare_visual_detector_runs.py \
 ```
 
 The evaluator reads `dataset_role` from the snapshot summary when `--dataset-role` is omitted, but an explicit command-line value takes priority. It never infers the role from directory names. Holdout metrics cover candidate screening on existing baseline-proposed crops only; they cannot measure complete-page molecule detection recall, missed molecule count, bbox proposal recall, or regions never proposed by baseline.
+
+### Production proposal/crop split and page holdout
+
+Page bbox formation and existing-crop screening are independent configuration axes. Production defaults to the validated combination `proposal=baseline` and `crop_screening=candidate`; candidate proposal morphology is not a production default until page-level validation passes. Crop screening returns `accept_molecule`, `reject_negative`, or `review_needed`. Only `accept_molecule` invokes OCSR. New collection commands use:
+
+```bash
+python scripts/collect_ocsr_dataset.py \
+  --proposal-config baseline \
+  --crop-screening-config candidate \
+  --dataset-root data/ocsr_collections pmc --pmcid PMC1234567
+```
+
+`--screening-config` remains temporarily supported, maps both axes to the same profile, and emits a deprecation warning.
+
+Prepare the detector-blind 30-page workspace once. The fixed seed chooses one page from each of ten page-position strata in each of the three holdout papers; it does not inspect baseline/candidate results. Open `Data Management / OCSR Dataset Review → Page annotation`. Proposal overlays are hidden by default, and annotations are saved separately from crop reviews.
+
+```bash
+python scripts/prepare_page_annotation_set.py \
+  --collection-root data/ocsr_holdout_collection \
+  --output data/page_annotations/visual-page-holdout-v0.1 \
+  --seed 20260718 --pages-per-document 10
+
+OCSR_PAGE_ANNOTATION_ROOT=data/page_annotations/visual-page-holdout-v0.1 \
+FAST_START=true ./start_gpu_app.sh
+```
+
+After all 30 pages are saved, freeze once and evaluate both unchanged proposal profiles:
+
+```bash
+python scripts/snapshot_page_dataset.py \
+  --source data/page_annotations/visual-page-holdout-v0.1 \
+  --version visual-page-holdout-v0.1 \
+  --output data/datasets/visual-page-holdout-v0.1
+
+python scripts/evaluate_page_region_proposals.py \
+  --dataset data/datasets/visual-page-holdout-v0.1 \
+  --proposal-config baseline \
+  --output data/evaluation/visual-page-holdout-v0.1/baseline
+python scripts/evaluate_page_region_proposals.py \
+  --dataset data/datasets/visual-page-holdout-v0.1 \
+  --proposal-config candidate \
+  --output data/evaluation/visual-page-holdout-v0.1/candidate
+python scripts/compare_page_proposal_runs.py \
+  --baseline data/evaluation/visual-page-holdout-v0.1/baseline \
+  --candidate data/evaluation/visual-page-holdout-v0.1/candidate \
+  --output data/evaluation/visual-page-holdout-v0.1/comparison
+```
+
+The page evaluator reports IoU≥0.5 proposal precision/recall/F1, misses, false proposals, merged/split errors, mean IoU, per-page/per-document metrics, and overlays. It measures only the 30 frozen pages and does not measure end-to-end OCSR structure accuracy or pages outside that set.

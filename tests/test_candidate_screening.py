@@ -16,7 +16,12 @@ import src.datasets.pipeline as dataset_pipeline_module
 import src.documents.candidate_screening as screening_module
 import src.documents.detectors as detectors_module
 import src.documents.processor as processor_module
-from src.documents.candidate_screening import get_screening_config, screen_region_candidate
+from scripts.collect_ocsr_dataset import _pipeline, build_parser
+from src.documents.candidate_screening import (
+    get_crop_screening_config, get_proposal_config, get_screening_config,
+    screen_region_candidate,
+)
+from src.documents.detectors import HeuristicMoleculeRegionDetector
 from src.evaluation.visual_detector import evaluate_visual_detector
 from src.evaluation.visual_detector_compare import compare_visual_detector_runs
 
@@ -103,6 +108,47 @@ def test_baseline_and_candidate_profiles_are_distinct_and_selectable() -> None:
     assert baseline.merge_overlap_ratio != candidate.merge_overlap_ratio
     with pytest.raises(ValueError, match="Unknown candidate-screening config"):
         get_screening_config("missing")  # type: ignore[arg-type]
+
+
+def test_proposal_and_crop_profiles_are_independent_and_default_is_safe() -> None:
+    detector = HeuristicMoleculeRegionDetector()
+    assert detector.proposal_config is get_proposal_config("baseline")
+    assert detector.crop_screening_config is get_crop_screening_config("candidate")
+    assert not hasattr(get_proposal_config("candidate"), "molecule_score_threshold")
+    assert not hasattr(get_crop_screening_config("candidate"), "dilation_kernel")
+
+
+def test_legacy_screening_config_warns_and_maps_both_axes() -> None:
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        detector = HeuristicMoleculeRegionDetector(screening_config="candidate")
+    assert detector.proposal_config.name == "candidate"
+    assert detector.crop_screening_config.name == "candidate"
+
+
+def test_legacy_cli_screening_flag_emits_deprecation_warning(tmp_path: Path) -> None:
+    args = build_parser().parse_args([
+        "--dataset-root", str(tmp_path), "--dry-run", "--screening-config", "candidate",
+        "pmc", "--pmcid", "PMC1234567",
+    ])
+    with pytest.warns(FutureWarning, match="deprecated"):
+        pipeline = _pipeline(args)
+    assert pipeline.proposal_config.name == "candidate"
+    assert pipeline.crop_screening_config.name == "candidate"
+
+
+def test_three_way_crop_decisions_are_explicit() -> None:
+    molecule = cv2.cvtColor(np.asarray(_molecule()), cv2.COLOR_RGB2BGR)
+    accepted = screen_region_candidate(molecule, (0, 0, molecule.shape[1], molecule.shape[0]), "molecule", 0.9)
+    rejected_image = cv2.cvtColor(np.asarray(_arrow()), cv2.COLOR_RGB2BGR)
+    rejected = screen_region_candidate(rejected_image, (0, 0, rejected_image.shape[1], rejected_image.shape[0]), "molecule", 0.9)
+    multiple_image = Image.new("RGB", (600, 220), "white")
+    crop = _molecule().resize((240, 180)); multiple_image.paste(crop, (20, 20)); multiple_image.paste(crop, (340, 20))
+    multiple_array = cv2.cvtColor(np.asarray(multiple_image), cv2.COLOR_RGB2BGR)
+    review = screen_region_candidate(multiple_array, (0, 0, 600, 220), "molecule", 0.9)
+    assert accepted.decision == "accept_molecule"
+    assert rejected.decision == "reject_negative"
+    assert review.decision == "review_needed"
+    assert accepted.config_version == "crop-screening-candidate-v1"
 
 
 def _evaluation_manifest(tmp_path: Path) -> Path:
