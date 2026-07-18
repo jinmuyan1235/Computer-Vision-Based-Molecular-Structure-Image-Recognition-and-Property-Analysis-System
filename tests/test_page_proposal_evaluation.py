@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import csv
+import io
 import json
 from pathlib import Path
 
@@ -12,6 +14,8 @@ from PIL import Image
 from scripts.snapshot_page_dataset import snapshot
 from src.datasets.page_annotations import PageAnnotationStore
 from src.evaluation.page_proposals import bbox_iou, match_boxes, evaluate_page_proposals
+from src.ui.page_annotation_page import _annotation_from_canvas_object, _canvas_object
+from src.ui.drawable_canvas_compat import image_data_url
 
 
 def _workspace(root: Path, *, completed: bool = False) -> Path:
@@ -41,6 +45,22 @@ def test_page_annotation_add_update_delete_and_save(tmp_path: Path) -> None:
     assert saved["annotations"][0]["bbox"] == [11, 21, 90, 110]
     assert saved["annotations"][0]["class"] == "reaction"
     assert store.delete_box(saved["annotations"], 0) == []
+
+
+def test_canvas_bbox_round_trip_preserves_class_and_original_coordinates() -> None:
+    annotation = {"bbox": [100, 200, 500, 700], "class": "reaction"}
+    canvas = _canvas_object(annotation, 0.5)
+    assert _annotation_from_canvas_object(canvas, 0.5, "molecule") == annotation
+    canvas["scaleX"] = 1.25
+    resized = _annotation_from_canvas_object(canvas, 0.5, "molecule")
+    assert resized == {"bbox": [100, 200, 600, 700], "class": "reaction"}
+
+
+def test_canvas_background_uses_inline_png_without_streamlit_image_api() -> None:
+    url = image_data_url(Image.new("RGB", (12, 8), "white"))
+    assert url.startswith("data:image/png;base64,")
+    decoded = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+    assert decoded.size == (12, 8)
 
 
 def test_iou_and_one_to_many_many_to_one_statistics() -> None:

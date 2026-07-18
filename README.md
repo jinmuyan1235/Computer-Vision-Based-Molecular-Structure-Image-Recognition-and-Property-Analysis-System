@@ -1016,6 +1016,15 @@ OCSR_PAGE_ANNOTATION_ROOT=data/page_annotations/visual-page-holdout-v0.1 \
 FAST_START=true ./start_gpu_app.sh
 ```
 
+The annotation UI is mouse-driven; coordinates are never entered manually:
+
+1. Choose `绘制新框` and the region class, then drag a tight rectangle directly over the page image.
+2. Choose `调整/删除框` to move or resize a selected rectangle. Press Delete/Backspace to remove it; use Undo for a mistaken action.
+3. Draw one box for each separable molecule and exclude labels, arrows, conditions, and captions where possible.
+4. Enter the annotator name and choose `保存当前页并进入下一页`. Save pages with no targets as well.
+
+Keep baseline/candidate overlays hidden while creating truth. They are available only for a post-save quality check.
+
 After all 30 pages are saved, freeze once and evaluate both unchanged proposal profiles:
 
 ```bash
