@@ -17,7 +17,13 @@ from PIL import Image, ImageDraw
 import config
 from src.analysis.batch_analyzer import flatten_report
 from src.analysis.molecule_report import MoleculeReportGenerator
-from src.documents.detectors import BaseMoleculeRegionDetector, HeuristicMoleculeRegionDetector, HybridMoleculeRegionDetector
+from src.documents.detectors import (
+    BaseMoleculeRegionDetector,
+    DocumentRegionStreams,
+    HeuristicMoleculeRegionDetector,
+    HybridMoleculeRegionDetector,
+    SplitDocumentRegionDetector,
+)
 from src.documents.candidate_screening import (
     CandidateProposalConfig, CandidateScreeningConfig, CropScreeningConfig,
     get_crop_screening_config, get_proposal_config, screen_region_candidate,
@@ -47,6 +53,7 @@ class DocumentOCSRProcessor:
         runtime_config: dict[str, Any] | None = None,
         review_output_dir: str | Path | None = None,
         proposal_config: str | CandidateProposalConfig = "baseline",
+        document_layout_proposal_config: str | CandidateProposalConfig = "baseline",
         crop_screening_config: str | CropScreeningConfig = "candidate",
         screening_config: str | CandidateScreeningConfig | None = None,
     ) -> None:
@@ -62,11 +69,20 @@ class DocumentOCSRProcessor:
             proposal_config = legacy_name
             crop_screening_config = legacy_name
         self.proposal_config = get_proposal_config(proposal_config)
+        self.document_layout_proposal_config = get_proposal_config(document_layout_proposal_config)
         self.crop_screening_config = get_crop_screening_config(crop_screening_config)
-        self.detector = detector or HybridMoleculeRegionDetector(
-            fallback=HeuristicMoleculeRegionDetector(
-                proposal_config=self.proposal_config,
-                crop_screening_config=self.crop_screening_config,
+        self.detector = detector or SplitDocumentRegionDetector(
+            molecule_detector=HybridMoleculeRegionDetector(
+                fallback=HeuristicMoleculeRegionDetector(
+                    proposal_config=self.proposal_config,
+                    crop_screening_config=self.crop_screening_config,
+                ),
+            ),
+            layout_detector=HybridMoleculeRegionDetector(
+                fallback=HeuristicMoleculeRegionDetector(
+                    proposal_config=self.document_layout_proposal_config,
+                    crop_screening_config=self.crop_screening_config,
+                ),
             ),
         )
         self.loader = loader or DocumentInputLoader(self.output_dir)
@@ -91,9 +107,13 @@ class DocumentOCSRProcessor:
         pages = self._move_pages_into_run(pages, document_dir)
         regions: list[DocumentRegion] = []
         detection_errors: list[dict[str, Any]] = []
+        stream_counts = {"molecule_extraction": 0, "document_layout": 0}
         for page in pages:
             try:
-                detected = self.detector.detect(page)
+                streams = self.detect_page_streams(page)
+                stream_counts["molecule_extraction"] += len(streams.molecule_extraction)
+                stream_counts["document_layout"] += len(streams.document_layout)
+                detected = streams.combined(page)
                 if len(regions) + len(detected) > config.DOCUMENT_MAX_REGIONS:
                     allowed = max(config.DOCUMENT_MAX_REGIONS - len(regions), 0)
                     detected = detected[:allowed]
@@ -135,9 +155,25 @@ class DocumentOCSRProcessor:
                 region for region in regions
                 if region.region_type == "molecule" and is_region_confirmed(region.to_dict())
             ]),
+            "region_stream_counts": stream_counts,
         }
         result["exports"] = self.export(result, document_dir)
         return result
+
+    def detect_page_streams(self, page: DocumentPage) -> DocumentRegionStreams:
+        """Return explicit molecule and layout streams without either overwriting the other."""
+
+        detect_streams = getattr(self.detector, "detect_streams", None)
+        if callable(detect_streams):
+            return detect_streams(page)
+        detected = self.detector.detect(page)
+        molecules = [region for region in detected if region.region_type == "molecule"]
+        layout = [region for region in detected if region.region_type != "molecule"]
+        for region in molecules:
+            region.source = region.source or "molecule_extraction"
+        for region in layout:
+            region.source = region.source or "document_layout"
+        return DocumentRegionStreams(molecules, layout, original_order=detected)
 
     def recognize_region(
         self,

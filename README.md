@@ -1048,4 +1048,24 @@ python scripts/compare_page_proposal_runs.py \
   --output data/evaluation/visual-page-holdout-v0.1/comparison
 ```
 
-The page evaluator reports IoU≥0.5 proposal precision/recall/F1, misses, false proposals, merged/split errors, mean IoU, per-page/per-document metrics, and overlays. It measures only the 30 frozen pages and does not measure end-to-end OCSR structure accuracy or pages outside that set.
+The raw page evaluator reports IoU≥0.5 proposal precision/recall/F1, misses, false proposals, merged/split errors, mean IoU, proposal growth, false-proposal growth, per-page load, and extra proposals per additional true positive. Its `molecule_raw_proposal_gate` uses molecule boxes only. It cannot validate text, reaction, table, figure, or other document-layout regions and never recommends a production default switch.
+
+Evaluate the complete proposal + crop-screening routing combinations without running MolScribe or DECIMER:
+
+```bash
+python scripts/evaluate_page_ocsr_routing.py \
+  --dataset data/datasets/visual-page-holdout-v0.1 \
+  --proposal-config baseline --crop-screening-config candidate \
+  --output data/evaluation/visual-page-holdout-v0.1/routing/baseline
+python scripts/evaluate_page_ocsr_routing.py \
+  --dataset data/datasets/visual-page-holdout-v0.1 \
+  --proposal-config candidate --crop-screening-config candidate \
+  --output data/evaluation/visual-page-holdout-v0.1/routing/candidate
+python scripts/compare_page_ocsr_routing_runs.py \
+  --baseline data/evaluation/visual-page-holdout-v0.1/routing/baseline \
+  --candidate data/evaluation/visual-page-holdout-v0.1/routing/candidate \
+  --output data/evaluation/visual-page-holdout-v0.1/routing/comparison \
+  --workflow-regressions-passed
+```
+
+Only `accept_molecule` triggers an OCSR call. `reject_negative` and `review_needed` do not. The workflow keeps two explicit outputs: a molecule-extraction stream and an independent baseline document-layout stream. The workflow regression flag may only be supplied after the complete test suite passes for the same Git SHA. Production remains `proposal=baseline,crop_screening=candidate` unless every routing and workflow check passes.

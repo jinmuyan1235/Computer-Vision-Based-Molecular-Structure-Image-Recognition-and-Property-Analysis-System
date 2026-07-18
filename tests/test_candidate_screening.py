@@ -27,7 +27,11 @@ from src.evaluation.visual_detector_compare import compare_visual_detector_runs
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-FROZEN_CHECKSUM_FILE_SHA256 = "74e0999340ccb99e50ed0970957d6cd6a532131c3dd28c7e164f851ac88ef9ab"
+FROZEN_CHECKSUM_FILE_SHA256 = {
+    "visual-dev-v0.1": "74e0999340ccb99e50ed0970957d6cd6a532131c3dd28c7e164f851ac88ef9ab",
+    "visual-holdout-v0.1": "ec144520fbc6b8df682f63659ad8e3d04c30406266eaf4a0588bd7932fed7cdf",
+    "visual-page-holdout-v0.1": "8f16dda80677e6cfbd243a34b77862b8ad80162a2ff409cee28442d87724aa5f",
+}
 
 
 def _screen(image: Image.Image, initial: str = "molecule") -> str:
@@ -220,11 +224,12 @@ def test_dataset_role_is_explicit_then_summary_then_development_default(tmp_path
     assert explicit["dataset_role_source"] == "command_line"
 
 
-def test_frozen_visual_development_snapshot_is_unchanged_when_present() -> None:
-    checksum_file = PROJECT_ROOT / "data" / "datasets" / "visual-dev-v0.1" / "checksums.sha256"
+@pytest.mark.parametrize("version", sorted(FROZEN_CHECKSUM_FILE_SHA256))
+def test_frozen_visual_snapshots_are_unchanged_when_present(version: str) -> None:
+    checksum_file = PROJECT_ROOT / "data" / "datasets" / version / "checksums.sha256"
     if not checksum_file.is_file():
-        pytest.skip("Local frozen development dataset is intentionally not committed.")
-    assert hashlib.sha256(checksum_file.read_bytes()).hexdigest() == FROZEN_CHECKSUM_FILE_SHA256
+        pytest.skip("Local frozen dataset is intentionally not committed.")
+    assert hashlib.sha256(checksum_file.read_bytes()).hexdigest() == FROZEN_CHECKSUM_FILE_SHA256[version]
     root = checksum_file.parent
     for line in checksum_file.read_text(encoding="utf-8").splitlines():
         expected, relative = line.split("  ", 1)
