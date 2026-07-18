@@ -1069,3 +1069,24 @@ python scripts/compare_page_ocsr_routing_runs.py \
 ```
 
 Only `accept_molecule` triggers an OCSR call. `reject_negative` and `review_needed` do not. The workflow keeps two explicit outputs: a molecule-extraction stream and an independent baseline document-layout stream. The workflow regression flag may only be supplied after the complete test suite passes for the same Git SHA. Production remains `proposal=baseline,crop_screening=candidate` unless every routing and workflow check passes.
+
+## Trusted OCSR benchmark (PubChem)
+
+`ocsr-trusted-v0.1` uses the official 2D image and structure properties from the same PubChem CID. Model predictions are never labels. Every CID also receives an RDKit rendering and one deterministic synthetic perturbation; all variants remain in the same scaffold-grouped split.
+
+```bash
+python scripts/build_trusted_ocsr_dataset.py \
+  --target-cids 1000 --minimum-success 800 \
+  --output data/datasets/ocsr-trusted-v0.1
+python scripts/validate_trusted_ocsr_dataset.py \
+  --dataset data/datasets/ocsr-trusted-v0.1
+
+python scripts/evaluate_trusted_ocsr.py --backend molscribe
+python scripts/evaluate_trusted_ocsr.py --backend decimer
+python scripts/evaluate_trusted_ocsr.py --backend ensemble
+python scripts/compare_trusted_ocsr_runs.py
+```
+
+Only the fixed `test` split is used for formal results. It must not be used to tune model settings or ensemble rules. PubChem/RDKit clean depictions and deterministic perturbations are not substitutes for real paper crops, so these results cannot be presented as PMC-paper accuracy.
+
+When the MolScribe and DECIMER prediction files already exist beside the ensemble output directory, the ensemble command replays the frozen agreement/abstention rule over those exact outputs. This avoids duplicate GPU inference and does not tune the rule.
