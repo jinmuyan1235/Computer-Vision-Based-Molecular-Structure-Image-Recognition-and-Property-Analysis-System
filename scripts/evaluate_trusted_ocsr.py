@@ -18,6 +18,11 @@ def main() -> int:
     parser.add_argument("--decimer-predictions", type=Path)
     parser.add_argument("--reuse-predictions", type=Path, help="Recompute metrics from this backend's saved raw predictions.")
     parser.add_argument("--peak-gpu-memory-mib", type=float, help="Preserve a previously measured system-level GPU peak when replaying predictions.")
+    parser.add_argument("--splits", default="test", help="Comma-separated manifest splits.")
+    parser.add_argument("--purpose", default="formal_baseline", choices=["formal_baseline", "diagnostic", "profile_selection", "router_selection", "external_holdout"])
+    parser.add_argument("--include-frozen-test", action="store_true", help="Explicitly allow test reads outside the default formal baseline run.")
+    parser.add_argument("--preprocessing-profile", default="raw", choices=["raw", "alpha_flatten", "autocrop_and_pad", "scale_normalized", "contrast_normalized", "line_enhanced", "combined_normalized"])
+    parser.add_argument("--retry-failures", action="store_true", help="Retry one failed sample in a rebuilt isolated model subprocess.")
     args = parser.parse_args()
     output = args.output or ROOT / f"data/evaluation/ocsr-trusted-v0.1/{args.backend}"
     predictor = None
@@ -34,6 +39,11 @@ def main() -> int:
     result = evaluate_trusted_manifest(
         args.manifest, args.backend, output, predictor=predictor, limit=args.limit,
         measure_gpu=measure_gpu, peak_gpu_memory_mib=args.peak_gpu_memory_mib,
+        splits=tuple(item.strip() for item in args.splits.split(",") if item.strip()),
+        purpose=args.purpose,
+        allow_frozen_test=(args.purpose == "formal_baseline" or args.include_frozen_test),
+        preprocessing_profile=args.preprocessing_profile,
+        retry_failures=args.retry_failures,
     )
     print(json.dumps(result["metrics"], ensure_ascii=False, indent=2)); return 0
 if __name__ == "__main__": raise SystemExit(main())

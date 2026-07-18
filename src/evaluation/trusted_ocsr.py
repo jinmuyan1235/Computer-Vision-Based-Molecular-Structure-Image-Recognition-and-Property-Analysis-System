@@ -6,18 +6,28 @@ import csv
 import json
 import statistics
 import subprocess
+import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from rdkit import Chem, rdBase
 from rdkit.Chem import rdMolDescriptors
+from PIL import Image
 
 from src.datasets.trusted_ocsr import sha256_file, validate_trusted_dataset
 from src.ocsr.base import OCSRResult
+from src.ocsr.decimer_adapter import DECIMERAdapter
 from src.ocsr.ensemble import combine_ensemble_results
+from src.ocsr.input_normalization import InputNormalizationConfig, get_profile, normalize_ocsr_input
+from src.ocsr.molscribe_adapter import MolScribeAdapter
+from src.ocsr.reliability import (
+    DEFAULT_BACKEND_RELIABILITY_CONFIG, BackendReliabilityConfig,
+    classify_backend_failure, run_with_single_retry, sanitize_exception_summary,
+)
 from src.ocsr.recognizer import MoleculeRecognizer
 from src.runtime.metadata import dependency_versions, git_commit
 
@@ -58,7 +68,7 @@ def classify_structural_error(truth: dict[str, Any], predicted: dict[str, Any], 
     """Assign only automatically supportable failure classes."""
     message = str(result.message or "").lower()
     if result.status != "success":
-        return "timeout" if "timeout" in message or "超时" in message else "backend_failure"
+        return result.failure_category or classify_backend_failure(result)
     if not predicted.get("valid"):
         return "invalid_smiles"
     if predicted["canonical"] == truth["canonical"] and predicted["isomeric"] != truth["isomeric"]:
@@ -73,12 +83,16 @@ def classify_structural_error(truth: dict[str, Any], predicted: dict[str, Any], 
         return "wrong_atom"
     if predicted["bond_types"] != truth["bond_types"]:
         return "wrong_bond_order"
+    truth_key = str(truth.get("inchikey") or "").split("-", 1)[0]
+    predicted_key = str(predicted.get("inchikey") or "").split("-", 1)[0]
+    if truth_key and predicted_key and truth_key != predicted_key:
+        return "wrong_connectivity"
     return "structural_mismatch_unclassified"
 
 
 class GPUMemoryMonitor:
     """Best-effort system GPU memory poller; unavailable platforms return None."""
-    def __init__(self, interval: float = 0.1, enabled: bool = True) -> None:
+    def __init__(self, interval: float = 0.5, enabled: bool = True) -> None:
         self.interval = interval
         self.enabled = enabled
         self.peak_mib: float | None = None
@@ -150,8 +164,17 @@ def evaluate_prediction(row: dict[str, str], result: OCSRResult, latency_ms: flo
     truth = _identity(row["ground_truth_isomeric_smiles"])
     predicted = _identity(result.smiles)
     output: dict[str, Any] = dict(row)
+    truth_key = str(truth.get("inchikey") or "")
+    predicted_key = str(predicted.get("inchikey") or "")
+    connectivity_exact = bool(truth_key and predicted_key and truth_key.split("-", 1)[0] == predicted_key.split("-", 1)[0])
+    failure_category = result.failure_category or (
+        classify_backend_failure(result) if result.status != "success" else ""
+    )
+    backend_execution_success = bool(result.status == "success" or failure_category == "output_parse_failure")
     output.update({
-        "backend": result.backend, "predicted_smiles": result.smiles or "", "backend_status": result.status,
+        "backend": result.backend, "predicted_smiles": result.smiles or "", "confidence": result.confidence,
+        "backend_status": result.status,
+        "backend_execution_success": backend_execution_success,
         "backend_success": result.status == "success" and bool(result.smiles), "valid_smiles": bool(predicted.get("valid")),
         "predicted_canonical_smiles": predicted.get("canonical", ""),
         "predicted_isomeric_smiles": predicted.get("isomeric", ""),
@@ -159,8 +182,11 @@ def evaluate_prediction(row: dict[str, str], result: OCSRResult, latency_ms: flo
         "canonical_exact_match": bool(predicted.get("canonical") == truth.get("canonical")),
         "isomeric_exact_match": bool(predicted.get("isomeric") == truth.get("isomeric")),
         "inchikey_exact_match": bool(predicted.get("inchikey") == truth.get("inchikey")),
+        "full_inchikey_exact": bool(predicted.get("inchikey") == truth.get("inchikey")),
+        "connectivity_exact": connectivity_exact,
         "molecular_formula_match": bool(predicted.get("formula") == truth.get("formula")),
-        "connectivity_match": bool(predicted.get("canonical") == truth.get("canonical")),
+        "connectivity_match": connectivity_exact,
+        "nonisomeric_canonical_exact": bool(predicted.get("canonical") == truth.get("canonical")),
         "stereochemistry_exact_match": bool(
             predicted.get("canonical") == truth.get("canonical") and predicted.get("isomeric") == truth.get("isomeric")
         ),
@@ -168,7 +194,26 @@ def evaluate_prediction(row: dict[str, str], result: OCSRResult, latency_ms: flo
         "decision": result.decision or ("accepted" if result.smiles else "rejected"),
         "message": result.message, "model_name": result.model_name, "model_version": result.model_version,
         "model_sha256": result.model_sha256, "device": result.device, "package_version": result.package_version,
+        "raw_output": result.raw_output or "", "failure_category": failure_category,
+        "exception_type": result.exception_type or "",
+        "exception_summary": sanitize_exception_summary(result.exception_summary or ""),
+        "attempt_count": result.attempt_count,
+        "first_attempt_json": json.dumps(result.first_attempt or {}, ensure_ascii=False, sort_keys=True),
+        "retry_attempt_json": json.dumps(result.retry_attempt or {}, ensure_ascii=False, sort_keys=True),
     })
+    charge_or_protonation_different = bool(
+        connectivity_exact and not output["full_inchikey_exact"] and (
+            predicted.get("formal_charge") != truth.get("formal_charge")
+            or predicted.get("formula") != truth.get("formula")
+        )
+    )
+    output["connectivity_correct_charge_or_protonation_different"] = charge_or_protonation_different
+    output["connectivity_correct_stereochemistry_wrong"] = bool(
+        connectivity_exact
+        and not charge_or_protonation_different
+        and predicted.get("canonical") == truth.get("canonical")
+        and not output["isomeric_exact_match"]
+    )
     output["error_type"] = "" if output["inchikey_exact_match"] else classify_structural_error(truth, predicted, result)
     if result.backend == "ensemble":
         output.update(_ensemble_flags(result, truth))
@@ -177,19 +222,33 @@ def evaluate_prediction(row: dict[str, str], result: OCSRResult, latency_ms: flo
     return output
 
 
+def _perturbation_group(row: dict[str, Any]) -> tuple[str, str]:
+    if row.get("image_variant") != "synthetic_perturbation":
+        return "none", "none"
+    kind = str(row.get("perturbation") or "unspecified")
+    try:
+        params = json.loads(str(row.get("perturbation_parameters") or "{}"))
+    except json.JSONDecodeError:
+        params = {}
+    severity = str(params.get("severity") or "composite_unspecified")
+    return kind, severity
+
+
 def summarize_predictions(rows: list[dict[str, Any]], peak_gpu_memory_mib: float | None = None) -> dict[str, Any]:
     total = len(rows)
     latencies = [float(row["latency_ms"]) for row in rows]
     metric_fields = (
-        "backend_success", "valid_smiles", "canonical_exact_match", "isomeric_exact_match",
-        "inchikey_exact_match", "molecular_formula_match", "connectivity_match", "stereochemistry_exact_match",
+        "backend_execution_success", "backend_success", "valid_smiles", "canonical_exact_match", "isomeric_exact_match",
+        "inchikey_exact_match", "full_inchikey_exact", "connectivity_exact", "molecular_formula_match",
+        "connectivity_match", "nonisomeric_canonical_exact", "stereochemistry_exact_match",
+        "connectivity_correct_stereochemistry_wrong", "connectivity_correct_charge_or_protonation_different",
     )
     result: dict[str, Any] = {"sample_count": total}
     for field in metric_fields:
         count = sum(bool(row.get(field)) for row in rows)
         result[f"{field}_count"] = count
         result[f"{field}_rate"] = _rate(count, total)
-    result["false_failure_count"] = total - result["backend_success_count"]
+    result["false_failure_count"] = total - result["backend_execution_success_count"]
     result["false_failure_rate"] = _rate(result["false_failure_count"], total)
     result.update({
         "mean_latency_ms": round(statistics.mean(latencies), 3) if latencies else None,
@@ -197,6 +256,29 @@ def summarize_predictions(rows: list[dict[str, Any]], peak_gpu_memory_mib: float
         "p95_latency_ms": _percentile(latencies, 95), "peak_gpu_memory_mib": peak_gpu_memory_mib,
         "error_distribution": dict(Counter(row["error_type"] for row in rows if row.get("error_type"))),
     })
+    accepted = [row for row in rows if row.get("decision") in {"accepted", "accepted_with_warning"}]
+    false_acceptances = [row for row in accepted if not bool(row.get("full_inchikey_exact"))]
+    result["accepted_prediction_count"] = len(accepted)
+    result["accepted_prediction_rate"] = _rate(len(accepted), total)
+    result["false_acceptance_count"] = len(false_acceptances)
+    result["false_acceptance_rate"] = _rate(len(false_acceptances), total)
+    result["abstention_count"] = total - len(accepted)
+    result["abstention_rate"] = _rate(result["abstention_count"], total)
+    successful = [row for row in rows if bool(row.get("backend_success"))]
+    result["conditional_sample_count"] = len(successful)
+    for field in (
+        "valid_smiles", "canonical_exact_match", "isomeric_exact_match", "full_inchikey_exact",
+        "connectivity_exact", "molecular_formula_match",
+    ):
+        count = sum(bool(row.get(field)) for row in successful)
+        result[f"conditional_{field}_count"] = count
+        result[f"conditional_{field}_rate"] = _rate(count, len(successful))
+    execution_successful = [row for row in rows if bool(row.get("backend_execution_success"))]
+    result["execution_conditional_sample_count"] = len(execution_successful)
+    for field in ("valid_smiles", "full_inchikey_exact", "connectivity_exact"):
+        count = sum(bool(row.get(field)) for row in execution_successful)
+        result[f"execution_conditional_{field}_count"] = count
+        result[f"execution_conditional_{field}_rate"] = _rate(count, len(execution_successful))
     if any(row.get("backend") == "ensemble" for row in rows):
         for field in (
             "both_models_correct", "only_molscribe_correct", "only_decimer_correct", "both_wrong_but_agree",
@@ -219,10 +301,55 @@ def _group_metrics(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]
     for value, members in sorted(grouped.items()):
         metrics = summarize_predictions(members)
         output.append({key: value, **{field: metrics[field] for field in (
-            "sample_count", "backend_success_rate", "valid_smiles_rate", "canonical_exact_match_rate",
+            "sample_count", "backend_execution_success_rate", "backend_success_rate", "valid_smiles_rate", "canonical_exact_match_rate",
             "inchikey_exact_match_rate", "connectivity_match_rate", "mean_latency_ms",
         )}})
     return output
+
+
+def _per_perturbation_metrics(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[_perturbation_group(row)].append(row)
+    output: list[dict[str, Any]] = []
+    for (kind, severity), members in sorted(grouped.items()):
+        metrics = summarize_predictions(members)
+        output.append({
+            "perturbation_type": kind,
+            "severity": severity,
+            "sample_count": metrics["sample_count"],
+            "backend_execution_success_rate": metrics["backend_execution_success_rate"],
+            "valid_smiles_rate": metrics["valid_smiles_rate"],
+            "connectivity_exact_rate": metrics["connectivity_exact_rate"],
+            "full_inchikey_exact_rate": metrics["full_inchikey_exact_rate"],
+        })
+    return output
+
+
+def _cid_consistency(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get("pubchem_cid"))].append(row)
+    output: list[dict[str, Any]] = []
+    counts: Counter[str] = Counter()
+    for cid, members in sorted(grouped.items(), key=lambda item: int(item[0])):
+        correct = {str(row.get("image_variant")): bool(row.get("full_inchikey_exact")) for row in members}
+        official = correct.get("official_clean", False)
+        rendered = correct.get("rendered_clean", False)
+        perturbed = correct.get("synthetic_perturbation", False)
+        if official and rendered and perturbed:
+            category = "all_three_correct"
+        elif rendered and not official and not perturbed:
+            category = "rendered_only_correct"
+        elif (official or rendered) and not perturbed:
+            category = "clean_correct_perturbed_wrong"
+        elif not any((official, rendered, perturbed)):
+            category = "all_three_wrong"
+        else:
+            category = "mixed_other"
+        counts[category] += 1
+        output.append({"pubchem_cid": cid, **correct, "consistency_category": category})
+    return output, dict(sorted(counts.items()))
 
 
 def _complexity_group(row: dict[str, Any]) -> str:
@@ -251,11 +378,65 @@ def _gpu_runtime_metadata() -> dict[str, Any]:
     return metadata
 
 
+def _reset_framework_gpu_peak(backend: str) -> None:
+    try:
+        if backend == "molscribe":
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+        # Do not import or touch TensorFlow here. DECIMER must configure the
+        # physical device before the first TensorFlow GPU operation. Each
+        # benchmark backend runs in a fresh process, so its allocator peak is
+        # already scoped to this run.
+    except Exception:
+        pass
+
+
+def _framework_gpu_peak_mib(backend: str) -> float | None:
+    try:
+        if backend == "molscribe":
+            import torch
+            if torch.cuda.is_available():
+                return round(float(torch.cuda.max_memory_allocated()) / (1024 * 1024), 3)
+        elif backend == "decimer":
+            import tensorflow as tf
+            return round(float(tf.config.experimental.get_memory_info("GPU:0")["peak"]) / (1024 * 1024), 3)
+    except Exception:
+        pass
+    return None
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fields = sorted({key for row in rows for key in row}) if rows else ["sample_id"]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader(); writer.writerows(rows)
+
+
+def _benchmark_predictor(
+    backend: str,
+    reliability_config: BackendReliabilityConfig = DEFAULT_BACKEND_RELIABILITY_CONFIG,
+) -> Callable[[Any], OCSRResult]:
+    """Reuse one loaded model inside the dedicated benchmark process.
+
+    Interactive production isolation remains unchanged. A classified
+    retriable failure is still retried once through the isolated worker in
+    ``run_with_single_retry``.
+    """
+    if backend == "molscribe":
+        adapter = MolScribeAdapter(
+            isolated_subprocess=False,
+            timeout_seconds=reliability_config.molscribe_timeout_seconds,
+        )
+        return adapter.recognize
+    if backend == "decimer":
+        adapter = DECIMERAdapter(
+            isolated_subprocess=False,
+            timeout_seconds=reliability_config.decimer_timeout_seconds,
+        )
+        return adapter.recognize
+    recognizer = MoleculeRecognizer(backend)
+    return recognizer.recognize
 
 
 def evaluate_trusted_manifest(
@@ -266,36 +447,97 @@ def evaluate_trusted_manifest(
     limit: int | None = None,
     measure_gpu: bool = True,
     peak_gpu_memory_mib: float | None = None,
+    splits: tuple[str, ...] = ("test",),
+    purpose: str = "formal_baseline",
+    allow_frozen_test: bool = True,
+    preprocessing_profile: InputNormalizationConfig | str = "raw",
+    retry_failures: bool = False,
+    reliability_config: BackendReliabilityConfig = DEFAULT_BACKEND_RELIABILITY_CONFIG,
 ) -> dict[str, Any]:
     root = manifest.resolve().parent
+    formal_lock = output / "formal_run.lock"
+    if purpose == "external_holdout" and formal_lock.exists():
+        raise FileExistsError(f"External holdout formal output is already frozen: {formal_lock}")
     validation = validate_trusted_dataset(root)
     if not validation["valid"]:
         raise ValueError("Trusted dataset validation failed: " + "; ".join(validation["errors"][:20]))
     all_rows = list(csv.DictReader(manifest.open("r", encoding="utf-8-sig", newline="")))
-    rows = [row for row in all_rows if row.get("split") == "test"]
+    selected_splits = tuple(dict.fromkeys(str(split).strip() for split in splits if str(split).strip()))
+    if not selected_splits:
+        raise ValueError("At least one split is required.")
+    if purpose in {"profile_selection", "tuning", "router_selection"} and "test" in selected_splits:
+        raise ValueError("Frozen test split cannot participate in profile or router selection.")
+    if "test" in selected_splits and not allow_frozen_test:
+        raise ValueError("Reading frozen test requires explicit allow_frozen_test=True.")
+    rows = [row for row in all_rows if row.get("split") in selected_splits]
     if limit is not None: rows = rows[:limit]
     if any(row.get("ground_truth_origin") != "pubchem" or row.get("review_status") != "source_verified" for row in rows):
         raise ValueError("Predictions or unverified labels cannot be used as trusted ground truth.")
-    recognizer = None if predictor else MoleculeRecognizer(backend)
-    infer = predictor or (lambda path: recognizer.recognize(path))  # type: ignore[union-attr]
+    infer = predictor or _benchmark_predictor(backend, reliability_config)
+    profile_config = get_profile(preprocessing_profile) if isinstance(preprocessing_profile, str) else preprocessing_profile
+    if purpose == "external_holdout":
+        protocol = json.loads((root / "protocol.json").read_text(encoding="utf-8"))
+        if protocol.get("dataset_role") != "external_holdout" or protocol.get("model_results_viewed_before_freeze") is not False:
+            raise ValueError("External holdout protocol is missing the pre-evaluation freeze declaration.")
+        if profile_config.profile != "raw":
+            frozen = (protocol.get("frozen_profiles") or {}).get(backend) or {}
+            if frozen.get("profile") != profile_config.profile or frozen.get("profile_sha256") != profile_config.sha256():
+                raise ValueError(
+                    f"Profile {profile_config.profile} is not the train/dev-frozen profile for {backend}."
+                )
     predictions: list[dict[str, Any]] = []
-    with GPUMemoryMonitor(enabled=measure_gpu) as monitor:
+    _reset_framework_gpu_peak(backend)
+    with tempfile.TemporaryDirectory(prefix=f"ocsr_{backend}_{profile_config.profile}_") as temp_directory, GPUMemoryMonitor(enabled=measure_gpu) as monitor:
+        normalized_root = Path(temp_directory)
         for row in rows:
             path = root / row["image_path"]
             started = time.perf_counter()
             try:
-                result = infer(path)
+                if profile_config.profile == "raw":
+                    target: Any = path
+                else:
+                    normalized = normalize_ocsr_input(path, profile_config)
+                    normalized_path = normalized_root / f"{row['sample_id']}.png"
+                    Image.fromarray(normalized).save(normalized_path, "PNG")
+                    target = normalized_path
+                result = (
+                    run_with_single_retry(backend, target, infer, config=reliability_config)
+                    if retry_failures and predictor is None else infer(target)
+                )
             except Exception as exc:
-                result = OCSRResult(None, None, backend, "failed", f"evaluation_error:{exc}")
-            predictions.append(evaluate_prediction(row, result, (time.perf_counter() - started) * 1000))
+                category = classify_backend_failure(exception=exc)
+                result = OCSRResult(
+                    None, None, backend, "failed", f"evaluation_error:{sanitize_exception_summary(exc)}",
+                    failure_category=category,
+                    exception_type=type(exc).__name__,
+                    exception_summary=sanitize_exception_summary(exc),
+                )
+            evaluated = evaluate_prediction(row, result, (time.perf_counter() - started) * 1000)
+            evaluated["preprocessing_profile"] = profile_config.profile
+            evaluated["preprocessing_version"] = profile_config.version
+            evaluated["preprocessing_config_sha256"] = profile_config.sha256()
+            predictions.append(evaluated)
     for row in predictions: row["complexity_group"] = _complexity_group(row)
-    metrics = summarize_predictions(predictions, peak_gpu_memory_mib if peak_gpu_memory_mib is not None else monitor.peak_mib)
+    framework_peak = _framework_gpu_peak_mib(backend)
+    measured_peaks = [
+        value for value in (peak_gpu_memory_mib, monitor.peak_mib, framework_peak)
+        if value is not None
+    ]
+    metrics = summarize_predictions(predictions, max(measured_peaks) if measured_peaks else None)
+    consistency_rows, consistency_counts = _cid_consistency(predictions)
+    metrics["cid_variant_consistency"] = consistency_counts
     metadata = {
-        "backend": backend, "split": "test", "test_sample_count": len(predictions),
-        "test_is_evaluation_only": True, "test_used_for_tuning": False, "git_sha": git_commit(),
+        "backend": backend, "splits": list(selected_splits), "sample_count": len(predictions),
+        "purpose": purpose, "test_is_evaluation_only": "test" in selected_splits,
+        "test_used_for_tuning": False, "git_sha": git_commit(),
         "dataset_checksums_sha256": validation["checksums_sha256"], "rdkit_version": rdBase.rdkitVersion,
         "dependency_versions": dependency_versions(),
+        "preprocessing_profile": asdict(profile_config),
+        "preprocessing_config_sha256": profile_config.sha256(),
+        "retry_failures": retry_failures,
+        "reliability_config": asdict(reliability_config),
         "gpu_runtime": _gpu_runtime_metadata(),
+        "framework_peak_gpu_memory_mib": framework_peak,
         "model_artifacts": [json.loads(item) for item in sorted({
             json.dumps({
                 "model_name": row.get("model_name"), "model_version": row.get("model_version"),
@@ -312,13 +554,19 @@ def evaluate_trusted_manifest(
     _write_csv(output / "per_variant_metrics.csv", _group_metrics(predictions, "image_variant"))
     _write_csv(output / "per_feature_metrics.csv", _group_metrics(predictions, "structure_features"))
     _write_csv(output / "per_complexity_metrics.csv", _group_metrics(predictions, "complexity_group"))
+    _write_csv(output / "per_perturbation_metrics.csv", _per_perturbation_metrics(predictions))
+    _write_csv(output / "per_cid_consistency.csv", consistency_rows)
     _write_csv(output / "latency.csv", [{"sample_id": row["sample_id"], "latency_ms": row["latency_ms"]} for row in predictions])
     report = [
-        f"# Trusted OCSR evaluation: {backend}", "", f"Test images: {len(predictions)}", "",
-        f"- Backend success rate: {metrics['backend_success_rate']:.4f}",
+        f"# Trusted OCSR evaluation: {backend}", "", f"Evaluated images: {len(predictions)}",
+        f"Splits: {', '.join(selected_splits)}", "",
+        f"- Backend execution success rate: {metrics['backend_execution_success_rate']:.4f}",
+        f"- Parseable backend output rate: {metrics['backend_success_rate']:.4f}",
         f"- Valid SMILES rate: {metrics['valid_smiles_rate']:.4f}",
         f"- Canonical exact match: {metrics['canonical_exact_match_rate']:.4f}",
         f"- InChIKey exact match: {metrics['inchikey_exact_match_rate']:.4f}",
+        f"- Connectivity exact (InChIKey first block): {metrics['connectivity_exact_rate']:.4f}",
+        f"- Conditional full InChIKey exact among backend successes: {metrics['conditional_full_inchikey_exact_rate']:.4f}",
         f"- Formula match: {metrics['molecular_formula_match_rate']:.4f}",
         f"- Mean / median / p95 latency (ms): {metrics['mean_latency_ms']} / {metrics['median_latency_ms']} / {metrics['p95_latency_ms']}",
         f"- Peak GPU memory (MiB, system poll): {metrics['peak_gpu_memory_mib']}", "",
@@ -327,9 +575,14 @@ def evaluate_trusted_manifest(
         "PubChem official and RDKit-rendered images are trustworthy structure depictions, but are not real paper crops.",
         "Synthetic perturbations are deterministic stress tests, not a substitute for real scan noise.",
         "These results do not directly estimate accuracy on PMC paper figures; a real-image set with trusted mappings is still required.",
-        "The test split is evaluation-only and was not used to tune model, threshold, or ensemble rules.",
+        "Any test/external-holdout split is evaluation-only and was not used to tune model, threshold, preprocessing, or ensemble rules.",
     ]
     (output / "report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+    if purpose == "external_holdout":
+        formal_lock.write_text(json.dumps({
+            "completed": True, "git_sha": metadata["git_sha"], "dataset_checksums_sha256": metadata["dataset_checksums_sha256"],
+            "backend": backend, "preprocessing_config_sha256": metadata["preprocessing_config_sha256"],
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"metrics": metrics, "metadata": metadata, "predictions": predictions}
 
 
@@ -368,6 +621,10 @@ def ensemble_predictor_from_files(
                 device=row.get("device") or None,
                 package_version=row.get("package_version") or None,
                 result_origin="replayed_real_model_prediction",
+                raw_output=row.get("raw_output") or None,
+                failure_category=row.get("failure_category") or None,
+                exception_type=row.get("exception_type") or None,
+                exception_summary=row.get("exception_summary") or None,
             ))
         return combine_ensemble_results(
             raw_results,
@@ -401,6 +658,10 @@ def backend_predictor_from_file(
             model_name=row.get("model_name") or None, model_version=row.get("model_version") or None,
             model_sha256=row.get("model_sha256") or None, device=row.get("device") or None,
             package_version=row.get("package_version") or None, result_origin="replayed_real_model_prediction",
+            raw_output=row.get("raw_output") or None,
+            failure_category=row.get("failure_category") or None,
+            exception_type=row.get("exception_type") or None,
+            exception_summary=row.get("exception_summary") or None,
         )
     return predictor
 
@@ -433,7 +694,7 @@ def compare_trusted_runs(evaluation_root: Path, output: Path) -> dict[str, Any]:
             errors.append({"backend": backend, "error_type": error, "count": count})
     comparison = {
         "backends": {backend: {key: metrics[backend].get(key) for key in (
-            "sample_count", "backend_success_rate", "valid_smiles_rate", "canonical_exact_match_rate",
+            "sample_count", "backend_execution_success_rate", "backend_success_rate", "valid_smiles_rate", "canonical_exact_match_rate",
             "isomeric_exact_match_rate", "inchikey_exact_match_rate", "molecular_formula_match_rate",
             "connectivity_match_rate", "mean_latency_ms", "median_latency_ms", "p95_latency_ms", "peak_gpu_memory_mib",
         )} for backend in backends},
