@@ -16,6 +16,7 @@ import config
 from src.documents.detectors import (
     HeuristicMoleculeRegionDetector,
     HybridMoleculeRegionDetector,
+    SplitDocumentRegionDetector,
     TrainableMoleculeRegionDetector,
 )
 from src.documents.input_loader import DocumentInputError, DocumentInputLoader, PDFRenderer, check_file_size
@@ -224,10 +225,71 @@ def test_full_document_mode_does_not_recognize_unconfirmed_regions(tmp_path: Pat
     assert "等待人工确认" in result["regions"][0]["message"]
 
 
-def test_default_processor_uses_hybrid_detector(tmp_path: Path) -> None:
+def test_default_processor_uses_split_molecule_and_layout_detector(tmp_path: Path) -> None:
     processor = DocumentOCSRProcessor("demo", tmp_path / "out")
-    assert isinstance(processor.detector, HybridMoleculeRegionDetector)
-    assert isinstance(processor.detector.fallback, HeuristicMoleculeRegionDetector)
+    assert isinstance(processor.detector, SplitDocumentRegionDetector)
+    assert isinstance(processor.detector.molecule_detector, HybridMoleculeRegionDetector)
+    assert isinstance(processor.detector.molecule_detector.fallback, HeuristicMoleculeRegionDetector)
+    assert processor.detector.molecule_detector.fallback.proposal_config.name == "baseline"
+    assert processor.detector.layout_detector.fallback.proposal_config.name == "baseline"
+
+
+def test_split_streams_do_not_overwrite_layout_or_molecule_regions(tmp_path: Path) -> None:
+    page_path = _make_page(tmp_path / "stream_fixture.png", [], text="fixture")
+    page = DocumentPage("doc", 1, str(page_path), 900, 600)
+    molecule_detector = FakeDetector([
+        DocumentRegion("doc", 1, "m1", (100, 100, 300, 300), "molecule", 0.9),
+        DocumentRegion("doc", 1, "ignored-text", (10, 10, 200, 60), "text", 0.8),
+    ])
+    layout_detector = FakeDetector([
+        DocumentRegion("doc", 1, "l1", (10, 10, 200, 60), "text", 0.8),
+        DocumentRegion("doc", 1, "l2", (50, 350, 350, 430), "reaction_like", 0.8),
+        DocumentRegion("doc", 1, "l3", (400, 100, 800, 400), "table", 0.8),
+        DocumentRegion("doc", 1, "ignored-molecule", (100, 100, 300, 300), "molecule", 0.9),
+    ])
+    detector = SplitDocumentRegionDetector(molecule_detector, layout_detector)
+    streams = detector.detect_streams(page)
+    assert [region.region_type for region in streams.molecule_extraction] == ["molecule"]
+    assert {region.region_type for region in streams.document_layout} == {"text", "reaction_like", "table"}
+    assert all(region.source == "molecule_extraction" for region in streams.molecule_extraction)
+    assert all(region.source == "document_layout" for region in streams.document_layout)
+    assert len(streams.combined(page)) == 4
+
+
+def test_candidate_molecule_stream_preserves_baseline_layout_on_mixed_page(tmp_path: Path) -> None:
+    page_image = Image.new("RGB", (1000, 850), "white")
+    draw = ImageDraw.Draw(page_image)
+    for index in range(8):
+        draw.text((40, 20 + index * 28), "Ordinary document body text remains in layout output.", fill="black")
+    molecule = Image.open(PROJECT_ROOT / "data" / "samples" / "caffeine.png").convert("RGB").resize((420, 300))
+    page_image.paste(molecule, (460, 430))
+    page_path = tmp_path / "candidate_molecule_baseline_layout.png"
+    page_image.save(page_path)
+    processor = DocumentOCSRProcessor(
+        "demo", tmp_path / "out", proposal_config="candidate",
+        document_layout_proposal_config="baseline", crop_screening_config="candidate",
+    )
+    streams = processor.detect_page_streams(DocumentPage("doc", 1, str(page_path), 1000, 850))
+    assert any(region.region_type == "molecule" for region in streams.molecule_extraction)
+    assert any(region.region_type == "text" for region in streams.document_layout)
+
+
+def test_baseline_layout_stream_preserves_table_fixture(tmp_path: Path) -> None:
+    image = Image.new("RGB", (900, 600), "white")
+    draw = ImageDraw.Draw(image)
+    for x in range(100, 801, 140):
+        draw.line((x, 100, x, 500), fill="black", width=4)
+    for y in range(100, 501, 80):
+        draw.line((100, y, 800, y), fill="black", width=4)
+    page_path = tmp_path / "table_fixture.png"
+    image.save(page_path)
+    processor = DocumentOCSRProcessor(
+        "demo", tmp_path / "out", proposal_config="candidate",
+        document_layout_proposal_config="baseline", crop_screening_config="candidate",
+    )
+    streams = processor.detect_page_streams(DocumentPage("doc", 1, str(page_path), 900, 600))
+    assert any(region.region_type == "table" for region in streams.document_layout)
+    assert not streams.molecule_extraction
 
 
 def test_full_document_mode_only_recognizes_screened_molecule_regions(tmp_path: Path) -> None:

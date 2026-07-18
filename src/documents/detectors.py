@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -157,6 +158,74 @@ class HybridMoleculeRegionDetector(BaseMoleculeRegionDetector):
             region.page_number = page.page_number
             region.region_id = f"p{page.page_number:03d}_r{index:03d}"
         return regions
+
+
+@dataclass
+class DocumentRegionStreams:
+    """Independent molecule-extraction and document-layout detector outputs."""
+
+    molecule_extraction: list[DocumentRegion]
+    document_layout: list[DocumentRegion]
+    original_order: list[DocumentRegion] | None = None
+
+    def combined(self, page: DocumentPage) -> list[DocumentRegion]:
+        if self.original_order is not None:
+            return list(self.original_order)
+        regions = sorted(
+            [*self.molecule_extraction, *self.document_layout],
+            key=lambda item: (item.bbox[1], item.bbox[0], item.region_type),
+        )
+        for index, region in enumerate(regions, start=1):
+            region.document_id = page.document_id
+            region.page_number = page.page_number
+            region.region_id = f"p{page.page_number:03d}_r{index:03d}"
+        return regions
+
+
+class SplitDocumentRegionDetector(BaseMoleculeRegionDetector):
+    """Keep molecule extraction independent from non-molecule document layout."""
+
+    name = "split-molecule-layout"
+
+    def __init__(
+        self,
+        molecule_detector: BaseMoleculeRegionDetector,
+        layout_detector: BaseMoleculeRegionDetector,
+    ) -> None:
+        self.molecule_detector = molecule_detector
+        self.layout_detector = layout_detector
+
+    def detect_streams(self, page: DocumentPage) -> DocumentRegionStreams:
+        shared_regions: list[DocumentRegion] | None = None
+        molecule_fallback = getattr(self.molecule_detector, "fallback", None)
+        layout_fallback = getattr(self.layout_detector, "fallback", None)
+        if (
+            isinstance(molecule_fallback, HeuristicMoleculeRegionDetector)
+            and isinstance(layout_fallback, HeuristicMoleculeRegionDetector)
+            and molecule_fallback.proposal_config == layout_fallback.proposal_config
+            and molecule_fallback.crop_screening_config == layout_fallback.crop_screening_config
+            and not getattr(getattr(self.molecule_detector, "trainable", None), "available", False)
+            and not getattr(getattr(self.layout_detector, "trainable", None), "available", False)
+        ):
+            shared_regions = self.molecule_detector.detect(page)
+        molecule_source = shared_regions if shared_regions is not None else self.molecule_detector.detect(page)
+        layout_source = shared_regions if shared_regions is not None else self.layout_detector.detect(page)
+        molecule_regions = [
+            region for region in molecule_source
+            if region.region_type == "molecule"
+        ]
+        layout_regions = [
+            region for region in layout_source
+            if region.region_type != "molecule"
+        ]
+        for region in molecule_regions:
+            region.source = "molecule_extraction"
+        for region in layout_regions:
+            region.source = "document_layout"
+        return DocumentRegionStreams(molecule_regions, layout_regions)
+
+    def detect(self, page: DocumentPage) -> list[DocumentRegion]:
+        return self.detect_streams(page).combined(page)
 
 
 def page_quality(image: np.ndarray) -> dict[str, Any]:
