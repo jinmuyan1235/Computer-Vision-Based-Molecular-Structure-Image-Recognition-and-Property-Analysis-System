@@ -1124,3 +1124,17 @@ python scripts/validate_trusted_ocsr_v2.py \
 `ocsr-trusted-v0.2` contains new PubChem identities only, uses the single `external_holdout` split, records one explicit perturbation type per CID, and refuses overwrite. Freeze it before any model prediction is viewed. Formal external evaluation output directories are also write-once. Neither trusted benchmark estimates performance on real PMC crops, Markush structures, handwritten chemistry, dense schemes, or scan artifacts not represented by the declared perturbations.
 
 When the MolScribe and DECIMER prediction files already exist beside the ensemble output directory, the ensemble command replays the frozen agreement/abstention rule over those exact outputs. This avoids duplicate GPU inference and does not tune the rule.
+
+### DECIMER fine-tuning feasibility guard
+
+Before attempting DECIMER fine-tuning, run the bounded interface audit and data export in the actual GPU environment:
+
+```bash
+python scripts/check_decimer_finetune_feasibility.py \
+  --dataset data/datasets/ocsr-trusted-v0.1 \
+  --output data/evaluation/decimer-finetune-feasibility/official-aware-50cid
+```
+
+The protocol deterministically selects exactly 50 unique `official_clean` CIDs from the frozen v0.1 `train` split and creates a 40/10 probe-train/probe-dev export. It never reads model predictions as labels and refuses to overwrite an existing export. If the installed DECIMER package has no supported public training interface or cannot reliably resume its inference weights, the command records a hard stop and deliberately does not run a batch, epoch, MolScribe, ensemble, external evaluation, or v0.3 construction.
+
+Current conclusion: the installed DECIMER distribution is supported here for reliable inference only. It has no stable public training API, and its inference SavedModel cannot reliably restore optimizer or training state in the current TensorFlow environment. DECIMER fine-tuning is therefore disabled for this environment, the original production weights remain unchanged, and `blocked_before_training` must not be bypassed. Because no training batch was run, this conclusion makes no claim that GPU memory is sufficient and provides no estimated training speed.
