@@ -1,28 +1,31 @@
-"""Compatibility wrapper for streamlit-drawable-canvas on recent Streamlit.
-
-The component's published Python wrapper uses a private Streamlit image API whose
-signature changed in Streamlit 1.59.  Passing the background as an inline PNG keeps
-the component self-contained and avoids depending on that private API.
-"""
+"""Compatibility wrapper for streamlit-drawable-canvas on recent Streamlit."""
 
 from __future__ import annotations
 
-import base64
-import io
 from copy import deepcopy
+from hashlib import md5
 
 import numpy as np
 from PIL import Image
+import streamlit as st
+from streamlit.elements.lib.image_utils import image_to_url
+from streamlit.elements.lib.layout_utils import LayoutConfig
 from streamlit_drawable_canvas import CanvasResult, _component_func, _data_url_to_image
 
 
-def image_data_url(image: Image.Image) -> str:
-    """Return a browser-ready PNG data URL without Streamlit internals."""
+def background_image_url(image: Image.Image, width: int, key: str | None) -> str:
+    """Register a canvas background with Streamlit's current media API."""
 
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
+    url = image_to_url(
+        image,
+        LayoutConfig(width=width),
+        True,
+        "RGB",
+        "PNG",
+        f"drawable-canvas-bg-{md5(image.tobytes()).hexdigest()}-{key}",
+    )
+    base_path = st._config.get_option("server.baseUrlPath")
+    return f"{base_path}{url}"
 
 
 def st_canvas_compat(
@@ -43,8 +46,8 @@ def st_canvas_compat(
 ) -> CanvasResult:
     """Render the drawable canvas with a Streamlit-1.59-safe background."""
 
-    background_image_url = image_data_url(background_image) if background_image else None
-    if background_image_url:
+    image_url = background_image_url(background_image, width, key) if background_image else None
+    if image_url:
         background_color = ""
     drawing = deepcopy(initial_drawing) if initial_drawing is not None else {"version": "4.4.0"}
     drawing["background"] = background_color
@@ -53,7 +56,7 @@ def st_canvas_compat(
         strokeWidth=stroke_width,
         strokeColor=stroke_color,
         backgroundColor=background_color,
-        backgroundImageURL=background_image_url,
+        backgroundImageURL=image_url,
         realtimeUpdateStreamlit=update_streamlit and drawing_mode != "polygon",
         canvasHeight=height,
         canvasWidth=width,

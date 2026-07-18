@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import base64
 import csv
-import io
 import json
 from pathlib import Path
 
@@ -15,7 +13,7 @@ from scripts.snapshot_page_dataset import snapshot
 from src.datasets.page_annotations import PageAnnotationStore
 from src.evaluation.page_proposals import bbox_iou, match_boxes, evaluate_page_proposals
 from src.ui.page_annotation_page import _annotation_from_canvas_object, _canvas_object
-from src.ui.drawable_canvas_compat import image_data_url
+from src.ui.drawable_canvas_compat import background_image_url
 
 
 def _workspace(root: Path, *, completed: bool = False) -> Path:
@@ -56,11 +54,20 @@ def test_canvas_bbox_round_trip_preserves_class_and_original_coordinates() -> No
     assert resized == {"bbox": [100, 200, 600, 700], "class": "reaction"}
 
 
-def test_canvas_background_uses_inline_png_without_streamlit_image_api() -> None:
-    url = image_data_url(Image.new("RGB", (12, 8), "white"))
-    assert url.startswith("data:image/png;base64,")
-    decoded = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
-    assert decoded.size == (12, 8)
+def test_canvas_background_uses_current_streamlit_layout_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    def fake_image_to_url(image, layout_config, *args):
+        captured["size"] = image.size
+        captured["width"] = layout_config.width
+        return "/media/test.png"
+
+    monkeypatch.setattr("src.ui.drawable_canvas_compat.image_to_url", fake_image_to_url)
+    monkeypatch.setattr(
+        "src.ui.drawable_canvas_compat.st._config.get_option", lambda _name: "",
+    )
+    assert background_image_url(Image.new("RGB", (12, 8), "white"), 12, "test") == "/media/test.png"
+    assert captured == {"size": (12, 8), "width": 12}
 
 
 def test_iou_and_one_to_many_many_to_one_statistics() -> None:
