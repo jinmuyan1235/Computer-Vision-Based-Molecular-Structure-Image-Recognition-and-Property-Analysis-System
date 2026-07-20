@@ -77,7 +77,7 @@ def _render_upload_step() -> None:
         show_upload_preview(payload["bytes"], f"上传原图：{payload['name']}")
     with right:
         st.write(f"**文件名：** {payload['name']}")
-        st.caption(f"SHA-256：{payload['sha256']}")
+        st.caption("文件哈希将在识别后的“技术详情”中记录。")
         if st.button("进入调整图片", type="primary", key="go_adjust_image"):
             _request_workflow_stage("2 调整图片")
             st.rerun()

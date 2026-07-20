@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import streamlit as st
 
-from config import DATA_DIR, OUTPUT_DIR
+from config import OUTPUT_DIR
 from src.analysis.correction import (
     apply_ensemble_candidate_result,
     apply_strategy_attempt_result,
     apply_smiles_correction,
+    confirm_structure,
+    human_review_state,
+    is_structure_confirmed,
+    mark_structure_unable_to_confirm,
     restore_original_prediction,
-    save_correction_feedback,
+    revoke_structure_confirmation,
     structure_similarity,
 )
 from src.chem.mol_drawer import draw_molecule
+from src.chem.smiles_validator import validate_smiles
 from src.export.json_exporter import to_json_text
 from src.export.pdf_exporter import save_pdf
 from src.export.structure_exporter import copyable_structure_fields, export_structure_files
@@ -30,13 +37,41 @@ from src.ui.streamlit_compat import segmented_control
 from src.utils.file_utils import safe_stem
 
 
-REPORT_SECTION_OPTIONS = ["概览", "人工纠错", "候选比较", "分子性质", "技术信息"]
+REPORT_SECTION_OPTIONS = ["概览", "确认与修正", "候选比较", "分子性质", "技术详情"]
 
 
 def _final_smiles(report: dict[str, Any]) -> str | None:
     final = report.get("final") or {}
     ocsr = report.get("ocsr") or {}
     return final.get("smiles") or final.get("canonical_smiles") or ocsr.get("smiles")
+
+
+def _format_local_time(value: Any) -> str:
+    """Format an ISO timestamp in the machine's local timezone for the UI."""
+    if not value:
+        return "时间未记录"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _has_second_candidate(report: dict[str, Any]) -> bool:
+    """Return whether candidate comparison has at least two actual records."""
+    ocsr = report.get("ocsr") or {}
+    candidates = [item for item in (ocsr.get("candidates") or []) if isinstance(item, dict)]
+    attempts = [
+        item for item in (ocsr.get("strategy_attempts") or [])
+        if isinstance(item, dict) and (item.get("smiles") or item.get("canonical_smiles"))
+    ]
+    return len(candidates) >= 2 or len(attempts) >= 2
+
+
+def _report_section_options(report: dict[str, Any]) -> list[str]:
+    return [item for item in REPORT_SECTION_OPTIONS if item != "候选比较" or _has_second_candidate(report)]
 
 
 def _persist_report_update(
@@ -112,8 +147,6 @@ def show_ensemble_details(ocsr: dict[str, Any]) -> None:
                     "原始 SMILES": candidate.get("raw_smiles"),
                     "Canonical SMILES": candidate.get("canonical_smiles"),
                     "有效": status_label(candidate.get("valid")),
-                    "耗时(ms)": candidate.get("inference_time_ms"),
-                    "错误": candidate.get("error"),
                 })
             render_records(rows, title_keys=("后端",))
 
@@ -123,7 +156,7 @@ def show_ensemble_candidate_actions(report: dict[str, Any]) -> dict[str, Any]:
     candidates = ocsr.get("candidates") or []
     if not candidates:
         return report
-    with st.expander("候选结果一键确认", expanded=False):
+    with st.expander("候选结果选择", expanded=False):
         current = report
         for candidate in candidates:
             current = _show_ensemble_candidate_card(current, candidate)
@@ -141,25 +174,18 @@ def _show_ensemble_candidate_card(report: dict[str, Any], candidate: dict[str, A
     with left:
         st.code(smiles or "-", language=None)
         st.caption(f"canonical: {canonical}")
-        st.caption(
-            f"模型：{candidate.get('model_name') or '-'}；"
-            f"置信度：{candidate.get('confidence') if candidate.get('confidence') is not None else '模型未提供'}；"
-            f"策略：{candidate.get('inference_strategy') or '-'}；"
-            f"耗时(ms)：{candidate.get('inference_time_ms') or '-'}"
-        )
+        st.caption(f"置信度：{candidate.get('confidence') if candidate.get('confidence') is not None else '模型未提供'}")
         if similarity:
             st.caption("候选相似性：" + "；".join(similarity))
         if risk_hints:
             st.warning("风险提示：" + ", ".join(str(item) for item in risk_hints))
-        if candidate.get("error"):
-            st.error(str(candidate.get("error")))
     with right:
         structure_path = _candidate_structure_path(report, candidate)
         if structure_path:
             show_structure(structure_path, f"{backend_label(backend, short=True)} 重绘结构")
     if candidate.get("valid") and smiles:
         analysis_id = report.get("analysis_id") or "image"
-        if st.button(f"采用 {backend_label(backend, short=True)} 结果", key=f"apply_candidate_{analysis_id}_{backend}"):
+        if st.button(f"选为当前候选：{backend_label(backend, short=True)}", key=f"apply_candidate_{analysis_id}_{backend}"):
             updated = apply_ensemble_candidate_result(report, backend, report_output_dir(report, OUTPUT_DIR))
             error = (updated.get("correction") or {}).get("last_error")
             if error:
@@ -207,12 +233,7 @@ def show_strategy_attempts(report: dict[str, Any]) -> dict[str, Any]:
     with st.expander("多预处理策略尝试", expanded=False):
         selected = ocsr.get("selected_strategy") or "-"
         agreement = ocsr.get("strategy_agreement")
-        agreement_label = "可比较成功结果不足" if agreement is None else ("一致" if agreement else "不一致")
-        st.caption(
-            f"selected_strategy: {selected}; "
-            f"strategy_agreement: {agreement_label}; "
-            f"attempt_count: {len(attempts)}"
-        )
+        st.caption(f"当前候选策略：{selected}；候选间结构{'一致' if agreement else '不一致' if agreement is False else '暂不可比较'}。")
         rows = []
         for attempt in attempts:
             rows.append({
@@ -222,14 +243,11 @@ def show_strategy_attempts(report: dict[str, Any]) -> dict[str, Any]:
                 "canonical_smiles": attempt.get("canonical_smiles"),
                 "valid_smiles": status_label(attempt.get("valid_smiles")),
                 "confidence": attempt.get("confidence"),
-                "retry_reason_codes": attempt.get("retry_reason_codes"),
-                "inference_time_ms": attempt.get("inference_time_ms"),
-                "message": attempt.get("message"),
             })
         render_records(
             rows,
             title_keys=("strategy",),
-            summary_keys=("status", "canonical_smiles", "confidence", "retry_reason_codes"),
+            summary_keys=("status", "canonical_smiles", "confidence"),
         )
         valid_options = [
             str(attempt.get("strategy"))
@@ -296,9 +314,7 @@ def show_recognition_decision(report: dict[str, Any]) -> None:
         st.info(f"识别决策：{value or '未知'}")
     if message:
         st.caption(message)
-    reason_codes = decision.get("reason_codes") or []
-    if reason_codes:
-        st.caption("原因码：" + ", ".join(str(item) for item in reason_codes))
+    # Technical reason codes are intentionally kept out of the ordinary view.
 
 
 def show_structure_exports(report: dict[str, Any], key_prefix: str) -> None:
@@ -384,7 +400,10 @@ def show_model_trust_and_capabilities(report: dict[str, Any]) -> None:
 
 
 def _render_result_message(report: dict[str, Any], ocsr: dict[str, Any]) -> None:
-    st.success(report.get("message", "分析完成。"))
+    if (report.get("input") or {}).get("type") == "image" and not is_structure_confirmed(report):
+        st.info("已生成候选结构。请对照原图确认、修改 SMILES，或标记为无法确认。")
+    else:
+        st.success(report.get("message", "分析完成。"))
     if ocsr.get("backend") == "demo":
         st.warning("当前是演示结果：系统按内置样例文件名返回固定 SMILES，并没有进行真实图片识别。")
     elif ocsr.get("result_origin") in {"real_model", "real_model_ensemble"}:
@@ -396,30 +415,150 @@ def _render_core_result(report: dict[str, Any]) -> None:
     correction = report.get("correction") or {}
     final = report.get("final") or {}
     validation = report.get("validation") or {}
-    left, right = st.columns([1.05, 0.95])
+    confirmed = is_structure_confirmed(report)
+    structure_label = "最终结构" if confirmed else "候选结构"
+    original_path = _original_image_path(report)
+    left, right = st.columns(2)
     with left:
-        st.subheader("核心识别结果")
-        st.code(final.get("smiles") or ocsr.get("smiles") or "", language=None)
-        st.write(f"**Canonical SMILES：** `{final.get('canonical_smiles') or validation.get('canonical_smiles') or '-'}`")
-        if final.get("standardized_smiles") or validation.get("standardized_smiles"):
-            st.write(f"**Standardized SMILES：** `{final.get('standardized_smiles') or validation.get('standardized_smiles')}`")
-        confidence = ocsr.get("confidence")
-        st.write(f"**识别后端：** {backend_label(ocsr.get('backend'), short=True)}")
-        st.write(f"**置信度：** {confidence if confidence is not None else '模型未提供'}")
-        st.write(f"**当前结果来源：** {final.get('source') or '未知'}")
-        st.write(f"**RDKit 校验：** {'有效' if validation.get('valid') else '无效'}")
-        if correction.get("applied"):
-            st.info(f"已应用人工修正：`{correction.get('corrected_canonical_smiles')}`")
+        st.subheader("原始图片")
+        if original_path:
+            st.image(str(original_path), caption="上传原图", width=480)
+        else:
+            st.info("原始图片文件当前不可用。")
     with right:
-        st.subheader("分子结构重绘")
-        show_structure((report.get("images") or {}).get("redrawn_molecule"), "最终分析结构")
+        st.subheader(f"{structure_label}重绘图")
+        show_structure((report.get("images") or {}).get("redrawn_molecule"), f"{structure_label}（RDKit 重绘）")
+
+    st.markdown(f"#### {structure_label}")
+    st.code(final.get("smiles") or ocsr.get("smiles") or "", language=None)
+    st.write(f"**Canonical SMILES：** `{final.get('canonical_smiles') or validation.get('canonical_smiles') or '-'}`")
+    st.write(f"**RDKit 校验：** {'有效' if validation.get('valid') else '无效'}")
+    confidence = ocsr.get("confidence")
+    st.caption(f"模型置信度：{confidence if confidence is not None else '模型未提供'}；该数值不等同于人工确认。")
+    if correction.get("applied"):
+        st.info("当前候选已应用人工输入的 SMILES；模型原始预测仍保留在技术详情和修改面板中。")
+
+
+def _original_image_path(report: dict[str, Any]) -> Path | None:
+    preprocessing = (report.get("images") or {}).get("preprocessing") or {}
+    candidates = [
+        preprocessing.get("uploaded_original"),
+        (report.get("input") or {}).get("path"),
+        preprocessing.get("original"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(str(candidate)).is_file():
+            return Path(str(candidate)).resolve()
+    return None
+
+
+def _render_human_review_actions(report: dict[str, Any]) -> dict[str, Any]:
+    """Render the three explicit single-image review actions."""
+    review = human_review_state(report)
+    correction = report.get("correction") or {}
+    analysis_id = str(report.get("analysis_id") or "image")
+    status = review.get("status")
+    states = st.columns(2)
+    states[0].metric("确认状态", "已确认" if status == "confirmed" else "无法确认" if status == "unable_to_confirm" else "未确认")
+    states[1].metric("修正状态", "已修正" if correction.get("applied") else "未修正")
+    if status == "confirmed":
+        st.success(f"已确认 · {_format_local_time(review.get('reviewed_at'))}")
+    elif status == "unable_to_confirm":
+        st.error("当前结构无法人工确认。正式报告和结构文件仍被锁定。")
+    else:
+        st.warning("当前仅为候选结构，尚未经过人工确认。")
+
+    if status == "confirmed":
+        actions = st.columns(2)
+        if actions[0].button("撤销确认", key=f"revoke_confirmation_{analysis_id}"):
+            updated = revoke_structure_confirmation(report)
+            _persist_report_update(updated, report, "revoke_confirmation", "用户撤销结构确认")
+            _apply_report_update_and_rerun(updated)
+        with actions[1].popover("重新修改结构"):
+            updated = _render_live_smiles_editor(report, analysis_id)
+            if updated is not report:
+                return updated
+        return report
+
+    actions = st.columns(3)
+    if actions[0].button(
+        "确认结构正确",
+        type="primary",
+        key=f"confirm_structure_{analysis_id}",
+        disabled=status == "confirmed" or not (report.get("validation") or {}).get("valid"),
+    ):
+        updated = confirm_structure(report)
+        error = human_review_state(updated).get("last_error")
+        if error:
+            st.error(str(error))
+        else:
+            _persist_report_update(updated, report, "confirm_structure", "用户确认结构正确")
+            _apply_report_update_and_rerun(updated)
+
+    with actions[1].popover("修改 SMILES"):
+        updated = _render_live_smiles_editor(report, analysis_id)
+        if updated is not report:
+            return updated
+
+    if actions[2].button("无法确认", key=f"unable_to_confirm_{analysis_id}"):
+        updated = mark_structure_unable_to_confirm(report)
+        _persist_report_update(updated, report, "unable_to_confirm", "用户无法确认候选结构")
+        _apply_report_update_and_rerun(updated)
+    return report
+
+
+def _render_live_smiles_editor(report: dict[str, Any], analysis_id: str) -> dict[str, Any]:
+    ocsr = report.get("ocsr") or {}
+    correction = report.get("correction") or {}
+    final = report.get("final") or {}
+    predicted = ocsr.get("predicted_smiles") or ocsr.get("smiles") or ""
+    current = correction.get("corrected_smiles") or final.get("raw_smiles") or final.get("smiles") or predicted
+    st.text_input("模型原始预测（保留）", value=predicted, disabled=True, key=f"original_prediction_{analysis_id}")
+    edited = st.text_input(
+        "候选 SMILES",
+        value=current,
+        key=f"live_corrected_smiles_{analysis_id}",
+        help="输入变化后立即执行 RDKit 校验、canonical 化和结构重绘。",
+    )
+    validation = validate_smiles(edited)
+    if not validation.get("valid"):
+        st.error(str(validation.get("error") or "SMILES 无效。"))
+        return report
+
+    canonical = str(validation.get("canonical_smiles") or "")
+    st.success("RDKit 校验通过")
+    st.code(canonical, language=None)
+    preview_dir = report_output_dir(report, OUTPUT_DIR) / "candidate_previews"
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    preview_path = preview_dir / f"{safe_stem(analysis_id)}_{digest}.png"
+    try:
+        if not preview_path.is_file():
+            draw_molecule(canonical, preview_path)
+        show_structure(preview_path, "实时候选结构预览")
+    except Exception as exc:
+        st.error(f"结构重绘失败：{exc}")
+        return report
+
+    if st.button("应用为候选结构", type="primary", key=f"apply_live_correction_{analysis_id}"):
+        updated = apply_smiles_correction(report, edited, report_output_dir(report, OUTPUT_DIR))
+        error = (updated.get("correction") or {}).get("last_error")
+        if error:
+            st.error(str(error))
+            return report
+        _persist_report_update(updated, report, "user_correction", "用户修改候选 SMILES")
+        _apply_report_update_and_rerun(updated)
+        return updated
+    return report
 
 
 def _render_descriptor_metrics(report: dict[str, Any]) -> None:
     descriptors = report.get("descriptors") or {}
     if not descriptors:
         return
-    st.subheader("分子性质")
+    confirmed = is_structure_confirmed(report)
+    st.subheader("分子性质" if confirmed else "候选性质预览")
+    if not confirmed:
+        st.error("免责声明：以下性质由尚未人工确认的候选结构计算，仅供预览，不得作为正式分析结论。")
     labels = {
         "formula": "分子式",
         "molecular_weight": "分子量",
@@ -485,10 +624,34 @@ def _render_preprocessing_details(report: dict[str, Any], show_preprocessing: bo
                 show_preprocess_thumbnail(stage_paths[name], titles[name])
 
 
+def _compact_technical(value: Any, key: str = "") -> Any:
+    """Remove empty technical values and express recorded durations in seconds."""
+    if value is None or (isinstance(value, str) and (not value.strip() or value.strip().lower() == "none")):
+        return None
+    if isinstance(value, dict):
+        compact: dict[str, Any] = {}
+        for child_key, child_value in value.items():
+            output_key = str(child_key)
+            converted = child_value
+            if output_key.endswith("_time_ms") and isinstance(child_value, (int, float)) and not isinstance(child_value, bool):
+                output_key = output_key[:-2] + "seconds"
+                converted = round(float(child_value) / 1000.0, 3)
+            cleaned = _compact_technical(converted, output_key)
+            if cleaned is not None and cleaned != {} and cleaned != []:
+                compact[output_key] = cleaned
+        return compact or None
+    if isinstance(value, (list, tuple)):
+        compact_list = [_compact_technical(item, key) for item in value]
+        compact_list = [item for item in compact_list if item is not None and item != {} and item != []]
+        return compact_list or None
+    return value
+
+
 def _render_technical_diagnostics(report: dict[str, Any]) -> None:
     ocsr = report.get("ocsr") or {}
     runtime = report.get("runtime") or {}
-    st.json({
+    inference_ms = ocsr.get("inference_time_ms")
+    payload = _compact_technical({
         "backend": ocsr.get("backend"),
         "device": ocsr.get("device"),
         "model_name": ocsr.get("model_name"),
@@ -498,12 +661,28 @@ def _render_technical_diagnostics(report: dict[str, Any]) -> None:
         "git_commit": ocsr.get("git_commit") or runtime.get("git_commit"),
         "app_mode": runtime.get("app_mode"),
         "dependency_versions": ocsr.get("dependency_versions") or runtime.get("dependency_versions"),
-        "inference_time_ms": ocsr.get("inference_time_ms"),
+        "inference_time_seconds": round(float(inference_ms) / 1000.0, 3)
+        if isinstance(inference_ms, (int, float)) and not isinstance(inference_ms, bool)
+        else None,
+        "created_at_utc": report.get("created_at"),
+        "reviewed_at_utc": human_review_state(report).get("reviewed_at"),
+        "corrected_at_utc": (report.get("correction") or {}).get("corrected_at"),
+        "recognition_decision": report.get("recognition_decision"),
+        "production_routing": report.get("production_routing"),
+        "recognition_audit": report.get("recognition_audit"),
+        "human_review": human_review_state(report),
+        "review_events": report.get("review_events"),
+        "image_sha256": (report.get("input") or {}).get("image_sha256"),
+        "ocsr_full": ocsr,
     })
+    st.json(payload or {})
 
 
 def show_report_export_actions(report: dict[str, Any], export_pdf: bool, key_prefix: str) -> None:
     """Render compact report export actions without occupying the whole page."""
+    if (report.get("input") or {}).get("type") == "image":
+        _show_single_image_exports(report, key_prefix)
+        return
     final = report.get("final") or {}
     validation = report.get("validation") or {}
     smiles = final.get("smiles") or (report.get("ocsr") or {}).get("smiles") or ""
@@ -541,6 +720,80 @@ def show_report_export_actions(report: dict[str, Any], export_pdf: bool, key_pre
         st.success("已标记保留；自动清理不会删除该分析记录。")
 
 
+def _show_single_image_exports(report: dict[str, Any], key_prefix: str) -> None:
+    """Enforce candidate/formal export permissions for single-image reports."""
+    confirmed = is_structure_confirmed(report)
+    review = human_review_state(report)
+    pdf_kind = "正式" if confirmed else "候选"
+    if confirmed:
+        st.success("结构已人工确认：可导出正式 PDF、SMI、MOL 和 SDF。")
+    else:
+        status_text = "无法确认" if review.get("status") == "unable_to_confirm" else "未人工确认"
+        st.warning(f"当前状态：{status_text}。只能导出带“未人工确认”水印的候选 PDF。")
+
+    pdf_path = report_output_dir(report, OUTPUT_DIR) / f"{safe_stem(key_prefix)}_{'formal' if confirmed else 'candidate'}_report.pdf"
+    pdf_result = save_pdf(report, pdf_path)
+    if pdf_result.get("success"):
+        pdf_label = "下载正式 PDF" if confirmed else "下载候选 PDF（未人工确认）"
+        st.download_button(
+            pdf_label,
+            Path(str(pdf_result["path"])).read_bytes(),
+            file_name=Path(str(pdf_result["path"])).name,
+            mime="application/pdf",
+            key=f"image_pdf_{key_prefix}_{pdf_kind}",
+        )
+    else:
+        st.caption(str(pdf_result.get("message") or "PDF 生成失败。"))
+
+    if confirmed:
+        final = report.get("final") or {}
+        validation = report.get("validation") or {}
+        smiles = str(final.get("smiles") or validation.get("canonical_smiles") or "")
+        try:
+            fields = copyable_structure_fields(report)
+            copy_columns = st.columns(3)
+            copy_columns[0].text_input(
+                "复制最终 SMILES",
+                value=smiles,
+                key=f"copy_final_smiles_{key_prefix}",
+            )
+            copy_columns[1].text_input(
+                "复制 Canonical SMILES",
+                value=str(fields.get("canonical_smiles") or ""),
+                key=f"copy_canonical_smiles_{key_prefix}",
+            )
+            copy_columns[2].text_input(
+                "复制 InChIKey",
+                value=str(fields.get("inchikey") or ""),
+                key=f"copy_inchikey_{key_prefix}",
+            )
+            exports = export_structure_files(
+                report,
+                report_output_dir(report, OUTPUT_DIR) / "formal_structure_exports",
+                prefix=f"{safe_stem(key_prefix)}_confirmed",
+            )
+            specs = [
+                ("下载 SMI", smiles.encode("utf-8") + b"\n", f"{safe_stem(key_prefix)}_confirmed.smi", "chemical/x-daylight-smiles"),
+                ("下载 MOL", Path(exports["mol"]).read_bytes(), Path(exports["mol"]).name, "chemical/x-mdl-molfile"),
+                ("下载 SDF", Path(exports["sdf"]).read_bytes(), Path(exports["sdf"]).name, "chemical/x-mdl-sdfile"),
+            ]
+            columns = st.columns(3)
+            for index, (label, data, filename, mime) in enumerate(specs):
+                columns[index].download_button(
+                    label,
+                    data,
+                    file_name=filename,
+                    mime=mime,
+                    key=f"formal_{index}_{key_prefix}",
+                )
+        except Exception as exc:
+            st.caption(f"正式结构文件导出不可用：{exc}")
+
+    if report.get("run") and st.button("保留本次分析记录", key=f"protect_run_{key_prefix}"):
+        mark_run_protected_from_report(report, "user_keep")
+        st.success("已标记保留；自动清理不会删除该分析记录。")
+
+
 def show_report_workbench(report: dict[str, Any], show_preprocessing: bool, key_prefix: str) -> dict[str, Any]:
     """Render a compact, sectioned report view for the single-image workflow."""
     if report.get("status") != "success":
@@ -549,19 +802,25 @@ def show_report_workbench(report: dict[str, Any], show_preprocessing: bool, key_
 
     ocsr = report.get("ocsr") or {}
     _render_result_message(report, ocsr)
-    show_recognition_decision(report)
+    report = _render_human_review_actions(report)
+    section_options = _report_section_options(report)
+    section_key = f"{key_prefix}_report_section"
+    requested_section = st.session_state.get(section_key, "概览")
+    if requested_section not in section_options:
+        requested_section = "概览"
+        st.session_state[section_key] = requested_section
     section = segmented_control(
         "结果视图",
-        REPORT_SECTION_OPTIONS,
-        default=st.session_state.get(f"{key_prefix}_report_section", "概览"),
-        key=f"{key_prefix}_report_section",
+        section_options,
+        default=requested_section if requested_section in section_options else "概览",
+        key=section_key,
         label_visibility="collapsed",
     )
     if section == "概览":
         _render_core_result(report)
         _render_descriptor_metrics(report)
         _render_lipinski_summary(report)
-    elif section == "人工纠错":
+    elif section == "确认与修正":
         report = show_correction_panel(report)
     elif section == "候选比较":
         show_ensemble_details(ocsr)
@@ -571,7 +830,7 @@ def show_report_workbench(report: dict[str, Any], show_preprocessing: bool, key_
         _render_descriptor_metrics(report)
         _render_lipinski_summary(report)
         show_chemical_identity(report)
-    elif section == "技术信息":
+    elif section == "技术详情":
         _render_preprocessing_details(report, show_preprocessing)
         _render_technical_diagnostics(report)
     return report
@@ -697,7 +956,8 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
 
     with st.expander("技术诊断", expanded=False):
         runtime = report.get("runtime") or {}
-        st.json({
+        inference_ms = ocsr.get("inference_time_ms")
+        diagnostics = _compact_technical({
             "backend": ocsr.get("backend"),
             "device": ocsr.get("device"),
             "model_name": ocsr.get("model_name"),
@@ -707,12 +967,16 @@ def show_report(report: dict[str, Any], show_preprocessing: bool, export_pdf: bo
             "git_commit": ocsr.get("git_commit") or runtime.get("git_commit"),
             "app_mode": runtime.get("app_mode"),
             "dependency_versions": ocsr.get("dependency_versions") or runtime.get("dependency_versions"),
-            "inference_time_ms": ocsr.get("inference_time_ms"),
+            "inference_time_seconds": round(float(inference_ms) / 1000.0, 3)
+            if isinstance(inference_ms, (int, float)) and not isinstance(inference_ms, bool)
+            else None,
+            "created_at_utc": report.get("created_at"),
         })
+        st.json(diagnostics or {})
 
 
 def show_correction_panel(report: dict[str, Any]) -> dict[str, Any]:
-    """Render human correction controls for image reports."""
+    """Render confirmation and correction controls for image reports."""
     if (report.get("input") or {}).get("type") != "image":
         return report
     analysis_id = report.get("analysis_id") or "image"
@@ -722,11 +986,19 @@ def show_correction_panel(report: dict[str, Any]) -> dict[str, Any]:
     predicted = ocsr.get("predicted_smiles") or ocsr.get("smiles") or ""
     default_smiles = correction.get("corrected_smiles") or final.get("smiles") or predicted
 
-    st.subheader("人工纠错")
-    st.caption(
-        f"纠错状态：{'已人工修正' if correction.get('applied') else '未人工修正'}；"
-        f"当前结果来源：{final.get('source') or '暂无有效结果'}"
+    review = human_review_state(report)
+    st.subheader("确认与修正")
+    states = st.columns(2)
+    states[0].metric(
+        "确认状态",
+        "已确认" if review.get("status") == "confirmed" else "无法确认" if review.get("status") == "unable_to_confirm" else "未确认",
     )
+    states[1].metric("修正状态", "已修正" if correction.get("applied") else "未修正")
+    if review.get("reviewed_at"):
+        st.caption(f"审核时间：{_format_local_time(review.get('reviewed_at'))}")
+    if correction.get("corrected_at"):
+        st.caption(f"修正时间：{_format_local_time(correction.get('corrected_at'))}")
+    st.caption(f"当前结果来源：{final.get('source') or '暂无有效结果'}")
     st.text_input("模型原始预测", value=predicted, disabled=True, key=f"predicted_{analysis_id}")
     corrected_input = st.text_input(
         "修正 SMILES",
@@ -756,63 +1028,6 @@ def show_correction_panel(report: dict[str, Any]) -> dict[str, Any]:
             _persist_report_update(current_report, report, "restore_original_prediction", "恢复模型原始结果")
             st.session_state["image_report"] = current_report
             st.success("已恢复为模型原始预测。")
-
-    with st.expander("纠错反馈与数据回流", expanded=False):
-        correction_type = st.selectbox(
-            "纠错类型",
-            ["atom", "bond", "charge", "stereo", "missing_fragment", "other"],
-            format_func={
-                "atom": "原子错误",
-                "bond": "键类型/连接错误",
-                "charge": "电荷错误",
-                "stereo": "立体化学错误",
-                "missing_fragment": "缺失片段",
-                "other": "其他",
-            }.get,
-            key=f"feedback_type_{analysis_id}",
-        )
-        source_col, license_col = st.columns(2)
-        source_reference = source_col.text_input(
-            "来源或引用（可选）",
-            value="",
-            key=f"feedback_source_{analysis_id}",
-            placeholder="DOI / 专利号 / 内部数据批次 / URL",
-        )
-        source_license = license_col.text_input(
-            "许可说明（可选）",
-            value="",
-            key=f"feedback_license_{analysis_id}",
-            placeholder="CC-BY-4.0 / internal / unknown",
-        )
-        privacy_notes = st.text_input(
-            "隐私/脱敏说明（可选）",
-            value="",
-            key=f"feedback_privacy_{analysis_id}",
-            placeholder="例如：已裁去个人信息；仅保留分子区域",
-        )
-        notes = st.text_area("反馈备注（可选）", value="", key=f"feedback_notes_{analysis_id}", height=70)
-        can_save_feedback = bool((current_report.get("correction") or {}).get("applied"))
-        save_col, discard_col = st.columns(2)
-        if save_col.button("保存为待审核", key=f"save_feedback_{analysis_id}", disabled=not can_save_feedback):
-            result = save_correction_feedback(
-                current_report,
-                DATA_DIR,
-                notes=notes,
-                correction_type=correction_type,
-                review_status="pending",
-                feedback_action="correction_only",
-                include_in_training=False,
-                source_reference=source_reference,
-                source_license=source_license,
-                privacy_notes=privacy_notes,
-            )
-            st.session_state[f"feedback_result_{analysis_id}"] = result
-            if result.get("duplicate_image"):
-                st.warning(f"已保存到审核队列；检测到重复图片，首次记录：{result.get('duplicate_of')}")
-            else:
-                st.success(f"已保存到审核队列：{result.get('annotation_path')}")
-        if discard_col.button("不保存", key=f"discard_feedback_{analysis_id}", disabled=not can_save_feedback):
-            st.info("本次纠错未保存到审核队列，也不会进入训练数据。")
 
     images = current_report.get("images") or {}
     predicted_image = images.get("predicted_molecule")

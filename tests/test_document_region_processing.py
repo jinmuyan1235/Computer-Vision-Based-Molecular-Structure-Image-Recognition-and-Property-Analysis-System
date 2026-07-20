@@ -151,6 +151,26 @@ def test_single_page_pdf_processes_with_fake_renderer(tmp_path: Path) -> None:
     assert Path(result["exports"]["zip"]).is_file()
 
 
+def test_full_document_workflow_reports_render_and_page_detection_progress(tmp_path: Path) -> None:
+    first = _make_page(tmp_path / "page_1.png", [], text="page one")
+    second = _make_page(tmp_path / "page_2.png", [], text="page two")
+    pdf = _make_pdf(tmp_path / "paper.pdf", pages=2)
+    loader = DocumentInputLoader(tmp_path / "out", renderer=FakePDFRenderer([first, second]))
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out", loader=loader, detector=FakeDetector([]))
+    events: list[tuple[str, int, int, str]] = []
+
+    result = processor.process(
+        pdf,
+        run_ocsr=False,
+        document_progress_callback=lambda stage, current, total, detail: events.append((stage, current, total, detail)),
+    )
+
+    assert events[0][:3] == ("rendered", 2, 2)
+    assert [event[:3] for event in events[1:]] == [("detecting", 1, 2), ("detecting", 2, 2)]
+    assert result["processing"]["workflow"] == "full_document_review"
+    assert result["processing"]["processed_page_count"] == 2
+
+
 def test_real_pymupdf_pdf_rendering_when_available(tmp_path: Path) -> None:
     pytest.importorskip("fitz")
     pdf_path = tmp_path / "aspirin_real_pdf.pdf"

@@ -13,11 +13,13 @@ from src.preprocess.image_loader import load_image
 
 
 OUTPUT_STAGES = ("original", "grayscale", "normalized", "binary")
+CLARITY_LEVELS = ("off", "mild", "standard", "strong")
 DEFAULT_USER_ADJUSTMENTS = {
     "crop_bbox": [],
     "rotation": 0.0,
     "invert": False,
     "contrast": 1.0,
+    "clarity_enhancement": "off",
     "trim_whitespace": False,
     "output_stage": "original",
 }
@@ -36,16 +38,22 @@ def normalize_user_adjustments(
     """Normalize user adjustment values and clamp crop boxes to image bounds."""
     raw = dict(DEFAULT_USER_ADJUSTMENTS)
     raw.update(dict(adjustments or {}))
+    clarity = raw.get("clarity_enhancement", "off")
+    if isinstance(clarity, bool):
+        clarity = "standard" if clarity else "off"
     normalized = {
         "crop_bbox": [],
         "rotation": _float(raw.get("rotation"), 0.0),
         "invert": bool(raw.get("invert")),
         "contrast": max(0.1, min(4.0, _float(raw.get("contrast"), 1.0))),
+        "clarity_enhancement": str(clarity or "off").lower(),
         "trim_whitespace": bool(raw.get("trim_whitespace")),
         "output_stage": str(raw.get("output_stage") or "original").lower(),
     }
     if normalized["output_stage"] not in OUTPUT_STAGES:
         normalized["output_stage"] = "original"
+    if normalized["clarity_enhancement"] not in CLARITY_LEVELS:
+        normalized["clarity_enhancement"] = "off"
     bbox = raw.get("crop_bbox") or []
     if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
         x1, y1, x2, y2 = [_int(value, 0) for value in bbox]
@@ -71,6 +79,7 @@ def has_user_adjustments(adjustments: Mapping[str, Any] | None) -> bool:
         or abs(float(normalized["rotation"])) > 0.001
         or normalized["invert"]
         or abs(float(normalized["contrast"]) - 1.0) > 0.001
+        or normalized["clarity_enhancement"] != "off"
         or normalized["trim_whitespace"]
         or normalized["output_stage"] != "original"
     )
@@ -96,6 +105,8 @@ def apply_user_adjustments(
     if abs(float(normalized["contrast"]) - 1.0) > 0.001:
         alpha = float(normalized["contrast"])
         working = cv2.convertScaleAbs(working, alpha=alpha, beta=128.0 * (1.0 - alpha))
+    if normalized["clarity_enhancement"] != "off":
+        working = _enhance_clarity(working, str(normalized["clarity_enhancement"]))
     if normalized["invert"]:
         working = cv2.bitwise_not(working)
 
@@ -177,6 +188,91 @@ def _trim_whitespace(image: np.ndarray, padding: int = 8) -> np.ndarray:
     x1 = min(image.shape[1], x + width + padding)
     y1 = min(image.shape[0], y + height + padding)
     return image[y0:y1, x0:x1].copy()
+
+
+def _enhance_clarity(image: np.ndarray, level: str) -> np.ndarray:
+    """Enhance existing strokes without claiming recovery of missing chemistry."""
+    settings = {
+        "mild": {"amount": 0.55, "sigma": 0.8, "clip": 1.35, "target_min": 0},
+        "standard": {"amount": 0.9, "sigma": 1.0, "clip": 1.65, "target_min": 384},
+        "strong": {"amount": 1.25, "sigma": 1.2, "clip": 2.0, "target_min": 512},
+    }
+    config = settings.get(level)
+    if config is None:
+        return image.copy()
+
+    working = np.clip(image, 0, 255).astype(np.uint8)
+    alpha_channel: np.ndarray | None = None
+    if working.ndim == 3 and working.shape[2] == 4:
+        alpha_channel = working[:, :, 3].copy()
+        working = working[:, :, :3].copy()
+    height, width = working.shape[:2]
+    target_min = int(config["target_min"])
+    if target_min and min(height, width) < target_min:
+        scale = min(2.0, target_min / max(1, min(height, width)), 2048.0 / max(height, width))
+        if scale > 1.05:
+            interpolation = cv2.INTER_LANCZOS4 if level == "strong" else cv2.INTER_CUBIC
+            working = cv2.resize(working, None, fx=scale, fy=scale, interpolation=interpolation)
+            if alpha_channel is not None:
+                alpha_channel = cv2.resize(
+                    alpha_channel,
+                    (working.shape[1], working.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
+    # Molecular drawings are usually sparse ink on a white background.  A large
+    # unsharp mask also amplifies their pale blur halo, so strong mode rebuilds
+    # the coverage of existing coloured/black strokes instead.  Photos and dark
+    # backgrounds retain the conservative generic path below.
+    if level == "strong" and _looks_like_white_line_art(working):
+        result = _rebuild_white_line_art(working)
+        if alpha_channel is not None:
+            result = np.dstack((result, alpha_channel))
+        return result
+
+    clahe = cv2.createCLAHE(clipLimit=float(config["clip"]), tileGridSize=(8, 8))
+    if working.ndim == 2:
+        contrasted = clahe.apply(working)
+    else:
+        lab = cv2.cvtColor(working, cv2.COLOR_BGR2LAB)
+        lightness, channel_a, channel_b = cv2.split(lab)
+        contrasted = cv2.cvtColor(cv2.merge((clahe.apply(lightness), channel_a, channel_b)), cv2.COLOR_LAB2BGR)
+
+    denoised = cv2.bilateralFilter(contrasted, d=5, sigmaColor=18, sigmaSpace=3)
+    blurred = cv2.GaussianBlur(denoised, (0, 0), sigmaX=float(config["sigma"]), sigmaY=float(config["sigma"]))
+    amount = float(config["amount"])
+    sharpened = cv2.addWeighted(denoised, 1.0 + amount, blurred, -amount, 0)
+    result = np.clip(sharpened, 0, 255).astype(np.uint8)
+    if alpha_channel is not None:
+        result = np.dstack((result, alpha_channel))
+    return result
+
+
+def _looks_like_white_line_art(image: np.ndarray) -> bool:
+    gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    white_fraction = float(np.mean(gray >= 235))
+    dark_fraction = float(np.mean(gray < 210))
+    return white_fraction >= 0.55 and dark_fraction <= 0.30
+
+
+def _rebuild_white_line_art(image: np.ndarray) -> np.ndarray:
+    """Tighten antialiased ink edges while retaining each stroke's colour."""
+    source = image.astype(np.float32)
+    if source.ndim == 2:
+        ink = np.maximum(255.0 - source, 0.0)
+        coverage = np.clip((ink - 18.0) / 105.0, 0.0, 1.0)
+        coverage = coverage * coverage * (3.0 - 2.0 * coverage)
+        coverage = np.power(coverage, 1.15)
+        return np.clip(255.0 - (235.0 * coverage), 0, 255).astype(np.uint8)
+
+    delta = np.maximum(255.0 - source, 0.0)
+    ink = np.max(delta, axis=2)
+    coverage = np.clip((ink - 18.0) / 105.0, 0.0, 1.0)
+    coverage = coverage * coverage * (3.0 - 2.0 * coverage)
+    coverage = np.power(coverage, 1.15)
+    colour_direction = delta / np.maximum(ink[:, :, None], 1.0)
+    rebuilt = 255.0 - colour_direction * (235.0 * coverage[:, :, None])
+    return np.clip(rebuilt, 0, 255).astype(np.uint8)
 
 
 def _rotate_image(image: np.ndarray, angle: float) -> np.ndarray:

@@ -98,17 +98,20 @@ class DocumentOCSRProcessor:
         input_path: str | Path,
         run_ocsr: bool = True,
         progress_callback: Callable[[int, int, str], None] | None = None,
+        document_progress_callback: Callable[[str, int, int, str], None] | None = None,
     ) -> dict[str, Any]:
         """Process a PDF, page image, or ZIP image collection."""
         started = perf_counter()
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8]
         document_id, pages = self.loader.load(input_path)
+        if document_progress_callback is not None:
+            document_progress_callback("rendered", len(pages), len(pages), f"已完成 {len(pages)} 页渲染。")
         document_dir = ensure_directory(self.output_dir / f"{document_id}_{run_id}")
         pages = self._move_pages_into_run(pages, document_dir)
         regions: list[DocumentRegion] = []
         detection_errors: list[dict[str, Any]] = []
         stream_counts = {"molecule_extraction": 0, "document_layout": 0}
-        for page in pages:
+        for page_index, page in enumerate(pages, start=1):
             try:
                 streams = self.detect_page_streams(page)
                 stream_counts["molecule_extraction"] += len(streams.molecule_extraction)
@@ -124,6 +127,13 @@ class DocumentOCSRProcessor:
                 regions.extend(detected)
             except Exception as exc:
                 detection_errors.append({"page_number": page.page_number, "message": str(exc)})
+            if document_progress_callback is not None:
+                document_progress_callback(
+                    "detecting",
+                    page_index,
+                    len(pages),
+                    f"正在检测第 {page_index}/{len(pages)} 页。",
+                )
         recognized_candidates = 0
         skipped_candidates = 0
         if run_ocsr:
@@ -141,12 +151,16 @@ class DocumentOCSRProcessor:
             for index, region in enumerate(candidates, start=1):
                 if progress_callback is not None:
                     progress_callback(index, total, region.region_id)
+                if document_progress_callback is not None:
+                    document_progress_callback("recognizing", index, total, region.region_id)
                 self.recognize_region(region, pages, document_dir, screen=False)
                 if region.status == "recognized":
                     recognized_candidates += 1
         result = self._result(input_path, document_id, document_dir, pages, regions, detection_errors)
         result["processing"] = {
             "mode": "detect_and_recognize" if run_ocsr else "detect_only",
+            "workflow": "full_document_review",
+            "processed_page_count": len(pages),
             "total_time_ms": round((perf_counter() - started) * 1000, 2),
             "recognized_candidate_count": recognized_candidates,
             "skipped_candidate_count": skipped_candidates,
@@ -474,14 +488,35 @@ class DocumentOCSRProcessor:
 
     def apply_edits(self, document_result: dict[str, Any], edits: list[dict[str, Any]], rerun_ocsr: bool = False) -> dict[str, Any]:
         """Apply human bbox/type edits and optionally re-run OCSR on edited molecule regions."""
+        before_ids = {str(region.get("region_id")) for region in document_result.get("regions", [])}
         updated = apply_region_edits(document_result, edits)
         document_dir = Path(updated["output_dir"])
         if rerun_ocsr:
+            requested_ids = {
+                str(edit.get("region_id"))
+                for edit in edits
+                if edit.get("region_id") is not None
+            }
+            requested_pages = {
+                int(edit.get("page_number"))
+                for edit in edits
+                if str(edit.get("action") or "").lower() == "confirm_page" and edit.get("page_number") is not None
+            }
+            requested_ids.update(
+                str(region.get("region_id"))
+                for region in updated.get("regions", [])
+                if str(region.get("region_id")) not in before_ids
+            )
             for region in updated.get("regions", []):
                 if (
                     region.get("status") in {"confirmed", "edited", "detected", "failed"}
                     and region.get("region_type") == "molecule"
                     and is_region_confirmed(region)
+                    and (
+                        not requested_ids and not requested_pages
+                        or str(region.get("region_id")) in requested_ids
+                        or int(region.get("page_number", 0)) in requested_pages
+                    )
                 ):
                     self.recognize_region(region, updated.get("pages", []), document_dir)
         updated["summary"] = self._summary(updated.get("pages", []), updated.get("regions", []), updated.get("detection_errors", []))

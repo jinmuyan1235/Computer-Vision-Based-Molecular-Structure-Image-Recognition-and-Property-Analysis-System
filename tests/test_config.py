@@ -20,7 +20,9 @@ def test_load_settings_falls_back_for_bad_numeric_env(monkeypatch) -> None:
     settings = config.load_settings()
 
     assert settings.ocsr_timeout_seconds == 120.0
-    assert settings.document_max_pages == 25
+    assert settings.document_max_pages == 100
+    assert settings.document_max_regions == 500
+    assert settings.document_max_file_size_mb == 100.0
     assert settings.ocsr_gpu_max_concurrent_inference == 1
     assert settings.run_retention_days == 1
     assert settings.run_max_storage_gb == 10.0

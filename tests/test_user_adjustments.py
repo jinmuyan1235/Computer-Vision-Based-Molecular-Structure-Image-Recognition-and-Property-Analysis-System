@@ -44,6 +44,7 @@ def test_normalize_user_adjustments_clamps_crop_and_values() -> None:
             "crop_bbox": [-10, 5, 90, 999],
             "rotation": "not-a-number",
             "contrast": 9,
+            "clarity_enhancement": "strong",
             "output_stage": "unsupported",
         },
         image.shape,
@@ -52,6 +53,7 @@ def test_normalize_user_adjustments_clamps_crop_and_values() -> None:
     assert normalized["crop_bbox"] == [0, 5, 90, 80]
     assert normalized["rotation"] == 0
     assert normalized["contrast"] == 4
+    assert normalized["clarity_enhancement"] == "strong"
     assert normalized["output_stage"] == "original"
     assert has_user_adjustments(normalized) is True
 
@@ -209,6 +211,70 @@ def test_apply_user_adjustments_outputs_requested_versions(tmp_path: Path) -> No
     assert cv2.imread(str(saved)) is not None
 
 
+def test_clarity_enhancement_sharpens_blurred_strokes_and_preserves_input() -> None:
+    original = _synthetic_structure()
+    blurred = cv2.GaussianBlur(original, (0, 0), sigmaX=2.0, sigmaY=2.0)
+    before = blurred.copy()
+
+    enhanced = apply_user_adjustments(blurred, {"clarity_enhancement": "mild"})
+
+    assert np.array_equal(blurred, before)
+    assert enhanced.shape == blurred.shape
+    assert enhanced.dtype == np.uint8
+    before_sharpness = float(cv2.Laplacian(cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
+    after_sharpness = float(cv2.Laplacian(cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
+    assert after_sharpness > before_sharpness
+    assert has_user_adjustments({"clarity_enhancement": "mild"}) is True
+
+
+def test_standard_clarity_enhancement_safely_upscales_low_resolution_image() -> None:
+    image = _synthetic_structure()
+    enhanced = apply_user_adjustments(image, {"clarity_enhancement": True})
+
+    assert enhanced.shape[:2] == (160, 240)
+    assert normalize_user_adjustments({"clarity_enhancement": True})["clarity_enhancement"] == "standard"
+    assert normalize_user_adjustments({"clarity_enhancement": "unsupported"})["clarity_enhancement"] == "off"
+
+
+def test_strong_clarity_enhancement_tightens_white_line_art_edges_and_preserves_colour() -> None:
+    image = np.full((80, 160, 3), 255, dtype=np.uint8)
+    cv2.line(image, (15, 42), (145, 42), (0, 0, 0), 3)
+    cv2.putText(image, "N", (70, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 0), 2)
+    blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=2.2, sigmaY=2.2)
+
+    enhanced = apply_user_adjustments(blurred, {"clarity_enhancement": "strong"})
+    baseline = cv2.resize(blurred, (enhanced.shape[1], enhanced.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+    baseline_gray = cv2.cvtColor(baseline, cv2.COLOR_BGR2GRAY)
+    enhanced_gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+    baseline_transition = np.mean((baseline_gray > 70) & (baseline_gray < 230))
+    enhanced_transition = np.mean((enhanced_gray > 70) & (enhanced_gray < 230))
+
+    assert enhanced.shape[:2] == (160, 320)
+    assert enhanced_transition < baseline_transition
+    blue_pixels = enhanced[:, :, 0] > (enhanced[:, :, 1] + 40)
+    assert np.count_nonzero(blue_pixels) > 0
+
+
+def test_clarity_enhancement_preserves_numpy_alpha_channel() -> None:
+    image = _synthetic_structure()
+    alpha = np.full(image.shape[:2], 180, dtype=np.uint8)
+    bgra = np.dstack((image, alpha))
+
+    enhanced = apply_user_adjustments(bgra, {"clarity_enhancement": "mild"})
+
+    assert enhanced.shape == bgra.shape
+    assert np.array_equal(enhanced[:, :, 3], alpha)
+
+
+def test_clarity_enhancement_ui_explains_limitations() -> None:
+    source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "image_editor.py").read_text(encoding="utf-8")
+    assert "模糊增强" in source
+    assert "标准（推荐）" in source
+    assert "强（线稿清晰化）" in source
+    assert "可放大查看" in source
+    assert "不能恢复原图中已经丢失的原子、键或立体化学信息" in source
+
+
 def test_preprocess_pipeline_records_uploaded_and_adjusted_stages(tmp_path: Path) -> None:
     image_path = tmp_path / "molecule.png"
     image_path.write_bytes(_encode_png(_synthetic_structure()))
@@ -232,6 +298,7 @@ def test_image_page_persists_adjusted_input_and_report_metadata(tmp_path: Path) 
         "rotation": 2.5,
         "invert": False,
         "contrast": 1.1,
+        "clarity_enhancement": "standard",
         "trim_whitespace": True,
         "output_stage": "normalized",
     }
@@ -243,6 +310,7 @@ def test_image_page_persists_adjusted_input_and_report_metadata(tmp_path: Path) 
     assert adjusted_input.is_file()
     assert adjusted_input.name == "aspirin_user_adjusted.png"
     assert report["user_preprocessing"]["applied"] is True
+    assert report["user_preprocessing"]["clarity_enhancement"] == "standard"
     assert report["user_preprocessing"]["effective_image_sha256"]
     assert report["input"]["effective_path"] == str(adjusted_input.resolve())
     assert report["images"]["preprocessing"]["uploaded_original"] == str(image_run.input_path.resolve())

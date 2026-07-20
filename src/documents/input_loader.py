@@ -95,7 +95,8 @@ class PDFRenderer:
             page_count = int(getattr(document, "page_count", len(document)))
             if page_count > config.DOCUMENT_MAX_PAGES:
                 raise DocumentInputError(
-                    f"PDF has {page_count} pages, above the {config.DOCUMENT_MAX_PAGES} page safety limit."
+                    f"PDF 共 {page_count} 页，超过当前全文处理上限 {config.DOCUMENT_MAX_PAGES} 页。"
+                    "如确需处理更长文档，请提高环境变量 DOCUMENT_MAX_PAGES 后重启应用。"
                 )
             pages: list[DocumentPage] = []
             page_dir = ensure_directory(Path(output_dir) / "pages")
@@ -181,7 +182,8 @@ class DocumentInputLoader:
             ]
             if len(image_members) > config.DOCUMENT_MAX_PAGES:
                 raise DocumentInputError(
-                    f"ZIP contains {len(image_members)} images, above the {config.DOCUMENT_MAX_PAGES} page limit."
+                    f"ZIP 共包含 {len(image_members)} 张页面图片，超过当前全文处理上限 "
+                    f"{config.DOCUMENT_MAX_PAGES} 页。"
                 )
             for index, info in enumerate(sorted(image_members, key=lambda item: item.filename.lower()), start=1):
                 member_name = Path(info.filename).name
