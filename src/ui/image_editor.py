@@ -28,6 +28,13 @@ OUTPUT_STAGE_LABELS = {
     "binary": "二值化",
 }
 
+CLARITY_LEVEL_LABELS = {
+    "off": "关闭",
+    "mild": "轻度",
+    "standard": "标准（推荐）",
+    "strong": "强（线稿清晰化）",
+}
+
 CROP_QUERY_KEYS = ("crop_editor_key", "crop_x", "crop_y", "crop_click_nonce")
 
 
@@ -76,10 +83,20 @@ def render_image_editor(
             y2 = crop_cols[3].number_input("y2", min_value=0, max_value=dimensions["height"], key=f"{key_prefix}_y2")
             crop_bbox = [int(x1), int(y1), int(x2), int(y2)]
 
-        rotate_cols = st.columns(3)
+        rotate_cols = st.columns(4)
         right_angle = rotate_cols[0].selectbox("旋转 90°", [0, 90, 180, 270], index=0, key=f"{key_prefix}_right_angle")
         fine_rotation = rotate_cols[1].slider("小角度旋转", -15.0, 15.0, 0.0, 0.5, key=f"{key_prefix}_fine_rotation")
         contrast = rotate_cols[2].slider("对比度", 0.5, 2.0, 1.0, 0.05, key=f"{key_prefix}_contrast")
+        clarity_enhancement = rotate_cols[3].selectbox(
+            "模糊增强",
+            list(CLARITY_LEVEL_LABELS),
+            index=0,
+            format_func=lambda value: CLARITY_LEVEL_LABELS[value],
+            key=f"{key_prefix}_clarity_enhancement",
+            help="保边降噪、局部对比度增强和反锐化；标准/强档会有限放大低分辨率图片。",
+        )
+        if clarity_enhancement != "off":
+            st.warning("模糊增强只能改善现有线条的可读性，不能恢复原图中已经丢失的原子、键或立体化学信息；请核对增强预览。")
 
         adjustments = normalize_user_adjustments(
             {
@@ -87,6 +104,7 @@ def render_image_editor(
                 "rotation": float(right_angle) + float(fine_rotation),
                 "invert": invert,
                 "contrast": float(contrast),
+                "clarity_enhancement": clarity_enhancement,
                 "trim_whitespace": trim_whitespace,
                 "output_stage": output_stage,
             }
@@ -94,7 +112,8 @@ def render_image_editor(
         try:
             adjusted_image = apply_user_adjustments(image_bytes, adjustments)
             adjusted_bytes = encode_png(adjusted_image)
-            st.image(adjusted_bytes, caption="调整后预览", width=600)
+            preview_width = min(900, max(600, int(adjusted_image.shape[1])))
+            st.image(adjusted_bytes, caption="调整后预览（可放大查看）", width=preview_width)
         except Exception as exc:
             st.warning(f"预处理预览失败：{exc}")
             adjusted_bytes = image_bytes

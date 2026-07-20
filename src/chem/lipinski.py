@@ -18,10 +18,8 @@ def evaluate_lipinski(descriptors: Mapping[str, Any]) -> dict[str, Any]:
     passed = not violations
     if passed:
         summary = "该分子基本符合 Lipinski 类药性规则及扩展可旋转键规则。"
-    elif len(violations) == 1:
-        summary = "该分子存在 1 项规则超限，建议结合具体用途进一步评估。"
     else:
-        summary = f"该分子存在 {len(violations)} 项规则超限，类药性风险相对较高。"
+        summary = f"规则超限项：{', '.join(violations)}。"
     return {"passed": passed, "violations": violations, "summary": summary}
 
 

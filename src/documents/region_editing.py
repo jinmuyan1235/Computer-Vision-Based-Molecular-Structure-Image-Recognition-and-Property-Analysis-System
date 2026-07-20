@@ -218,6 +218,13 @@ def apply_region_edits(document_result: dict[str, Any], edits: list[dict[str, An
             target.setdefault("audit", []).append(
                 _audit("confirm", before, _region_snapshot(target), edit.get("note"))
             )
+        elif action == "recognize":
+            if target.get("region_type") != "molecule" or not is_region_confirmed(target):
+                raise ValueError("recognize requires a confirmed molecule region.")
+            target["status"] = "confirmed"
+            target.setdefault("audit", []).append(
+                _audit("recognize_requested", before, _region_snapshot(target), edit.get("note"))
+            )
         elif action == "unconfirm":
             _set_confirmation(target, False, "edited")
             _clear_region_outputs(target)

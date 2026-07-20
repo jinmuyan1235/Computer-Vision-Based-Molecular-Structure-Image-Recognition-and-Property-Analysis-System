@@ -20,6 +20,7 @@ from src.chem.standardization import standardize_smiles
 from src.analysis.correction import (
     default_correction_state,
     default_final_state,
+    default_human_review_state,
     normalize_ocsr_block,
     sha256_file,
 )
@@ -60,6 +61,7 @@ class MoleculeReportGenerator:
             "ocsr": None,
             "correction": default_correction_state(),
             "final": default_final_state(),
+            "human_review": default_human_review_state(required=input_data.get("type") == "image"),
             "validation": {"valid": False, "canonical_smiles": None, "standardized_smiles": None, "error": None},
             "chemical_identity": None,
             "standardization": {"profile": None, "changed": False, "steps": [], "warnings": []},

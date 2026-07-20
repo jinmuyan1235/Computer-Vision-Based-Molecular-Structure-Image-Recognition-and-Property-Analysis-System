@@ -767,10 +767,10 @@ Safety limits are configurable with environment variables:
 |---|---:|---|
 | `DOCUMENT_OUTPUT_DIR` | `data/outputs/documents` | Document run output directory |
 | `DOCUMENT_RENDER_DPI` | `200` | PDF page render resolution |
-| `DOCUMENT_MAX_FILE_SIZE_MB` | `50` | Maximum uploaded PDF/image/ZIP size |
-| `DOCUMENT_MAX_PAGES` | `25` | Maximum PDF pages or ZIP images |
+| `DOCUMENT_MAX_FILE_SIZE_MB` | `100` | Maximum uploaded PDF/image/ZIP size |
+| `DOCUMENT_MAX_PAGES` | `100` | Maximum PDF pages or ZIP images in one full-document review task |
 | `DOCUMENT_MAX_PIXELS` | `25000000` | Maximum pixels per rendered page |
-| `DOCUMENT_MAX_REGIONS` | `80` | Maximum detected regions per document |
+| `DOCUMENT_MAX_REGIONS` | `500` | Maximum detected regions per document |
 
 Each region is exported with:
 

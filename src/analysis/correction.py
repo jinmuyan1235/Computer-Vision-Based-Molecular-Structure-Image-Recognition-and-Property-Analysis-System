@@ -57,6 +57,124 @@ def default_final_state() -> dict[str, Any]:
     return {"smiles": None, "raw_smiles": None, "canonical_smiles": None, "standardized_smiles": None, "source": None}
 
 
+def default_human_review_state(required: bool = True) -> dict[str, Any]:
+    """Return an additive review block compatible with legacy reports."""
+    return {
+        "required": bool(required),
+        "status": "unconfirmed" if required else "not_required",
+        "confirmed": not required,
+        "reviewed_smiles": None,
+        "reviewed_canonical_smiles": None,
+        "reviewed_at": None,
+        "action": None,
+        "candidate_source": None,
+        "last_confirmed_at": None,
+    }
+
+
+def human_review_state(report: dict[str, Any]) -> dict[str, Any]:
+    """Return a normalized review state without changing a legacy report."""
+    required = (report.get("input") or {}).get("type") == "image"
+    state = default_human_review_state(required=required)
+    existing = report.get("human_review")
+    if isinstance(existing, dict):
+        state.update(existing)
+    state["required"] = bool(state.get("required", required))
+    state["confirmed"] = state.get("status") in {"confirmed", "not_required"}
+    return state
+
+
+def is_structure_confirmed(report: dict[str, Any]) -> bool:
+    """Return whether formal structure exports are allowed for this report."""
+    return bool(human_review_state(report).get("confirmed"))
+
+
+def _append_review_event(report: dict[str, Any], action: str, smiles: str | None) -> None:
+    report.setdefault("review_events", []).append({
+        "action": action,
+        "smiles": smiles,
+        "created_at": utc_now_iso(),
+    })
+
+
+def reset_human_review(report: dict[str, Any], action: str = "candidate_changed") -> dict[str, Any]:
+    """Reset image reports to an unconfirmed candidate after a structure change."""
+    if (report.get("input") or {}).get("type") != "image":
+        return report
+    report["human_review"] = default_human_review_state(required=True)
+    report["human_review"]["action"] = action
+    _append_review_event(report, action, current_final_smiles(report))
+    return report
+
+
+def confirm_structure(report: dict[str, Any]) -> dict[str, Any]:
+    """Confirm the current valid candidate and record an auditable snapshot."""
+    updated = ensure_traceability_blocks(report)
+    smiles = current_final_smiles(updated)
+    validation = validate_smiles(smiles)
+    if not validation["valid"]:
+        updated["human_review"] = human_review_state(updated)
+        updated["human_review"]["last_error"] = validation["error"] or "候选结构无效，无法确认。"
+        return updated
+    reviewed_at = utc_now_iso()
+    final = updated.get("final") or {}
+    candidate_source = final.get("source")
+    updated["human_review"] = {
+        "required": True,
+        "status": "confirmed",
+        "confirmed": True,
+        "reviewed_smiles": smiles,
+        "reviewed_canonical_smiles": validation["canonical_smiles"],
+        "reviewed_at": reviewed_at,
+        "action": "confirm_structure",
+        "candidate_source": candidate_source,
+        "last_confirmed_at": reviewed_at,
+        "last_error": None,
+    }
+    if isinstance(updated.get("final"), dict):
+        updated["final"]["source"] = "human_confirmed_model_candidate"
+    _append_review_event(updated, "confirm_structure", smiles)
+    return updated
+
+
+def revoke_structure_confirmation(report: dict[str, Any]) -> dict[str, Any]:
+    """Revoke confirmation while preserving correction state and candidate data."""
+    updated = ensure_traceability_blocks(report)
+    previous = human_review_state(updated)
+    final = updated.get("final") or {}
+    fallback_source = "user_correction" if (updated.get("correction") or {}).get("applied") else "ocsr"
+    candidate_source = previous.get("candidate_source") or fallback_source
+    if isinstance(final, dict) and final.get("source") == "human_confirmed_model_candidate":
+        final["source"] = candidate_source
+    state = default_human_review_state(required=True)
+    state.update({
+        "status": "unconfirmed",
+        "confirmed": False,
+        "action": "revoke_confirmation",
+        "candidate_source": candidate_source,
+        "last_confirmed_at": previous.get("reviewed_at") or previous.get("last_confirmed_at"),
+    })
+    updated["human_review"] = state
+    _append_review_event(updated, "revoke_confirmation", current_final_smiles(updated))
+    return updated
+
+
+def mark_structure_unable_to_confirm(report: dict[str, Any]) -> dict[str, Any]:
+    """Record that the reviewer could not verify the current candidate."""
+    updated = ensure_traceability_blocks(report)
+    state = default_human_review_state(required=True)
+    state.update({
+        "status": "unable_to_confirm",
+        "confirmed": False,
+        "reviewed_smiles": current_final_smiles(updated),
+        "reviewed_at": utc_now_iso(),
+        "action": "unable_to_confirm",
+    })
+    updated["human_review"] = state
+    _append_review_event(updated, "unable_to_confirm", current_final_smiles(updated))
+    return updated
+
+
 def current_final_smiles(report: dict[str, Any]) -> str | None:
     """Return the current user-facing final SMILES for audit/history use."""
     final = report.get("final") or {}
@@ -120,6 +238,7 @@ def ensure_traceability_blocks(report: dict[str, Any]) -> dict[str, Any]:
     updated.setdefault("chemical_identity", None)
     updated.setdefault("standardization", {"profile": None, "changed": False, "steps": [], "warnings": []})
     updated.setdefault("structure_warnings", [])
+    updated["human_review"] = human_review_state(updated)
     return updated
 
 
@@ -210,6 +329,7 @@ def _apply_final_smiles(
             updated["ocsr"]["decision"] = "accepted"
             updated["ocsr"]["risk_level"] = "low"
             updated["ocsr"]["manual_review_recommended"] = False
+    reset_human_review(updated, "candidate_changed")
     return updated
 
 

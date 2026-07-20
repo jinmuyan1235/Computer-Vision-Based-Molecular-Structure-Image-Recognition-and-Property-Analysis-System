@@ -17,6 +17,10 @@ from src.documents.processor import DocumentOCSRProcessor
 from src.storage.analysis_repository import record_result_payload
 
 
+DOCUMENT_PROGRESS_MARKER = "DOCUMENT_PROGRESS_JSON="
+DOCUMENT_RESULT_MARKER = "DOCUMENT_RESULT_JSON="
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="PDF, PNG/JPG/JPEG page image, or ZIP of page images.")
@@ -43,7 +47,21 @@ def main() -> int:
             runtime_config=runtime_config,
             review_output_dir=config.DATA_DIR,
         )
-        result = processor.process(args.input, run_ocsr=not args.detect_only)
+        def progress(stage: str, current: int, total: int, detail: str) -> None:
+            print(
+                DOCUMENT_PROGRESS_MARKER
+                + json.dumps(
+                    {"stage": stage, "current": current, "total": total, "detail": detail},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+        result = processor.process(
+            args.input,
+            run_ocsr=not args.detect_only,
+            document_progress_callback=progress,
+        )
         record_result_payload(result, result.get("exports", {}).get("json"))
     except OptionalDependencyError as exc:
         print(json.dumps({"status": "unavailable", "message": str(exc)}, ensure_ascii=False, indent=2))
@@ -51,13 +69,14 @@ def main() -> int:
     except (DocumentInputError, FileNotFoundError, ValueError) as exc:
         print(json.dumps({"status": "failed", "message": str(exc)}, ensure_ascii=False, indent=2))
         return 1
-    print(json.dumps({
+    final_payload = {
         "status": "success",
         "document_id": result["document_id"],
         "summary": result["summary"],
         "exports": result["exports"],
         "result_path": result["exports"].get("json"),
-    }, ensure_ascii=False, indent=2))
+    }
+    print(DOCUMENT_RESULT_MARKER + json.dumps(final_payload, ensure_ascii=False), flush=True)
     return 0
 
 
