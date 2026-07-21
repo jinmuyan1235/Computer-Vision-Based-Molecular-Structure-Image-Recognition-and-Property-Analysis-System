@@ -629,6 +629,21 @@ class DECIMERAdapter(BaseOCSRAdapter):
         }
 
     def diagnose(self, load_model: bool = False) -> dict[str, Any]:
+        if not load_model and self.requested_device in {"gpu", "auto"}:
+            # status() deliberately avoids importing TensorFlow, so a fresh
+            # adapter only reports gpu_available=None. Health checks run in an
+            # isolated worker and may safely perform this lightweight framework
+            # probe without loading the DECIMER model.
+            tf_status = self._tensorflow_status(load=True)
+            self.tensorflow_version = tf_status.get("tensorflow_version")
+            self.detected_gpus = list(tf_status.get("detected_gpus") or [])
+            gpu_available = bool(tf_status.get("gpu_available"))
+            if self.requested_device == "auto":
+                self.device = "gpu" if gpu_available else "cpu"
+            elif gpu_available:
+                self.device = "gpu"
+            else:
+                self._load_error = "请求 GPU 运行 DECIMER，但 TensorFlow 没有检测到可用 GPU。"
         diagnostics = self.status()
         if load_model:
             try:

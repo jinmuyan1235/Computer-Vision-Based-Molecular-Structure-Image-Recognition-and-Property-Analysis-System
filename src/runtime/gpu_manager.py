@@ -57,7 +57,7 @@ def gpu_selection_options() -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = [
         {
             "value": "auto",
-            "label": "自动选择可用设备",
+            "label": "自动选择（优先可用 GPU）",
             "molscribe_device": "auto",
             "decimer_device": "auto",
             "visible_gpu_index": None,

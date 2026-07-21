@@ -60,14 +60,28 @@ def _format_local_time(value: Any) -> str:
 
 
 def _has_second_candidate(report: dict[str, Any]) -> bool:
-    """Return whether candidate comparison has at least two actual records."""
+    """Return whether candidate comparison has two distinct structures."""
     ocsr = report.get("ocsr") or {}
     candidates = [item for item in (ocsr.get("candidates") or []) if isinstance(item, dict)]
     attempts = [
         item for item in (ocsr.get("strategy_attempts") or [])
         if isinstance(item, dict) and (item.get("smiles") or item.get("canonical_smiles"))
     ]
-    return len(candidates) >= 2 or len(attempts) >= 2
+    distinct: set[str] = set()
+    for item in [*candidates, *attempts]:
+        smiles = next(
+            (
+                str(item.get(field)).strip()
+                for field in ("canonical_smiles", "standardized_smiles", "smiles", "raw_smiles", "predicted_smiles")
+                if item.get(field)
+            ),
+            "",
+        )
+        if not smiles:
+            continue
+        validation = validate_smiles(smiles)
+        distinct.add(str(validation.get("canonical_smiles") or smiles))
+    return len(distinct) >= 2
 
 
 def _report_section_options(report: dict[str, Any]) -> list[str]:

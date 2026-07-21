@@ -9,14 +9,16 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 import config
+from src.analysis.image_quality import assess_image_quality
 from src.chem.smiles_validator import validate_smiles
 from src.ocsr.base import OCSRResult
 from src.ocsr.recognizer import MoleculeRecognizer
 
 
-VALID_STRATEGIES = ("original", "normalized", "grayscale", "binary")
+VALID_STRATEGIES = ("original", "enhanced", "normalized", "grayscale", "binary")
 STAGE_BY_STRATEGY = {
     "original": "original",
+    "enhanced": "clarity_enhanced",
     "normalized": "normalized",
     "grayscale": "gray",
     "binary": "binary",
@@ -98,7 +100,7 @@ def recognize_with_fallback_strategies(
         result = recognizer.recognize(target)
         attempt = _attempt_from_result(strategy, target, result)
         attempt["attempt_index"] = attempt_index
-        retry_reasons = retry_reason_codes(attempt, image_quality)
+        retry_reasons = retry_reason_codes(attempt, attempt.get("image_quality") or image_quality)
         attempt["retry_reason_codes"] = retry_reasons
         attempt["triggered_next_strategy"] = bool(retry_reasons)
         attempts.append(attempt)
@@ -147,10 +149,18 @@ def retry_reason_codes(attempt: Mapping[str, Any], image_quality: Mapping[str, A
     )
     quality = dict(image_quality or {})
     quality_reasons = set(str(item) for item in quality.get("reason_codes") or [])
-    # A quality warning remains part of the report, but should not multiply
-    # expensive model calls after a valid first-pass structure was obtained.
-    if not result_is_usable and quality_reasons & QUALITY_RETRY_REASONS:
-        reasons.extend(f"image_quality_{item}" for item in sorted(quality_reasons & QUALITY_RETRY_REASONS))
+    if attempt.get("strategy") != "original":
+        # Percentile-based contrast is intentionally conservative for uploads,
+        # but normalized sparse line art can look "low contrast" merely because
+        # most pixels are white. Do not cascade retries on that derived stage.
+        quality_reasons.discard("low_contrast")
+    # A syntactically valid SMILES can still omit atoms when the source is
+    # blurred or low contrast. Continue with a cleaner image stage in that
+    # case; selection later prefers the valid attempt whose actual input no
+    # longer carries the quality warning.
+    quality_retry_reasons = quality_reasons & QUALITY_RETRY_REASONS
+    if quality_retry_reasons and (not result_is_usable or quality_retry_reasons & {"blurred", "low_contrast"}):
+        reasons.extend(f"image_quality_{item}" for item in sorted(quality_retry_reasons))
     if not result_is_usable and quality.get("passed") is False and not quality_reasons:
         reasons.append("image_quality_failed")
     return sorted(set(reasons))
@@ -185,6 +195,10 @@ def _target_label(target: str | Path | np.ndarray) -> str:
 def _attempt_from_result(strategy: str, target: str | Path | np.ndarray, result: OCSRResult) -> dict[str, Any]:
     validation = validate_smiles(result.smiles)
     raw = result.to_dict()
+    try:
+        input_quality = assess_image_quality(target)
+    except Exception:
+        input_quality = None
     return {
         "strategy": strategy,
         "image_stage": STAGE_BY_STRATEGY[strategy],
@@ -204,6 +218,7 @@ def _attempt_from_result(strategy: str, target: str | Path | np.ndarray, result:
         "device": result.device,
         "decision": result.decision,
         "consensus": raw.get("consensus"),
+        "image_quality": input_quality,
     }
 
 
@@ -212,7 +227,7 @@ def _select_attempt(attempts: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] 
     if not valid:
         return None
 
-    def score(attempt: Mapping[str, Any]) -> tuple[int, float, int]:
+    def score(attempt: Mapping[str, Any]) -> tuple[int, int, float, int]:
         retry_reasons = set(str(item) for item in attempt.get("retry_reason_codes") or [])
         confidence = attempt.get("confidence")
         try:
@@ -221,6 +236,7 @@ def _select_attempt(attempts: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] 
             confidence_value = 0.0
         attempt_index = int(attempt.get("attempt_index") or 99)
         return (
+            0 if any(item.startswith("image_quality_") for item in retry_reasons) else 1,
             0 if "low_confidence" in retry_reasons else 1,
             confidence_value,
             -attempt_index,

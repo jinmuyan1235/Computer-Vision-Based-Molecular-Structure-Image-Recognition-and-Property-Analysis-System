@@ -407,6 +407,26 @@ def _device_check(backend: str, status: Mapping[str, Any]) -> dict[str, Any]:
                 "TensorFlow GPU 可用。" if ok else "请求了 GPU 运行 DECIMER，但 TensorFlow GPU 不可用。",
                 {"requested_device": requested, "tensorflow": tf_status},
             )
+        if requested == "auto":
+            gpu_available = bool(tf_status.get("gpu_available") or status.get("gpu_available"))
+            requires_gpu = bool(status.get("strict_mode") or config.OCSR_GPU_REQUIRED)
+            if gpu_available:
+                return _check(
+                    "runtime.device",
+                    CHECK_PASS,
+                    "自动选择已解析为 TensorFlow GPU。",
+                    {"requested_device": requested, "resolved_device": "gpu", "tensorflow": tf_status},
+                )
+            return _check(
+                "runtime.device",
+                CHECK_FAIL if requires_gpu else CHECK_PASS,
+                (
+                    "自动选择未检测到 TensorFlow GPU，且当前配置要求 GPU。"
+                    if requires_gpu
+                    else "自动选择未检测到 TensorFlow GPU，已回退 CPU。"
+                ),
+                {"requested_device": requested, "resolved_device": "cpu", "tensorflow": tf_status},
+            )
     return _check("runtime.device", CHECK_PASS, f"请求设备：{requested or 'auto'}", {"device": status.get("device")})
 
 
@@ -703,6 +723,7 @@ def _cache_key(
     warmup_path: Path,
 ) -> str:
     payload = {
+        "health_probe_version": 2,
         "backend": backend,
         "runtime_config": dict(sorted((str(key), value) for key, value in runtime_config.items())),
         "model_fingerprint": model_fingerprint,

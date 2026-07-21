@@ -52,6 +52,7 @@ def test_default_fallback_image_strategy_order(monkeypatch) -> None:
     monkeypatch.delenv("OCSR_FALLBACK_IMAGE_STRATEGIES", raising=False)
     assert config.load_settings().ocsr_fallback_image_strategies == (
         "original",
+        "enhanced",
         "normalized",
         "grayscale",
         "binary",

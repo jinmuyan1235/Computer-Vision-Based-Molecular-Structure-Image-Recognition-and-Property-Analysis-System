@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import config
 from src.runtime.batch_job_store import BatchJobStore
+from src.runtime.batch_inputs import check_batch_disk_space, extract_batch_uploads, inspect_batch_folder
 from src.runtime.job_manager import (
     extract_json_object,
     is_process_alive,
@@ -33,16 +34,19 @@ def start_batch_job(
 ) -> dict[str, Any]:
     """Start a background batch job and return its persisted state."""
     active_store = store or BatchJobStore()
+    input_path = Path(input_dir).expanduser().resolve()
+    input_summary = inspect_batch_folder(input_path)
     job_id = _new_job_id()
     return _start_prepared_batch_job(
         job_id,
-        Path(input_dir).expanduser().resolve(),
+        input_path,
         backend,
         runtime_config or {},
         active_store,
         source=source,
         parent_job_id=parent_job_id,
         retry_mode=retry_mode,
+        input_summary=input_summary,
     )
 
 
@@ -57,12 +61,20 @@ def start_batch_job_from_uploads(
     active_store = store or BatchJobStore()
     job_id = _new_job_id()
     input_dir = ensure_directory(active_store.job_dir(job_id) / "input")
-    for index, (name, content) in enumerate(uploads, start=1):
-        suffix = Path(name).suffix.lower()
-        stem = safe_stem(Path(name).stem, f"upload_{index:03d}")
-        destination = input_dir / f"{index:03d}_{stem}{suffix}"
-        destination.write_bytes(content)
-    return _start_prepared_batch_job(job_id, input_dir, backend, runtime_config or {}, active_store, source="upload")
+    try:
+        _, input_summary = extract_batch_uploads(list(uploads), input_dir)
+    except Exception:
+        shutil.rmtree(active_store.job_dir(job_id), ignore_errors=True)
+        raise
+    return _start_prepared_batch_job(
+        job_id,
+        input_dir,
+        backend,
+        runtime_config or {},
+        active_store,
+        source="upload",
+        input_summary=input_summary,
+    )
 
 
 def start_batch_retry_job(
@@ -73,10 +85,11 @@ def start_batch_retry_job(
     *,
     store: BatchJobStore | None = None,
     parent_job_id: str | None = None,
+    analysis_ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Start a retry job from failed or review-needed reports in an existing result."""
     active_store = store or BatchJobStore()
-    selected = _retry_source_paths(result, mode)
+    selected = _retry_source_paths(result, mode, analysis_ids=analysis_ids)
     if not selected:
         raise ValueError("没有可重试的图片。")
     job_id = _new_job_id()
@@ -102,7 +115,7 @@ def refresh_batch_job(job_id: str, store: BatchJobStore | None = None) -> dict[s
     active_store = store or BatchJobStore()
     state = active_store.read(job_id)
     status = state.get("status")
-    if status not in {"queued", "running", "cancelling"}:
+    if status not in {"queued", "running", "paused", "cancelling"}:
         return state
     pid = _int_or_none(state.get("pid"))
     if is_process_alive(pid):
@@ -139,11 +152,50 @@ def request_skip_current(job_id: str, store: BatchJobStore | None = None) -> dic
     return (store or BatchJobStore()).request_skip_current(job_id)
 
 
+def pause_batch_job(job_id: str, store: BatchJobStore | None = None) -> dict[str, Any]:
+    """Pause a live worker at the next safe file boundary."""
+    return (store or BatchJobStore()).request_pause(job_id)
+
+
+def resume_batch_job(job_id: str, store: BatchJobStore | None = None) -> dict[str, Any]:
+    """Continue a paused worker or restart an interrupted job from its checkpoint."""
+    active_store = store or BatchJobStore()
+    state = active_store.read(job_id)
+    pid = _int_or_none(state.get("pid"))
+    if state.get("status") == "paused" and is_process_alive(pid):
+        return active_store.resume(job_id)
+    if state.get("status") not in {"paused", "failed", "cancelled"}:
+        return state
+    input_dir = Path(str(state.get("input_dir") or ""))
+    if not input_dir.is_dir():
+        raise FileNotFoundError("原批量任务输入目录已不存在，无法断点继续。")
+    active_store.clear_control_requests(job_id)
+    command = list(state.get("command") or [])
+    if not command:
+        command = _batch_command(
+            job_id,
+            input_dir,
+            Path(str(state.get("output_dir"))),
+            str(state.get("backend") or config.OCSR_BACKEND),
+            state.get("runtime_config") or {},
+            active_store,
+        )
+    active_store.update(job_id, status="queued", error="", message="正在从持久化检查点继续……", finished_at=None)
+    process = start_logged_process(
+        command,
+        cwd=config.PROJECT_ROOT,
+        env=_job_environment(),
+        stdout_path=active_store.stdout_path(job_id),
+        stderr_path=active_store.stderr_path(job_id),
+    )
+    return active_store.mark_running(job_id, process.pid, command)
+
+
 def clear_batch_job(job_id: str, store: BatchJobStore | None = None) -> None:
     """Remove a non-running job from the registry."""
     active_store = store or BatchJobStore()
     state = active_store.read(job_id)
-    if state.get("status") in {"queued", "running", "cancelling"}:
+    if state.get("status") in {"queued", "running", "paused", "cancelling"}:
         cancel_batch_job(job_id, active_store, force=True)
     active_store.clear(job_id)
 
@@ -163,10 +215,20 @@ def _start_prepared_batch_job(
     source: str,
     parent_job_id: str | None = None,
     retry_mode: str | None = None,
+    input_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     output_dir = ensure_directory(store.job_dir(job_id) / "outputs")
-    total = len(list(iter_image_files(input_dir)))
-    command = _batch_command(job_id, input_dir, output_dir, backend, runtime_config, store)
+    check_batch_disk_space(output_dir, int((input_summary or {}).get("total_bytes") or 0))
+    total = len(list(iter_image_files(input_dir, recursive=True)))
+    command = _batch_command(
+        job_id,
+        input_dir,
+        output_dir,
+        backend,
+        runtime_config,
+        store,
+        use_cache=source != "retry",
+    )
     store.create(
         job_id,
         backend=backend,
@@ -178,6 +240,7 @@ def _start_prepared_batch_job(
         runtime_config=dict(runtime_config),
         parent_job_id=parent_job_id,
         retry_mode=retry_mode,
+        input_summary=input_summary or inspect_batch_folder(input_dir),
     )
     process = start_logged_process(
         command,
@@ -196,6 +259,7 @@ def _batch_command(
     backend: str,
     runtime_config: Mapping[str, Any],
     store: BatchJobStore,
+    use_cache: bool = True,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -210,6 +274,10 @@ def _batch_command(
         job_id,
         "--job-store-dir",
         str(store.root),
+        "--checkpoint",
+        str(store.checkpoint_path(job_id)),
+        "--cache-dir",
+        str(ensure_directory(store.root / "result_cache")),
     ]
     if runtime_config.get("molscribe_device"):
         command.extend(["--molscribe-device", str(runtime_config["molscribe_device"])])
@@ -217,21 +285,33 @@ def _batch_command(
         command.extend(["--decimer-device", str(runtime_config["decimer_device"])])
     if runtime_config.get("visible_gpu_index") is not None:
         command.extend(["--visible-gpu-index", str(runtime_config["visible_gpu_index"])])
+    if not use_cache:
+        command.append("--no-cache")
     return command
 
 
 def _job_environment() -> dict[str, str]:
     env = os.environ.copy()
-    env.setdefault("MOLSCRIBE_ISOLATED_SUBPROCESS", "true")
-    env.setdefault("DECIMER_ISOLATED_SUBPROCESS", "true")
+    # One worker owns one model instance for the whole batch. Adapter timeouts and
+    # the global scheduler still isolate individual failures and cap GPU concurrency.
+    env["MOLSCRIBE_ISOLATED_SUBPROCESS"] = "false"
+    env["DECIMER_ISOLATED_SUBPROCESS"] = "false"
+    env["OCSR_GPU_MAX_CONCURRENT_INFERENCE"] = "1"
     return env
 
 
-def _retry_source_paths(result: Mapping[str, Any], mode: str) -> list[Path]:
+def _retry_source_paths(
+    result: Mapping[str, Any],
+    mode: str,
+    analysis_ids: Iterable[str] | None = None,
+) -> list[Path]:
     reports = list(result.get("reports") or [])
+    requested = {str(value) for value in (analysis_ids or [])}
     paths: list[Path] = []
     for report in reports:
         if not isinstance(report, Mapping):
+            continue
+        if mode == "selected" and str(report.get("analysis_id") or "") not in requested:
             continue
         if mode == "failed" and report.get("status") == "success":
             continue

@@ -39,7 +39,7 @@ def test_demo_image_pipeline_and_pdf_export(tmp_path: Path) -> None:
     report = MoleculeReportGenerator("demo", tmp_path).generate(image_path=sample)
     assert report["status"] == "success"
     assert report["ocsr"]["backend"] == "demo"
-    assert report["ocsr"]["selected_strategy"] == "original"
+    assert report["ocsr"]["selected_strategy"] in {"original", "enhanced"}
     assert report["ocsr"]["strategy_attempt_count"] >= 1
     assert report["ocsr"]["strategy_attempts"][0]["strategy"] == "original"
     assert set(report["images"]["preprocessing"]) >= {

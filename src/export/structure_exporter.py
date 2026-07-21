@@ -15,6 +15,7 @@ from rdkit.Chem import AllChem, Draw
 
 from src.chem.mol_drawer import draw_molecule
 from src.chem.smiles_validator import smiles_to_mol, suppress_rdkit_parse_errors
+from src.analysis.correction import is_structure_confirmed
 from src.export.csv_exporter import save_csv
 from src.utils.file_utils import ensure_directory, safe_stem
 
@@ -188,26 +189,38 @@ def export_batch_structure_files(
     destination = ensure_directory(output_dir)
     prefix = safe_stem(file_prefix, "batch")
     merged_sdf = destination / f"{prefix}_merged_structures.sdf"
-    successful_zip = destination / f"{prefix}_successful_structures.zip"
+    merged_smi = destination / f"{prefix}_merged_structures.smi"
+    successful_zip = destination / f"{prefix}_confirmed_structures.zip"
+    complete_zip = destination / f"{prefix}_complete_results.zip"
     failed_csv = destination / f"{prefix}_failed_results.csv"
     review_csv = destination / f"{prefix}_pending_review.csv"
 
     sdf_blocks: list[str] = []
+    smiles_lines: list[str] = []
     failed_rows: list[dict[str, Any]] = []
     review_rows: list[dict[str, Any]] = []
 
     with zipfile.ZipFile(successful_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for index, report in enumerate(report_list, start=1):
             row = _row_for_index(row_list, index - 1, report)
-            if requires_review(report):
+            confirmed = is_structure_confirmed(dict(report))
+            if requires_review(report) or not confirmed:
                 review_rows.append(row)
-            if not can_export_structure(report) or report.get("status") != "success":
+            if report.get("status") != "success":
+                failed_rows.append(row)
+                continue
+            if not confirmed:
+                continue
+            if not can_export_structure(report):
                 failed_rows.append(row)
                 continue
 
             stem = f"{index:04d}_{structure_export_prefix(report)}"
             sdf = sdf_text(report)
             sdf_blocks.append(sdf)
+            smiles = report_structure_smiles(report)
+            if smiles:
+                smiles_lines.append(f"{smiles}\t{stem}")
             archive.writestr(f"{stem}.mol", mol_text(report))
             archive.writestr(f"{stem}.sdf", sdf)
             archive.writestr(f"{stem}.svg", svg_text(report))
@@ -218,11 +231,24 @@ def export_batch_structure_files(
                 pass
 
     merged_sdf.write_text("".join(sdf_blocks), encoding="utf-8")
+    merged_smi.write_text("\n".join(smiles_lines) + ("\n" if smiles_lines else ""), encoding="utf-8")
     _save_list_csv(failed_rows, failed_csv, row_list)
     _save_list_csv(review_rows, review_csv, row_list)
+    with zipfile.ZipFile(complete_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in (merged_sdf, merged_smi, successful_zip, failed_csv, review_csv):
+            archive.write(path, path.name)
+        for index, report in enumerate(report_list, start=1):
+            input_path = Path(str(_block(report, "input").get("path") or ""))
+            if input_path.is_file():
+                archive.write(input_path, f"originals/{index:04d}_{safe_stem(input_path.name, 'image')}")
+            redraw_path = Path(str(_block(report, "images").get("redrawn_molecule") or ""))
+            if redraw_path.is_file():
+                archive.write(redraw_path, f"candidate_previews/{index:04d}_{safe_stem(redraw_path.name, 'structure.png')}")
     return {
         "merged_sdf": str(merged_sdf.resolve()),
+        "merged_smi": str(merged_smi.resolve()),
         "successful_zip": str(successful_zip.resolve()),
+        "complete_zip": str(complete_zip.resolve()),
         "failed_csv": str(failed_csv.resolve()),
         "review_csv": str(review_csv.resolve()),
     }
@@ -234,6 +260,8 @@ def requires_review(report: Mapping[str, Any]) -> bool:
     consensus = _block(_block(report, "ocsr"), "consensus")
     final_decision = decision.get("decision") or consensus.get("decision")
     return bool(
+        not is_structure_confirmed(dict(report))
+        or
         decision.get("manual_review_recommended")
         or final_decision in {"review_needed", "accepted_with_warning"}
         or consensus.get("status") == "disagreement"

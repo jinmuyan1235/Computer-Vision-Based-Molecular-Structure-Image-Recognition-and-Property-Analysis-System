@@ -29,6 +29,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--visible-gpu-index", default=None, help="CUDA_VISIBLE_DEVICES index for TensorFlow/DECIMER.")
     parser.add_argument("--job-id", default=None, help="Background job id for progress persistence.")
     parser.add_argument("--job-store-dir", default=None, help="Directory containing background job state.")
+    parser.add_argument("--checkpoint", default=None, help="Persistent per-file checkpoint JSON.")
+    parser.add_argument("--cache-dir", default=None, help="Content-hash result cache shared by batch jobs.")
+    parser.add_argument("--no-cache", action="store_true", help="Force fresh OCSR for explicit retry tasks.")
     return parser
 
 
@@ -42,11 +45,18 @@ def main() -> int:
             "visible_gpu_index": args.visible_gpu_index,
         }
         output_dir = ensure_directory(args.output)
-        result = BatchAnalyzer(args.backend, output_dir, runtime_config=runtime_config).analyze_folder(
+        result = BatchAnalyzer(
+            args.backend,
+            output_dir,
+            runtime_config=runtime_config,
+            cache_dir=None if args.no_cache else args.cache_dir,
+        ).analyze_folder(
             args.input,
             progress_callback=(lambda payload: store.update_progress(args.job_id, payload)) if store and args.job_id else None,
             cancel_requested=(lambda: store.cancel_requested(args.job_id)) if store and args.job_id else None,
             skip_requested=(lambda _path: store.consume_skip_request(args.job_id)) if store and args.job_id else None,
+            pause_requested=(lambda: store.pause_requested(args.job_id)) if store and args.job_id else None,
+            checkpoint_path=args.checkpoint,
         )
         ui_result = {
             "summary": result["summary"],

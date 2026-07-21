@@ -189,7 +189,7 @@ def load_settings() -> Settings:
         ocsr_gpu_required=_env_bool("OCSR_GPU_REQUIRED", False),
         ocsr_gpu_max_concurrent_inference=_env_int("OCSR_GPU_MAX_CONCURRENT_INFERENCE", 1, minimum=1),
         ocsr_gpu_allow_parallel_models=_env_bool("OCSR_GPU_ALLOW_PARALLEL_MODELS", False),
-        ocsr_fallback_image_strategies=_csv_tuple("OCSR_FALLBACK_IMAGE_STRATEGIES", "original,normalized,grayscale,binary"),
+        ocsr_fallback_image_strategies=_csv_tuple("OCSR_FALLBACK_IMAGE_STRATEGIES", "original,enhanced,normalized,grayscale,binary"),
         enable_admet_model=_env_bool("ENABLE_ADMET_MODEL", False),
         admet_model_path=admet_model_path,
         molscribe_model_path=molscribe_model_path,

@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
+from hashlib import sha256
 import json
 from pathlib import Path
+import time
 from typing import Any, Callable
 from uuid import uuid4
 
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 
+import config
 from config import OUTPUT_DIR
 from src.export.csv_exporter import save_csv
 from src.export.json_exporter import save_json
 from src.export.structure_exporter import export_batch_structure_files
+from src.analysis.correction import is_structure_confirmed, sha256_file
 from src.utils.file_utils import ensure_directory, iter_image_files
 from .molecule_report import MoleculeReportGenerator
 
@@ -71,6 +76,10 @@ def flatten_report(report: dict[str, Any]) -> dict[str, Any]:
         "final_raw_smiles": final.get("raw_smiles"),
         "final_standardized_smiles": final.get("standardized_smiles") or validation.get("standardized_smiles"),
         "final_result_source": final.get("source"),
+        "candidate_smiles": final.get("smiles") or ocsr.get("smiles"),
+        "human_review_status": (report.get("human_review") or {}).get("status") or "unconfirmed",
+        "human_confirmed": is_structure_confirmed(report),
+        "official_smiles": (final.get("smiles") or ocsr.get("smiles")) if is_structure_confirmed(report) else None,
         "confidence": ocsr.get("confidence"),
         "inference_time_ms": ocsr.get("inference_time_ms"),
         "model_name": ocsr.get("model_name"),
@@ -123,9 +132,28 @@ class BatchAnalyzer:
         backend: str | None = None,
         output_dir: str | Path = OUTPUT_DIR,
         runtime_config: dict[str, Any] | None = None,
+        cache_dir: str | Path | None = None,
     ) -> None:
         self.output_dir = ensure_directory(output_dir)
         self.generator = MoleculeReportGenerator(backend=backend, output_dir=self.output_dir, runtime_config=runtime_config)
+        self.backend = str(backend or self.generator.backend)
+        self.runtime_config = dict(runtime_config or {})
+        model_path = Path(config.MOLSCRIBE_MODEL_PATH)
+        model_stamp = ""
+        if model_path.is_file():
+            stat = model_path.stat()
+            model_stamp = f"{model_path}:{stat.st_size}:{stat.st_mtime_ns}"
+        self.cache_namespace = json.dumps(
+            {
+                "backend": self.backend,
+                "runtime": self.runtime_config,
+                "model": model_stamp,
+                "preprocessing_pipeline": "clarity-aware-v2",
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        self.cache_dir = ensure_directory(cache_dir) if cache_dir else None
 
     def analyze_folder(
         self,
@@ -133,24 +161,59 @@ class BatchAnalyzer:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         skip_requested: Callable[[Path], bool] | None = None,
+        pause_requested: Callable[[], bool] | None = None,
+        checkpoint_path: str | Path | None = None,
     ) -> dict[str, Any]:
         """Process a folder, export CSV/JSON, and return results plus statistics."""
-        image_files = list(iter_image_files(input_dir))
+        image_files = list(iter_image_files(input_dir, recursive=True))
         reports: list[dict[str, Any]] = []
+        checkpoint = Path(checkpoint_path).expanduser().resolve() if checkpoint_path else None
+        completed_by_path = self._load_checkpoint(checkpoint)
+        cache_hits = 0
         cancelled = False
-        self._emit_progress(progress_callback, "running", image_files, reports)
+        self._emit_progress(progress_callback, "running", image_files, reports, cache_hits=cache_hits)
         for index, image_path in enumerate(image_files, start=1):
             if cancel_requested is not None and cancel_requested():
                 cancelled = True
-                self._emit_progress(progress_callback, "cancelling", image_files, reports, current_file=image_path.name, current_index=index)
+                self._emit_progress(progress_callback, "cancelling", image_files, reports, current_file=image_path.name, current_index=index, cache_hits=cache_hits)
                 break
+            while pause_requested is not None and pause_requested():
+                self._emit_progress(
+                    progress_callback,
+                    "paused",
+                    image_files,
+                    reports,
+                    current_file=image_path.name,
+                    current_index=index,
+                    cache_hits=cache_hits,
+                )
+                if cancel_requested is not None and cancel_requested():
+                    cancelled = True
+                    break
+                time.sleep(0.5)
+            if cancelled:
+                break
+            path_key = str(image_path.resolve())
+            if path_key in completed_by_path:
+                reports.append(deepcopy(completed_by_path[path_key]))
+                cache_hits += 1
+                self._emit_progress(progress_callback, "running", image_files, reports, current_file=image_path.name, current_index=index, cache_hits=cache_hits)
+                continue
             if skip_requested is not None and skip_requested(image_path):
                 reports.append(self._skipped_report(image_path, "用户请求跳过该未开始文件。"))
-                self._emit_progress(progress_callback, "running", image_files, reports, current_file=image_path.name, current_index=index)
+                completed_by_path[path_key] = reports[-1]
+                self._save_checkpoint(checkpoint, completed_by_path)
+                self._emit_progress(progress_callback, "running", image_files, reports, current_file=image_path.name, current_index=index, cache_hits=cache_hits)
                 continue
-            self._emit_progress(progress_callback, "running", image_files, reports, current_file=image_path.name, current_index=index)
+            self._emit_progress(progress_callback, "running", image_files, reports, current_file=image_path.name, current_index=index, cache_hits=cache_hits)
             try:
-                reports.append(self.generator.generate(image_path=image_path))
+                cached = self._load_cached_report(image_path)
+                if cached is not None:
+                    reports.append(cached)
+                    cache_hits += 1
+                else:
+                    reports.append(self.generator.generate(image_path=image_path))
+                    self._save_cached_report(image_path, reports[-1])
             except Exception as exc:
                 reports.append({
                     "analysis_id": uuid4().hex,
@@ -158,9 +221,12 @@ class BatchAnalyzer:
                     "message": f"未预期错误：{exc}",
                     "input": {"type": "image", "filename": image_path.name, "path": str(image_path)},
                 })
-            self._emit_progress(progress_callback, "running", image_files, reports, current_file=image_path.name, current_index=index)
+            completed_by_path[path_key] = reports[-1]
+            self._save_checkpoint(checkpoint, completed_by_path)
+            self._emit_progress(progress_callback, "running", image_files, reports, current_file=image_path.name, current_index=index, cache_hits=cache_hits)
         rows = [flatten_report(report) for report in reports]
         summary = self._summary(rows, total=len(image_files), cancelled=cancelled)
+        summary["cache_hits"] = cache_hits
         csv_path = save_csv(rows, self.output_dir / "batch_results.csv")
         json_path = save_json({"summary": summary, "results": reports}, self.output_dir / "batch_results.json")
         chart_path = self._save_summary_chart(summary)
@@ -184,6 +250,7 @@ class BatchAnalyzer:
             reports,
             current_file=None,
             current_index=len(reports),
+            cache_hits=cache_hits,
         )
         return result
 
@@ -212,6 +279,9 @@ class BatchAnalyzer:
         failed = category_counts["failed"]
         skipped = category_counts["skipped"]
         manual_review_total = accepted_with_warning + review_needed
+        pending_confirmation = sum(
+            row.get("status") == "success" and not bool(row.get("human_confirmed")) for row in rows
+        )
         return {
             "summary_schema_version": BATCH_SUMMARY_SCHEMA_VERSION,
             "total": planned_total,
@@ -224,6 +294,7 @@ class BatchAnalyzer:
             "review_needed": review_needed,
             "rejected": rejected,
             "manual_review_total": manual_review_total,
+            "pending_confirmation": pending_confirmation,
             "valid_smiles": valid,
             "success_rate": round(successful / planned_total, 4) if planned_total else 0.0,
             "valid_rate": round(valid / planned_total, 4) if planned_total else 0.0,
@@ -248,6 +319,7 @@ class BatchAnalyzer:
         current_index: int | None = None,
         result_path: str | Path | None = None,
         exports: dict[str, str] | None = None,
+        cache_hits: int = 0,
     ) -> None:
         if progress_callback is None:
             return
@@ -260,12 +332,74 @@ class BatchAnalyzer:
             "current_file": current_file,
             "current_index": current_index,
             "summary": summary,
+            "cache_hits": int(cache_hits),
         }
         if result_path is not None:
             payload["result_path"] = str(result_path)
         if exports is not None:
             payload["exports"] = exports
         progress_callback(payload)
+
+    def _cache_path(self, image_path: Path) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        image_hash = sha256_file(image_path)
+        if not image_hash:
+            return None
+        key = sha256(f"{self.cache_namespace}:{image_hash}".encode("utf-8")).hexdigest()
+        return self.cache_dir / f"{key}.json"
+
+    def _load_cached_report(self, image_path: Path) -> dict[str, Any] | None:
+        cache_path = self._cache_path(image_path)
+        if cache_path is None or not cache_path.is_file():
+            return None
+        try:
+            report = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if report.get("status") != "success":
+            return None
+        updated = deepcopy(report)
+        updated["analysis_id"] = uuid4().hex
+        updated.setdefault("input", {}).update({
+            "type": "image",
+            "filename": image_path.name,
+            "path": str(image_path),
+            "image_sha256": sha256_file(image_path),
+        })
+        updated["cache"] = {"hit": True, "key": cache_path.stem, "source": str(cache_path)}
+        return updated
+
+    def _save_cached_report(self, image_path: Path, report: dict[str, Any]) -> None:
+        cache_path = self._cache_path(image_path)
+        if cache_path is None or report.get("status") != "success":
+            return
+        temp = cache_path.with_suffix(".tmp")
+        temp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(cache_path)
+
+    @staticmethod
+    def _load_checkpoint(path: Path | None) -> dict[str, dict[str, Any]]:
+        if path is None or not path.is_file():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        reports = payload.get("reports_by_path") or {}
+        return {str(key): value for key, value in reports.items() if isinstance(value, dict)}
+
+    @staticmethod
+    def _save_checkpoint(path: Path | None, reports_by_path: dict[str, dict[str, Any]]) -> None:
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(".tmp")
+        temp.write_text(
+            json.dumps({"schema_version": 1, "reports_by_path": reports_by_path}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp.replace(path)
 
     @staticmethod
     def _skipped_report(image_path: Path, message: str) -> dict[str, Any]:

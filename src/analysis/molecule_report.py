@@ -46,6 +46,8 @@ class MoleculeReportGenerator:
         self.output_dir = ensure_directory(output_dir)
         self.backend = "manual" if backend == "manual" else (backend or config.OCSR_BACKEND).strip().lower()
         self.recognizer = None if self.backend == "manual" else MoleculeRecognizer(backend, runtime_config=runtime_config)
+        self.runtime_config = dict(runtime_config or {})
+        self._fallback_recognizers: dict[str, MoleculeRecognizer] = {}
         self.preprocessor = ImagePreprocessor()
         self.admet_predictor = ConfiguredADMETPredictor()
 
@@ -126,7 +128,11 @@ class MoleculeReportGenerator:
         routing_candidates = [candidate_from_result(result)]
         if self.backend == "decimer" and not routing_candidates[0].get("valid"):
             try:
-                fallback_recognizer = MoleculeRecognizer("molscribe")
+                if "molscribe" not in self._fallback_recognizers:
+                    self._fallback_recognizers["molscribe"] = MoleculeRecognizer(
+                        "molscribe", runtime_config=self.runtime_config
+                    )
+                fallback_recognizer = self._fallback_recognizers["molscribe"]
                 fallback_recognition = recognize_with_fallback_strategies(
                     fallback_recognizer,
                     path,

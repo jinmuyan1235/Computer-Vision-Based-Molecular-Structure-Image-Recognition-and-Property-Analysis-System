@@ -22,12 +22,13 @@ def safe_stem(value: str, fallback: str = "molecule") -> str:
     return cleaned or fallback
 
 
-def iter_image_files(folder: str | Path) -> Iterable[Path]:
-    """Yield supported images in deterministic filename order."""
+def iter_image_files(folder: str | Path, recursive: bool = False) -> Iterable[Path]:
+    """Yield supported images in deterministic order, optionally including subfolders."""
     root = Path(folder).expanduser().resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"输入文件夹不存在或不是目录：{root}")
+    candidates = root.rglob("*") if recursive else root.iterdir()
     yield from sorted(
-        (item for item in root.iterdir() if item.is_file() and item.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS),
-        key=lambda item: item.name.lower(),
+        (item for item in candidates if item.is_file() and item.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS),
+        key=lambda item: str(item.relative_to(root)).lower(),
     )

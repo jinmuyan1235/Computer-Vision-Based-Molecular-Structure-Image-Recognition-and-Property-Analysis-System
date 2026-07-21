@@ -150,6 +150,12 @@ def test_candidate_tab_is_hidden_until_a_second_candidate_exists(tmp_path: Path)
     report = _image_report(tmp_path)
     assert "候选比较" not in _report_section_options(report)
 
+    report["ocsr"]["strategy_attempts"] = [
+        {"smiles": "CCO"},
+        {"smiles": "OCC"},
+    ]
+    assert "候选比较" not in _report_section_options(report)
+
     report["ocsr"]["candidates"] = [
         {"backend": "first", "raw_smiles": "CCO"},
         {"backend": "second", "raw_smiles": "CCN"},

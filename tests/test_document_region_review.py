@@ -159,6 +159,7 @@ def test_background_recognition_can_run_all_confirmed_regions(tmp_path: Path) ->
     processor._summary = lambda pages, regions, errors: {"page_count": len(pages), "region_count": len(regions)}  # type: ignore[method-assign]
     processor.export = lambda updated, output: updated.get("exports", {})  # type: ignore[method-assign]
 
+    progress: list[tuple[str, int, int, str]] = []
     processor.apply_edits(
         _document(tmp_path),
         [
@@ -166,12 +167,91 @@ def test_background_recognition_can_run_all_confirmed_regions(tmp_path: Path) ->
             {"action": "recognize", "region_id": "p001_r002"},
         ],
         rerun_ocsr=True,
+        progress_callback=lambda stage, current, total, region_id: progress.append(
+            (stage, current, total, region_id)
+        ),
     )
 
     assert calls == ["p001_r001", "p001_r002"]
+    assert progress == [
+        ("recognizing", 1, 2, "p001_r001"),
+        ("recognized", 1, 2, "p001_r001"),
+        ("recognizing", 2, 2, "p001_r002"),
+        ("recognized", 2, 2, "p001_r002"),
+    ]
 
 
 def test_background_failure_reason_prefers_explicit_worker_message() -> None:
     assert background_failure_reason(1, {"message": "CUDA 显存不足"}, "", "trace") == "CUDA 显存不足"
     assert background_failure_reason(2, None, "", "line one\n模型文件缺失") == "模型文件缺失"
     assert background_failure_reason(9, None, "", "") == "后台进程退出码 9"
+
+
+def test_running_region_job_is_restored_from_disk_after_refresh(tmp_path: Path, monkeypatch) -> None:
+    from src.ui import document_page
+
+    state_dir = tmp_path / "ui_jobs" / "region_batch_test"
+    state_dir.mkdir(parents=True)
+    state_path = state_dir / "job_state.json"
+    state_path.write_text(
+        json.dumps({
+            "status": "running",
+            "pid": 43210,
+            "region_id": "p001_r001",
+            "region_ids": ["p001_r001", "p001_r002"],
+            "scope_label": "全文批量识别",
+            "page_number": 1,
+            "page_numbers": [1],
+            "stdout_path": str(state_dir / "stdout.log"),
+            "stderr_path": str(state_dir / "stderr.log"),
+            "started_at": 100.0,
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(document_page.config, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(document_page, "is_process_alive", lambda pid: pid == 43210)
+    document_page.st.session_state.pop("document_region_job", None)
+
+    document_page._restore_region_job_from_disk()
+
+    restored = document_page.st.session_state.get("document_region_job")
+    assert restored is not None
+    assert restored["region_ids"] == ["p001_r001", "p001_r002"]
+    assert restored["process"] is None
+    assert restored["state_path"] == str(state_path)
+    document_page.st.session_state.pop("document_region_job", None)
+
+
+def test_document_region_smiles_correction_and_confirmation_keep_model_candidate_audit(tmp_path: Path) -> None:
+    processor = object.__new__(DocumentOCSRProcessor)
+    processor._summary = lambda pages, regions, errors: {"page_count": len(pages), "region_count": len(regions)}  # type: ignore[method-assign]
+    processor.export = lambda updated, output: updated.get("exports", {})  # type: ignore[method-assign]
+    document = _document(tmp_path)
+    document["regions"][0]["report"] = {
+        "analysis_id": "doc-region-1",
+        "status": "success",
+        "message": "candidate",
+        "input": {"type": "image", "filename": "crop.png"},
+        "ocsr": {"status": "success", "smiles": "CCO", "predicted_smiles": "CCO"},
+        "final": {"smiles": "CCO", "canonical_smiles": "CCO", "source": "ocsr"},
+        "images": {},
+    }
+
+    corrected = processor.apply_edits(
+        document,
+        [{"action": "correct_smiles", "region_id": "p001_r001", "smiles": "C(C)O"}],
+        rerun_ocsr=False,
+    )
+    corrected_region = corrected["regions"][0]
+    assert corrected_region["report"]["final"]["canonical_smiles"] == "CCO"
+    assert corrected_region["report"]["ocsr"]["predicted_smiles"] == "CCO"
+    assert corrected_region["confirmed"] is False
+
+    confirmed = processor.apply_edits(
+        corrected,
+        [{"action": "confirm_structure", "region_id": "p001_r001"}],
+        rerun_ocsr=False,
+    )
+    confirmed_region = confirmed["regions"][0]
+    assert confirmed_region["confirmed"] is True
+    assert confirmed_region["report"]["final"]["source"] == "human_confirmed_model_candidate"

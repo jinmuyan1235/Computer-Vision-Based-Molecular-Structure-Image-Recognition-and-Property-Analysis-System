@@ -139,16 +139,17 @@ def test_document_page_uses_chinese_mode_labels() -> None:
     assert "Delete region" not in source
     assert "确认并识别" not in source
     assert "仅保存框选" in source
-    assert "保存并识别" in source
+    assert "识别当前区域" in source
     assert "空白处拖动画新框" in source
-    assert "框选已自动保存" in source
+    assert "框选调整已保存" in source
     assert "裁剪预览" in source
     assert '@st.fragment(run_every="2s")' in source
     assert "document_region_job" in source
-    assert "步骤 1/2：已保存并锁定" in source
-    assert "步骤 2/2：正在加载 OCSR 并识别结构" in source
+    assert "当前阶段" in source
+    assert "取消当前识别任务" in source
+    assert "重试最近识别任务" in source
     assert "识别本页已确认区域" in source
-    assert "识别全文全部已确认区域" in source
+    assert "批量识别全部已确认区域" in source
     assert "未确认框不会进入 OCSR" in source
     render_page_body = source.split("def render_document_page", 1)[1].split("def _run_demo_document", 1)[0]
     inspector_body = source.split("def _render_region_inspector", 1)[1].split("def _region_candidate_smiles", 1)[0]
@@ -156,11 +157,11 @@ def test_document_page_uses_chinese_mode_labels() -> None:
     assert "_render_region_ocsr_job_status(selected_id)" in inspector_body
     assert "合并两个或多个区域" in source
     assert "拆分当前区域" in source
-    assert "下载检测训练标注" in source
+    assert "JSON 检测训练标注" in source
 
 
 def test_document_subprocess_json_parser_ignores_trailing_logs() -> None:
-    from src.ui.document_page import _extract_document_progress, _extract_json_object
+    from src.ui.document_page import _extract_document_progress, _extract_json_object, _extract_region_progress
 
     parsed = _extract_json_object('native log\n{"status": "success", "result_path": "x.json"}\n[09:46] warning')
     assert parsed == {"status": "success", "result_path": "x.json"}
@@ -179,6 +180,10 @@ def test_document_subprocess_json_parser_ignores_trailing_logs() -> None:
         'DOCUMENT_RESULT_JSON={"status":"success","result_path":"marked.json"}\n'
     )
     assert _extract_json_object(marked)["result_path"] == "marked.json"
+    region_progress = _extract_region_progress(
+        'noise\nDOCUMENT_REGION_PROGRESS_JSON={"stage":"recognizing","current":2,"total":5,"region_id":"p002_r004"}\n'
+    )
+    assert region_progress == {"stage": "recognizing", "current": 2, "total": 5, "region_id": "p002_r004"}
 
 
 def test_document_result_recovery_uses_completed_worker_log(tmp_path: Path) -> None:
@@ -202,3 +207,210 @@ def test_document_result_recovery_uses_completed_worker_log(tmp_path: Path) -> N
     payload, recovered_path = recovered
     assert payload["summary"] == {"page_count": 15, "region_count": 377}
     assert recovered_path == result_path
+
+
+def test_document_region_filter_does_not_fall_back_to_nonmatching_regions() -> None:
+    from src.ui.document_page import _filter_document_regions
+
+    regions = [
+        {"region_id": "text", "region_type": "text", "status": "detected", "confirmed": False},
+        {"region_id": "reaction", "region_type": "reaction_like", "status": "recognized", "confirmed": True},
+    ]
+
+    assert _filter_document_regions(regions, "molecule", "全部") == []
+    assert [region["region_id"] for region in _filter_document_regions(regions, "reaction", "全部")] == ["reaction"]
+    assert _filter_document_regions(regions, "全部", "识别失败") == []
+
+
+def test_document_region_list_renders_empty_state_without_radio(monkeypatch) -> None:
+    from src.ui import document_page
+
+    selections = iter(["molecule", "全部"])
+    messages: list[str] = []
+    monkeypatch.setattr(document_page.st, "subheader", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(document_page.st, "selectbox", lambda *_args, **_kwargs: next(selections))
+    monkeypatch.setattr(document_page.st, "info", lambda message, **_kwargs: messages.append(str(message)))
+
+    def unexpected_radio(*_args, **_kwargs):
+        raise AssertionError("空筛选结果不应回退并渲染区域单选列表")
+
+    monkeypatch.setattr(document_page.st, "radio", unexpected_radio)
+    selected = document_page._render_region_list(
+        [{"region_id": "text", "region_type": "text", "status": "detected", "confirmed": False}],
+        "text",
+    )
+
+    assert selected is None
+    assert messages == ["没有匹配区域。"]
+
+
+def test_document_region_label_exposes_screening_diagnostics() -> None:
+    from src.ui.document_page import _compact_region_option_label, _region_option_label, _short_text_false_positive
+
+    region = {
+        "page_number": 2,
+        "region_id": "p002_r003",
+        "region_type": "text",
+        "status": "detected",
+        "screening": {
+            "reason_codes": ["short_text_hard_reject", "pdf_text_token"],
+            "diagnostics": {"long_line_count": 1, "valid_component_count": 2},
+        },
+    }
+
+    label = _region_option_label(region)
+    assert "线段 1" in label
+    assert "组件 2" in label
+    assert "短文本硬拒绝" in label
+    compact_label = _compact_region_option_label(region)
+    assert compact_label.startswith("p002_r003 · 文本 · 已检测")
+    assert "线段" not in compact_label
+    assert _short_text_false_positive(region) is True
+
+
+def test_document_advanced_filters_share_one_compact_canvas_layout() -> None:
+    source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "document_page.py").read_text(encoding="utf-8")
+    workbench = source[source.index("def _document_workbench") : source.index("def _document_needs_screening_refresh")]
+
+    assert "selected, filtered = _render_region_navigator" in workbench
+    assert 'st.columns([0.72, 0.28], gap="large")' in workbench
+    assert '_render_bbox_dragger(page, filtered, "", [0, 0, 1, 1])' in workbench
+    assert '_render_bbox_dragger(page, filtered, selected["region_id"], preview_bbox)' in workbench
+    assert "_render_bbox_dragger(page, visible" not in workbench
+    assert "类型和状态筛选会同步作用于区域导航与画布框" in workbench
+
+
+def test_document_canvas_exposes_human_friendly_edit_controls() -> None:
+    source = (Path(__file__).resolve().parents[1] / "src" / "ui" / "document_page.py").read_text(encoding="utf-8")
+
+    assert "＋ 新增框模式" in source
+    assert "方向键微调" in source
+    assert "Esc 取消当前拖动" in source
+    assert "删除当前框（Delete）" in source
+    assert "确认新增" in source
+    assert "取消新增" in source
+    assert "保存调整" in source
+    assert "取消调整" in source
+    assert 'submitEvent("select"' not in source
+    assert "松手后自动保存" not in source
+    assert "批量清理短文本误框" in source
+    assert "拖动画布" in source
+    assert 'id="zoom-in"' in source
+    assert "↶ 撤销" in source
+    assert "复制区域" in source
+
+
+def test_batch_page_exposes_resumable_review_and_confirmation_gated_exports() -> None:
+    root = Path(__file__).resolve().parents[1]
+    page_source = (root / "src" / "ui" / "batch_page.py").read_text(encoding="utf-8")
+    registry_source = (root / "src" / "runtime" / "job_registry.py").read_text(encoding="utf-8")
+
+    assert "上传多张图片或 ZIP" in page_source
+    assert 'accept_multiple_files="directory"' in page_source
+    assert "服务器本地文件夹路径" in page_source
+    assert "暂停" in page_source and "继续/断点续跑" in page_source
+    assert "预计剩余" in page_source and "当前文件" in page_source
+    assert "批量确认所选候选" in page_source
+    assert "校验并应用修正" in page_source
+    assert "重新识别所选文件" in page_source
+    assert "下载已确认结构 SMI" in page_source
+    assert "下载完整结果 ZIP" in page_source
+    assert "st.dataframe" not in page_source
+    assert "st.table" not in page_source
+    assert "_render_batch_result_rows" in page_source
+    assert 'st.status("正在启动批量任务…"' in page_source
+    assert 'with st.expander(f"查看文件清单（{len(entries)} 项）", expanded=False)' in page_source
+    assert 'with st.expander(f"缩略图预览（前 {len(previews)} 张）", expanded=False)' in page_source
+    assert 'caption="原图", width=280' in page_source
+    assert 'caption="候选结构", width=280' in page_source
+    assert "系统会使用清晰增强图参与 OCSR" in page_source
+    assert 'env["MOLSCRIBE_ISOLATED_SUBPROCESS"] = "false"' in registry_source
+    assert 'env["OCSR_GPU_MAX_CONCURRENT_INFERENCE"] = "1"' in registry_source
+
+
+def test_batch_page_restores_active_job(monkeypatch) -> None:
+    from src.ui import batch_page
+
+    class FakeStore:
+        def exists(self, job_id: str) -> bool:
+            return job_id == "batch-demo"
+
+    expected = {"job_id": "batch-demo", "status": "running"}
+    monkeypatch.setattr(batch_page.st, "session_state", {"batch_job_id": "batch-demo"})
+    monkeypatch.setattr(batch_page, "refresh_batch_job", lambda job_id, store: expected)
+
+    assert batch_page._active_job(FakeStore()) == expected
+
+
+def test_document_navigation_strict_filter_copy_quality_and_duplicates() -> None:
+    from src.ui.document_page import (
+        _copy_region_edit,
+        _crop_quality_warnings,
+        _duplicate_region_groups,
+        _is_strict_molecule_candidate,
+        _thumbnail_window,
+    )
+
+    assert _thumbnail_window(list(range(1, 21)), 10) == [7, 8, 9, 10, 11, 12, 13]
+    assert _thumbnail_window([1, 2, 3], 2) == [1, 2, 3]
+
+    strict = {
+        "region_type": "molecule",
+        "source": "detector",
+        "screening": {"passed": True, "structural_evidence": True},
+    }
+    weak = {
+        "region_type": "molecule",
+        "source": "detector",
+        "screening": {"passed": True, "structural_evidence": False},
+    }
+    assert _is_strict_molecule_candidate(strict) is True
+    assert _is_strict_molecule_candidate(weak) is False
+    assert _is_strict_molecule_candidate({**weak, "source": "user"}) is True
+
+    document = {
+        "pages": [
+            {"page_number": 1, "width": 1000, "height": 2000},
+            {"page_number": 2, "width": 2000, "height": 1000},
+        ]
+    }
+    region = {"region_id": "p001_r001", "page_number": 1, "bbox": [100, 200, 500, 1000], "region_type": "molecule"}
+    copied = _copy_region_edit(document, region, 2)
+    assert copied["bbox"] == [200, 100, 1000, 500]
+    assert copied["confirmed"] is False
+
+    duplicates = _duplicate_region_groups([
+        {"region_id": "a", "page_number": 1, "bbox": [10, 10, 110, 110], "region_type": "molecule"},
+        {"region_id": "b", "page_number": 1, "bbox": [12, 12, 108, 108], "region_type": "molecule"},
+        {"region_id": "c", "page_number": 2, "bbox": [12, 12, 108, 108], "region_type": "molecule"},
+    ])
+    assert duplicates == [["a", "b"]]
+
+    warnings = _crop_quality_warnings(
+        {"width": 2000, "height": 3000},
+        [10, 10, 30, 35],
+        {"screening": {"reason_codes": ["missing_skeleton_evidence"]}},
+    )
+    assert any("尺寸过小" in message for message in warnings)
+    assert any("骨架证据" in message for message in warnings)
+
+
+def test_old_document_screening_is_detected_for_non_ocsr_refresh() -> None:
+    from src.ui.document_page import _document_needs_screening_refresh
+
+    old = {
+        "regions": [{
+            "region_id": "p001_r001",
+            "source": "detector",
+            "status": "detected",
+            "confirmed": False,
+            "screening": {"config_version": "crop-screening-candidate-v2"},
+        }]
+    }
+    current = {
+        "processing": {"screening_refresh": {"config_version": "crop-screening-candidate-v3"}},
+        "regions": old["regions"],
+    }
+
+    assert _document_needs_screening_refresh(old) is True
+    assert _document_needs_screening_refresh(current) is False

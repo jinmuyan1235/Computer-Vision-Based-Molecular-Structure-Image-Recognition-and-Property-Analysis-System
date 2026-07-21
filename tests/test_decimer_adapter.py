@@ -65,6 +65,31 @@ def test_decimer_diagnose_reports_predictor_import_failure(monkeypatch) -> None:
     assert "keras mismatch" in status["load_error"]
 
 
+def test_decimer_lightweight_diagnose_probes_tensorflow_gpu(monkeypatch) -> None:
+    adapter = DECIMERAdapter(device="auto", strict_mode=False)
+    monkeypatch.setattr(adapter, "_package_installed", lambda: True)
+    calls: list[bool] = []
+
+    def fake_tensorflow_status(load: bool = True) -> dict:
+        calls.append(load)
+        return {
+            "tensorflow_installed": True,
+            "tensorflow_version": "2.test",
+            "gpu_available": True if load else bool(adapter.detected_gpus),
+            "detected_gpus": ["GPU:0"] if load else list(adapter.detected_gpus),
+            "tensorflow": object() if load else None,
+        }
+
+    monkeypatch.setattr(adapter, "_tensorflow_status", fake_tensorflow_status)
+
+    status = adapter.diagnose(load_model=False)
+
+    assert calls[0] is True
+    assert status["gpu_available"] is True
+    assert status["device"] == "gpu"
+    assert status["detected_gpus"] == ["GPU:0"]
+
+
 def test_decimer_initialization_error(monkeypatch, tmp_path: Path) -> None:
     adapter = DECIMERAdapter()
     monkeypatch.setattr(adapter, "_package_installed", lambda: True)
