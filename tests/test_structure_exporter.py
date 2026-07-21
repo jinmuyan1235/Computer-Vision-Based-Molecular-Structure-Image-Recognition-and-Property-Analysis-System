@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.analysis.molecule_report import MoleculeReportGenerator
+from src.analysis.correction import confirm_structure, reset_human_review
 from src.export.structure_exporter import (
     SDF_PROPERTY_FIELDS,
     copyable_structure_fields,
@@ -72,6 +73,9 @@ def test_batch_structure_export_writes_sdf_zip_and_review_lists(tmp_path: Path) 
     assert merged.count("$$$$") == 2
     assert ">  <ANALYSIS_ID>\naccepted001" in merged
     assert ">  <ANALYSIS_ID>\nreview001" in merged
+    merged_smi = Path(exports["merged_smi"]).read_text(encoding="utf-8")
+    assert "CCO\t" in merged_smi
+    assert "c1ccccc1\t" in merged_smi
 
     with zipfile.ZipFile(exports["successful_zip"]) as archive:
         names = archive.namelist()
@@ -83,6 +87,26 @@ def test_batch_structure_export_writes_sdf_zip_and_review_lists(tmp_path: Path) 
     assert list(failed_frame["analysis_id"]) == ["failed001"]
     review_frame = pd.read_csv(exports["review_csv"])
     assert list(review_frame["analysis_id"]) == ["review001"]
+
+
+def test_batch_formal_exports_exclude_unconfirmed_image_candidates(tmp_path: Path) -> None:
+    candidate = _report("CCO", tmp_path / "candidate", "candidate001", "candidate.png")
+    candidate["input"]["type"] = "image"
+    candidate = reset_human_review(candidate)
+    rows = [{"analysis_id": "candidate001", "filename": "candidate.png", "status": "success"}]
+
+    unconfirmed = export_batch_structure_files([candidate], tmp_path / "unconfirmed", rows)
+    assert Path(unconfirmed["merged_sdf"]).read_text(encoding="utf-8") == ""
+    assert Path(unconfirmed["merged_smi"]).read_text(encoding="utf-8") == ""
+    with zipfile.ZipFile(unconfirmed["successful_zip"]) as archive:
+        assert archive.namelist() == []
+    assert list(pd.read_csv(unconfirmed["review_csv"])["analysis_id"]) == ["candidate001"]
+
+    confirmed = confirm_structure(candidate)
+    formal = export_batch_structure_files([confirmed], tmp_path / "confirmed", rows)
+    assert "$$$$" in Path(formal["merged_sdf"]).read_text(encoding="utf-8")
+    assert "CCO" in Path(formal["merged_smi"]).read_text(encoding="utf-8")
+    assert Path(formal["complete_zip"]).is_file()
 
 
 def test_sdf_text_contains_required_audit_properties(tmp_path: Path) -> None:

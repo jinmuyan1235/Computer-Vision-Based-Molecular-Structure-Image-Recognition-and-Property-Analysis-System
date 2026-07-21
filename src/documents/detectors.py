@@ -309,7 +309,13 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
         for proposed_region in proposed:
             bbox = proposed_region.bbox
             screening = screen_region_candidate(
-                image, bbox, "molecule", None, config=self.crop_screening_config,
+                image,
+                bbox,
+                "molecule",
+                None,
+                config=self.crop_screening_config,
+                text_boxes=page.text_boxes,
+                figure_boxes=page.figure_boxes,
             )
             recommended = screening.recommended_region_type
             region_type = "reaction_like" if recommended == "reaction" else (
@@ -329,6 +335,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
                 detection_confidence=round(confidence, 3),
                 detector_name=self.name,
                 message=message,
+                screening=screening.to_dict(),
             ))
             if len(regions) >= self.max_regions:
                 break
@@ -526,7 +533,13 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             min(page_height, y + height + padding),
         )
         screening = screen_region_candidate(
-            image, bbox, "molecule", None, config=self.crop_screening_config,
+            image,
+            bbox,
+            "molecule",
+            None,
+            config=self.crop_screening_config,
+            text_boxes=page.text_boxes,
+            figure_boxes=page.figure_boxes,
         )
         confidence = screening.screening_score
         message = ", ".join(screening.reason_codes)
@@ -541,6 +554,7 @@ class HeuristicMoleculeRegionDetector(BaseMoleculeRegionDetector):
             detection_confidence=round(min(confidence, 0.82), 3),
             detector_name=self.name,
             message=message + " Whole-page fallback was used.",
+            screening=screening.to_dict(),
         )
 
     @staticmethod

@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import sys
 import time
+from io import BytesIO
 from pathlib import Path
+import zipfile
+
+from PIL import Image
 
 from src.analysis.batch_analyzer import BatchAnalyzer
+from src.analysis.correction import reset_human_review
+from src.analysis.molecule_report import MoleculeReportGenerator
 from src.runtime.batch_job_store import BatchJobStore
+from src.runtime.batch_inputs import extract_batch_uploads, inspect_batch_uploads
 from src.runtime.job_manager import run_process
-from src.runtime.job_registry import load_batch_job_result, refresh_batch_job, start_batch_job
+from src.runtime.job_registry import _retry_source_paths, load_batch_job_result, refresh_batch_job, start_batch_job
+from src.runtime.batch_result_review import apply_batch_review_actions, persist_batch_result
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -200,3 +208,138 @@ def test_job_registry_starts_and_recovers_batch_result(tmp_path: Path) -> None:
     assert result is not None
     assert result["summary"]["completed"] == 1
     assert Path(result["exports"]["json"]).is_file()
+
+
+def test_batch_job_store_persists_pause_and_resume(tmp_path: Path) -> None:
+    store = BatchJobStore(tmp_path / "jobs")
+    store.create("paused", backend="demo", input_dir=tmp_path, output_dir=tmp_path / "out", total=2)
+    store.mark_running("paused", 1234)
+
+    paused = store.request_pause("paused")
+    assert paused["status"] == "paused"
+    assert store.pause_requested("paused") is True
+    resumed = store.resume("paused")
+    assert resumed["status"] == "running"
+    assert store.pause_requested("paused") is False
+
+
+def test_batch_zip_validation_dedup_and_safe_extraction(tmp_path: Path) -> None:
+    image_buffer = BytesIO()
+    Image.new("RGB", (40, 30), "white").save(image_buffer, format="PNG")
+    image_bytes = image_buffer.getvalue()
+    archive_buffer = BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w") as archive:
+        archive.writestr("nested/a.png", image_bytes)
+        archive.writestr("nested/b.png", image_bytes)
+        archive.writestr("notes.txt", "ignored")
+
+    uploads = [("images.zip", archive_buffer.getvalue())]
+    inspection = inspect_batch_uploads(uploads)
+    assert inspection["valid_files"] == 2
+    assert inspection["duplicate_files"] == 1
+    paths, extracted = extract_batch_uploads(uploads, tmp_path / "input")
+    assert len(paths) == 2
+    assert all(path.is_file() for path in paths)
+    assert extracted["duplicate_files"] == 1
+
+    unsafe_buffer = BytesIO()
+    with zipfile.ZipFile(unsafe_buffer, "w") as archive:
+        archive.writestr("../escape.png", image_bytes)
+    unsafe = inspect_batch_uploads([("unsafe.zip", unsafe_buffer.getvalue())])
+    assert any("不安全路径" in message for message in unsafe["errors"])
+
+    mixed = inspect_batch_uploads([("source_note.txt", b"not an image"), ("valid.png", image_bytes)])
+    assert mixed["total_files"] == 2
+    assert mixed["valid_files"] == 1
+    assert any("不支持的图片格式" in message for message in mixed["errors"])
+
+
+def test_batch_analyzer_reuses_hash_cache_and_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    image = Image.new("RGB", (32, 24), "white")
+    image.save(input_dir / "a.png")
+    image.save(input_dir / "b.png")
+    calls = {"count": 0}
+    analyzer = BatchAnalyzer("demo", tmp_path / "out1", cache_dir=tmp_path / "cache")
+
+    def fake_generate(image_path: Path):
+        calls["count"] += 1
+        return {
+            "analysis_id": f"generated-{calls['count']}",
+            "status": "success",
+            "message": "candidate",
+            "input": {"type": "image", "filename": image_path.name, "path": str(image_path)},
+            "ocsr": {"status": "success", "smiles": "CCO", "backend": "demo"},
+            "final": {"smiles": "CCO", "source": "ocsr"},
+            "validation": {"valid": True, "canonical_smiles": "CCO"},
+            "human_review": {"required": True, "status": "unconfirmed", "confirmed": False},
+            "recognition_decision": {"decision": "accepted", "manual_review_recommended": False},
+            "images": {},
+        }
+
+    monkeypatch.setattr(analyzer.generator, "generate", fake_generate)
+    first = analyzer.analyze_folder(input_dir, checkpoint_path=tmp_path / "checkpoint.json")
+    assert calls["count"] == 1
+    assert first["summary"]["cache_hits"] == 1
+    assert first["summary"]["pending_confirmation"] == 2
+
+    second = BatchAnalyzer("demo", tmp_path / "out2", cache_dir=tmp_path / "cache")
+
+    def unexpected_generate(**_kwargs):
+        raise AssertionError("cache miss")
+
+    monkeypatch.setattr(second.generator, "generate", unexpected_generate)
+    cached = second.analyze_folder(input_dir, checkpoint_path=tmp_path / "checkpoint2.json")
+    assert cached["summary"]["cache_hits"] == 2
+
+    resumed = second.analyze_folder(input_dir, checkpoint_path=tmp_path / "checkpoint.json")
+    assert resumed["summary"]["completed"] == 2
+    assert resumed["summary"]["cache_hits"] == 2
+
+
+def test_selected_retry_only_returns_requested_report_paths(tmp_path: Path) -> None:
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    Image.new("RGB", (10, 10)).save(first)
+    Image.new("RGB", (10, 10)).save(second)
+    result = {
+        "reports": [
+            {"analysis_id": "a", "status": "success", "input": {"path": str(first)}},
+            {"analysis_id": "b", "status": "success", "input": {"path": str(second)}},
+        ]
+    }
+
+    assert _retry_source_paths(result, "selected", analysis_ids=["b"]) == [second]
+
+
+def test_batch_review_persists_confirmation_correction_and_formal_exports(tmp_path: Path) -> None:
+    report = MoleculeReportGenerator("manual", tmp_path / "report").generate(smiles="CCO", analysis_id="batch-review")
+    report["input"].update({"type": "image", "filename": "ethanol.png"})
+    report = reset_human_review(report)
+    analyzer = BatchAnalyzer("demo", tmp_path / "summary")
+    row = analyzer._summary([], total=1)
+    batch = {
+        "summary": row,
+        "rows": [],
+        "reports": [report],
+        "exports": {},
+    }
+
+    corrected = apply_batch_review_actions(
+        batch,
+        [{"action": "correct_smiles", "analysis_id": "batch-review", "smiles": "OCC"}],
+        tmp_path / "reviewed",
+    )
+    assert corrected["summary"]["pending_confirmation"] == 1
+    assert Path(corrected["exports"]["merged_sdf"]).read_text(encoding="utf-8") == ""
+
+    confirmed = apply_batch_review_actions(
+        corrected,
+        [{"action": "confirm", "analysis_id": "batch-review"}],
+        tmp_path / "reviewed",
+    )
+    assert confirmed["summary"]["pending_confirmation"] == 0
+    assert "$$$$" in Path(confirmed["exports"]["merged_sdf"]).read_text(encoding="utf-8")
+    result_path = persist_batch_result(confirmed, tmp_path / "batch_ui_result.json")
+    assert result_path.is_file()

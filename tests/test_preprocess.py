@@ -20,7 +20,7 @@ def test_preprocessing_pipeline_does_not_crash(tmp_path: Path) -> None:
     encoded.tofile(image_path)
 
     result = ImagePreprocessor(default_size=(256, 256)).preprocess_pipeline(image_path)
-    assert {"original", "gray", "denoised", "binary", "cropped", "normalized"} <= result.keys()
+    assert {"original", "clarity_enhanced", "gray", "denoised", "binary", "cropped", "normalized"} <= result.keys()
     assert result["normalized"].shape == (256, 256)
     assert result["binary"].dtype == np.uint8
 

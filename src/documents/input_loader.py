@@ -104,6 +104,8 @@ class PDFRenderer:
             matrix = fitz.Matrix(zoom, zoom)
             for index in range(page_count):
                 page = document.load_page(index)
+                text_boxes = self._extract_text_boxes(page, zoom)
+                figure_boxes = self._extract_figure_boxes(page, zoom)
                 pixmap = page.get_pixmap(matrix=matrix, alpha=False)
                 width, height = int(pixmap.width), int(pixmap.height)
                 if width * height > config.DOCUMENT_MAX_PIXELS:
@@ -122,12 +124,54 @@ class PDFRenderer:
                     source_type="pdf",
                     render_dpi=self.dpi,
                     page_label=f"p{index + 1:03d}",
+                    text_boxes=text_boxes,
+                    figure_boxes=figure_boxes,
                 ))
             return pages
         finally:
             close = getattr(document, "close", None)
             if callable(close):
                 close()
+
+    @staticmethod
+    def _extract_text_boxes(page, zoom: float) -> list[dict]:
+        """Return PDF text-layer words in rendered-page pixel coordinates."""
+
+        try:
+            words = page.get_text("words") or []
+        except Exception:
+            return []
+        boxes: list[dict] = []
+        for word in words:
+            if len(word) < 5:
+                continue
+            text = str(word[4] or "").strip()
+            if not text:
+                continue
+            x1, y1, x2, y2 = [int(round(float(value) * zoom)) for value in word[:4]]
+            if x2 <= x1 or y2 <= y1:
+                continue
+            boxes.append({"bbox": [x1, y1, x2, y2], "text": text, "source": "pdf_text_layer"})
+        return boxes
+
+    @staticmethod
+    def _extract_figure_boxes(page, zoom: float) -> list[dict]:
+        """Return embedded PDF image bounds for figure-label context checks."""
+
+        try:
+            images = page.get_image_info() or []
+        except Exception:
+            return []
+        boxes: list[dict] = []
+        for image in images:
+            bbox = image.get("bbox") if isinstance(image, dict) else None
+            if not bbox or len(bbox) != 4:
+                continue
+            x1, y1, x2, y2 = [int(round(float(value) * zoom)) for value in bbox]
+            if x2 <= x1 or y2 <= y1:
+                continue
+            boxes.append({"bbox": [x1, y1, x2, y2], "source": "pdf_image_layer"})
+        return boxes
 
 
 class DocumentInputLoader:

@@ -15,6 +15,7 @@ RegionType = Literal[
     "text",
     "table",
     "figure",
+    "figure_label",
     "multiple_molecules",
     "blank",
     "invalid_crop",
@@ -38,6 +39,8 @@ class DocumentPage:
     render_dpi: int | None = None
     page_label: str | None = None
     quality: dict[str, Any] = field(default_factory=dict)
+    text_boxes: list[dict[str, Any]] = field(default_factory=list)
+    figure_boxes: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

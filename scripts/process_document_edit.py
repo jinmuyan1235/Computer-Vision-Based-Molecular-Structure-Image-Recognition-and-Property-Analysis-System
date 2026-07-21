@@ -49,7 +49,27 @@ def main() -> int:
             runtime_config=runtime_config,
             review_output_dir=config.DATA_DIR,
         )
-        updated = processor.apply_edits(document_result, edits, rerun_ocsr=args.rerun_ocsr)
+        def progress(stage: str, current: int, total: int, region_id: str) -> None:
+            print(
+                "DOCUMENT_REGION_PROGRESS_JSON="
+                + json.dumps(
+                    {
+                        "stage": stage,
+                        "current": current,
+                        "total": total,
+                        "region_id": region_id,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+        updated = processor.apply_edits(
+            document_result,
+            edits,
+            rerun_ocsr=args.rerun_ocsr,
+            progress_callback=progress if args.rerun_ocsr else None,
+        )
         result_path = Path(updated["exports"].get("json") or output_dir / "document_result.json")
         if not result_path.is_file():
             result_path = Path(save_json(updated, output_dir / "document_result.json"))

@@ -25,12 +25,16 @@ class FakeRecognizer:
 
 
 def _stages() -> dict[str, np.ndarray]:
-    image = np.full((8, 8), 255, dtype=np.uint8)
+    image = np.full((256, 256), 255, dtype=np.uint8)
+    enhanced = image.copy()
+    enhanced[48:54, 40:216] = 0
+    enhanced[48:216, 122:128] = 0
     return {
         "original": image,
-        "normalized": image,
-        "gray": image,
-        "binary": image,
+        "clarity_enhanced": enhanced,
+        "normalized": enhanced,
+        "gray": enhanced,
+        "binary": enhanced,
     }
 
 
@@ -84,7 +88,7 @@ def test_failed_attempt_retries_next_strategy(tmp_path: Path) -> None:
     assert "recognition_failed" in result.attempts[0]["retry_reason_codes"]
 
 
-def test_low_quality_valid_result_stops_after_first_attempt(tmp_path: Path) -> None:
+def test_blurred_valid_result_retries_a_clearer_input(tmp_path: Path) -> None:
     recognizer = FakeRecognizer([_result("CCO"), _result("OCC")])
 
     result = recognize_with_fallback_strategies(
@@ -92,12 +96,12 @@ def test_low_quality_valid_result_stops_after_first_attempt(tmp_path: Path) -> N
         tmp_path / "mol.png",
         _stages(),
         image_quality=_quality(passed=False, quality_score=0.4, reason_codes=["low_contrast"]),
-        strategies=["original", "normalized"],
+        strategies=["original", "enhanced"],
     )
 
-    assert len(recognizer.calls) == 1
-    assert result.strategy_agreement is None
-    assert result.attempts[0]["retry_reason_codes"] == []
+    assert len(recognizer.calls) == 2
+    assert result.selected_strategy == "enhanced"
+    assert "image_quality_low_contrast" in result.attempts[0]["retry_reason_codes"]
 
 
 def test_strategy_disagreement_requires_review() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 import json
 import os
 import sys
@@ -35,16 +36,21 @@ from src.ui.state import current_runtime_key, get_document_processor, remember_b
 from src.ui.styles import page_intro
 from src.runtime.job_manager import (
     extract_json_object,
+    is_process_alive,
     run_json_command,
     start_logged_process,
     terminate_process_tree,
+    terminate_process_tree_by_pid,
 )
 
 DOCUMENT_WORKFLOW_LABEL = "全文检测与审核识别"
 DOCUMENT_PROGRESS_MARKER = "DOCUMENT_PROGRESS_JSON="
 DOCUMENT_RESULT_MARKER = "DOCUMENT_RESULT_JSON="
+REGION_PROGRESS_MARKER = "DOCUMENT_REGION_PROGRESS_JSON="
+CURRENT_DOCUMENT_SCREENING_SUFFIX = "-v3"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_REGION_TYPES = ["molecule", "text", "table", "reaction", "ignore"]
+DOCUMENT_HISTORY_LIMIT = 20
 DOCUMENT_BBOX_QUERY_KEYS = (
     "document_region_editor_key",
     "doc_bbox_action",
@@ -62,6 +68,7 @@ DOCUMENT_BBOX_QUERY_KEYS = (
 
 def render_document_page(backend: str) -> None:
     page_intro("PDF/多分子文档", "一个入口处理整篇论文：全文分页、区域检测、人工审核和后台 OCSR 识别。")
+    _restore_region_job_from_disk()
     upload = st.file_uploader(
         "上传 PDF / 页面图片 / ZIP",
         type=["pdf", "png", "jpg", "jpeg", "zip"],
@@ -91,6 +98,9 @@ def render_document_page(backend: str) -> None:
             st.error(str(exc))
 
     _render_document_job_status()
+    _render_document_job_retry()
+    if "document_result" not in st.session_state and st.session_state.get("document_region_job"):
+        _render_region_ocsr_job_status(None)
     if "document_result" in st.session_state:
         st.session_state["document_result"] = show_document_result(st.session_state["document_result"], backend)
     elif not st.session_state.get("document_job"):
@@ -220,11 +230,9 @@ def _render_document_job_status() -> None:
         st.caption(f"后台日志：{job.get('stdout_path')} / {job.get('stderr_path')}")
         if st.button("取消文档后台任务", key="cancel_document_job"):
             terminate_process_tree(process)
-            input_path = Path(str(job.get("input_path") or ""))
-            if input_path.exists():
-                input_path.unlink(missing_ok=True)
+            st.session_state["document_job_retry"] = {key: value for key, value in job.items() if key != "process"}
             st.session_state.pop("document_job", None)
-            st.warning("已取消文档处理任务并终止后台进程。")
+            st.warning("已取消文档处理任务并终止后台进程；可选择重试。")
             return
         time.sleep(2)
         st.rerun()
@@ -235,8 +243,6 @@ def _render_document_job_status() -> None:
     stderr = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.is_file() else ""
     payload = _extract_json_object(stdout)
     input_path = Path(str(job.get("input_path") or ""))
-    if input_path.exists():
-        input_path.unlink(missing_ok=True)
     st.session_state.pop("document_job", None)
 
     if return_code != 0:
@@ -244,15 +250,21 @@ def _render_document_job_status() -> None:
         message = detail[-1] if detail else f"文档处理子进程退出码 {return_code}"
         if payload and payload.get("message"):
             message = str(payload["message"])
+        st.session_state["document_job_retry"] = {key: value for key, value in job.items() if key != "process"}
         st.error(f"文档处理失败：{message}")
         return
     if not payload or not payload.get("result_path"):
+        st.session_state["document_job_retry"] = {key: value for key, value in job.items() if key != "process"}
         st.error("文档处理完成，但没有返回结果文件路径。")
         return
     result_path = Path(str(payload["result_path"]))
     if not result_path.is_file():
+        st.session_state["document_job_retry"] = {key: value for key, value in job.items() if key != "process"}
         st.error(f"文档处理结果文件不存在：{result_path}")
         return
+    if input_path.exists():
+        input_path.unlink(missing_ok=True)
+    st.session_state.pop("document_job_retry", None)
     result = json.loads(result_path.read_text(encoding="utf-8"))
     record_result_payload(result, result_path)
     st.session_state["document_result"] = result
@@ -319,11 +331,68 @@ def _document_edit_command(current_path: Path, backend: str, edits: list[dict], 
     return command
 
 
+def _write_region_job_state(job: dict, status: str, **extra: Any) -> None:
+    state_path = Path(str(job.get("state_path") or ""))
+    if not str(state_path) or state_path == Path("."):
+        return
+    payload = {
+        "status": status,
+        "pid": int(job.get("pid") or getattr(job.get("process"), "pid", 0) or 0),
+        "region_id": str(job.get("region_id") or ""),
+        "region_ids": [str(value) for value in (job.get("region_ids") or [])],
+        "scope_label": str(job.get("scope_label") or ""),
+        "page_number": int(job.get("page_number") or 0),
+        "page_numbers": [int(value) for value in (job.get("page_numbers") or [])],
+        "stdout_path": str(job.get("stdout_path") or ""),
+        "stderr_path": str(job.get("stderr_path") or ""),
+        "started_at": float(job.get("started_at") or time.time()),
+        "backend": str(job.get("backend") or ""),
+        "state_path": str(state_path),
+        **extra,
+    }
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _poll_region_job(job: dict) -> int | None:
+    process = job.get("process")
+    if process is not None:
+        return process.poll()
+    pid = int(job.get("pid") or 0)
+    if is_process_alive(pid):
+        return None
+    stdout_path = Path(str(job.get("stdout_path") or ""))
+    stdout = stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.is_file() else ""
+    payload = _extract_json_object(stdout)
+    return 0 if payload and payload.get("result_path") else 1
+
+
+def _restore_region_job_from_disk() -> None:
+    if st.session_state.get("document_region_job"):
+        return
+    root = config.OUTPUT_DIR / "ui_jobs"
+    if not root.is_dir():
+        return
+    states = sorted(root.glob("region*/job_state.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for state_path in states[:20]:
+        try:
+            job = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if job.get("status") != "running":
+            continue
+        job["process"] = None
+        job["state_path"] = str(state_path)
+        st.session_state["document_region_job"] = job
+        return
+
+
 def _start_region_ocsr_job(document_result: dict, backend: str, region_id: str, bbox: list[int]) -> dict:
     current_job = st.session_state.get("document_region_job")
-    if current_job and current_job.get("process") and current_job["process"].poll() is None:
+    if current_job and _poll_region_job(current_job) is None:
         raise RuntimeError("已有区域识别任务正在运行，请等待其完成。")
     saved = save_region_selection(document_result, region_id, bbox, recognize=True)
+    _push_document_history(document_result)
     current_path = persist_document_result_atomic(saved)
     record_result_payload(saved, current_path)
     selected = next(region for region in saved.get("regions", []) if str(region.get("region_id")) == str(region_id))
@@ -347,14 +416,22 @@ def _start_region_ocsr_job(document_result: dict, backend: str, region_id: str, 
         stderr_path=stderr_path,
     )
     st.session_state["document_result"] = saved
-    st.session_state["document_region_job"] = {
+    job = {
         "process": process,
+        "pid": process.pid,
+        "backend": backend,
         "region_id": str(region_id),
+        "region_ids": [str(region_id)],
+        "scope_label": f"区域 {region_id} 识别",
         "page_number": int(selected.get("page_number") or 0),
+        "page_numbers": [int(selected.get("page_number") or 0)],
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
+        "state_path": str(job_dir / "job_state.json"),
         "started_at": time.time(),
     }
+    st.session_state["document_region_job"] = job
+    _write_region_job_state(job, "running")
     return saved
 
 
@@ -367,7 +444,7 @@ def _start_confirmed_region_batch_job(
     page_number: int,
 ) -> dict:
     current_job = st.session_state.get("document_region_job")
-    if current_job and current_job.get("process") and current_job["process"].poll() is None:
+    if current_job and _poll_region_job(current_job) is None:
         raise RuntimeError("已有区域识别任务正在运行，请等待其完成。")
     requested = {str(region_id) for region_id in region_ids}
     targets = [
@@ -405,16 +482,23 @@ def _start_confirmed_region_batch_job(
         stderr_path=stderr_path,
     )
     restore_id = str(st.session_state.get("document_region_select") or target_ids[0])
-    st.session_state["document_region_job"] = {
+    target_pages = sorted({int(region.get("page_number") or 0) for region in targets})
+    job = {
         "process": process,
+        "pid": process.pid,
+        "backend": backend,
         "region_id": restore_id,
         "region_ids": target_ids,
         "scope_label": scope_label,
         "page_number": int(page_number),
+        "page_numbers": target_pages,
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
+        "state_path": str(job_dir / "job_state.json"),
         "started_at": time.time(),
     }
+    st.session_state["document_region_job"] = job
+    _write_region_job_state(job, "running")
     return document_result
 
 
@@ -424,21 +508,40 @@ def _render_region_ocsr_job_status(inline_region_id: str | None = None) -> None:
     if not job:
         return
     process = job.get("process")
-    if process is None:
-        st.session_state.pop("document_region_job", None)
-        return
     elapsed = time.time() - float(job.get("started_at", time.time()))
-    return_code = process.poll()
+    return_code = _poll_region_job(job)
     region_id = str(job.get("region_id") or "")
     region_ids = [str(value) for value in (job.get("region_ids") or [region_id])]
     scope_label = str(job.get("scope_label") or f"区域 {region_id}")
     if return_code is None:
+        stdout_path = Path(str(job.get("stdout_path") or ""))
+        stdout = stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.is_file() else ""
+        progress = _extract_region_progress(stdout) or {}
+        current = int(progress.get("current") or 0)
+        total = max(1, int(progress.get("total") or len(region_ids) or 1))
+        current_region = str(progress.get("region_id") or "等待模型加载")
+        stage = "正在识别" if progress.get("stage") == "recognizing" else "正在保存结果"
+        page_count = len(job.get("page_numbers") or [job.get("page_number")])
         target_note = "当前区域" if len(region_ids) == 1 and str(inline_region_id or "") in region_ids else scope_label
         with st.status(f"{target_note}正在后台识别…", state="running", expanded=True):
-            st.write(f"✅ 步骤 1/2：已保存并锁定 {len(region_ids)} 个已确认分子区域。")
-            st.write("⏳ 步骤 2/2：正在加载 OCSR 并识别结构，请稍候。")
-            st.progress(min(0.95, max(0.08, elapsed / 90.0)))
-            st.caption(f"已运行 {elapsed:.1f} 秒。识别按钮已锁定，完成后会自动显示候选结构。")
+            st.write(f"页数：{page_count}；区域数：{len(region_ids)}；当前阶段：{stage}。")
+            st.write(f"当前区域：{current_region}；进度：{current}/{total}。")
+            fraction = current / total if current else min(0.12, elapsed / 180.0)
+            st.progress(min(0.95, max(0.04, fraction)))
+            st.caption(f"已运行 {elapsed:.1f} 秒。完成后会恢复当前页和当前区域。")
+            if st.button("取消当前识别任务", key=f"cancel_region_job_{job.get('pid')}"):
+                if process is not None:
+                    terminate_process_tree(process)
+                else:
+                    terminate_process_tree_by_pid(int(job.get("pid") or 0))
+                _write_region_job_state(job, "cancelled", elapsed_seconds=round(elapsed, 3))
+                st.session_state["document_region_retry"] = {key: value for key, value in job.items() if key != "process"}
+                st.session_state.pop("document_region_job", None)
+                st.session_state["document_region_notice"] = {
+                    "level": "error",
+                    "message": f"{scope_label}已取消；可以使用“重试最近任务”重新启动。",
+                }
+                st.rerun()
         return
 
     stdout_path = Path(str(job.get("stdout_path") or ""))
@@ -457,12 +560,16 @@ def _render_region_ocsr_job_status(inline_region_id: str | None = None) -> None:
     }
     if return_code != 0:
         reason = background_failure_reason(return_code, payload, stdout, stderr)
+        _write_region_job_state(job, "failed", failure_reason=reason, elapsed_seconds=round(elapsed, 3))
+        st.session_state["document_region_retry"] = {key: value for key, value in job.items() if key != "process"}
         st.session_state["document_region_notice"] = {"level": "error", "message": f"{scope_label}失败：{reason}"}
         st.rerun()
         return
     result_path_value = (payload or {}).get("result_path")
     result_path = Path(str(result_path_value or ""))
     if not result_path_value or not result_path.is_file():
+        _write_region_job_state(job, "failed", failure_reason="结果文件缺失", elapsed_seconds=round(elapsed, 3))
+        st.session_state["document_region_retry"] = {key: value for key, value in job.items() if key != "process"}
         st.session_state["document_region_notice"] = {
             "level": "error",
             "message": f"{scope_label}完成，但结果文件缺失。请查看后台日志。",
@@ -470,7 +577,12 @@ def _render_region_ocsr_job_status(inline_region_id: str | None = None) -> None:
         st.rerun()
         return
     updated = json.loads(result_path.read_text(encoding="utf-8"))
+    current_result = st.session_state.get("document_result")
+    if isinstance(current_result, dict):
+        _push_document_history(current_result)
     st.session_state["document_result"] = updated
+    _write_region_job_state(job, "completed", result_path=str(result_path), elapsed_seconds=round(elapsed, 3))
+    st.session_state.pop("document_region_retry", None)
     record_result_payload(updated, result_path)
     result_regions = [item for item in updated.get("regions", []) if str(item.get("region_id")) in set(region_ids)]
     recognized_count = sum(str(item.get("status")) == "recognized" for item in result_regions)
@@ -488,6 +600,26 @@ def _render_region_ocsr_job_status(inline_region_id: str | None = None) -> None:
             level = "error"
     st.session_state["document_region_notice"] = {"level": level, "message": message}
     st.rerun()
+
+
+def _render_document_job_retry() -> None:
+    retry = st.session_state.get("document_job_retry")
+    if not retry or st.session_state.get("document_job"):
+        return
+    input_path = Path(str(retry.get("input_path") or ""))
+    if not input_path.is_file():
+        st.session_state.pop("document_job_retry", None)
+        return
+    controls = st.columns([0.2, 0.2, 0.6])
+    if controls[0].button("重试文档处理", key="retry_document_job", type="primary"):
+        _start_document_job(input_path, str(retry.get("backend") or config.OCSR_BACKEND), False)
+        st.session_state.pop("document_job_retry", None)
+        st.rerun()
+    if controls[1].button("放弃重试", key="dismiss_document_job_retry"):
+        input_path.unlink(missing_ok=True)
+        st.session_state.pop("document_job_retry", None)
+        st.rerun()
+    controls[2].caption(f"保留了原始上传文件，可直接重新启动：{input_path.name}")
 
 
 def _apply_document_edits(document_result: dict, backend: str, edits: list[dict], rerun_ocsr: bool) -> dict:
@@ -533,6 +665,18 @@ def _extract_document_progress(text: str) -> dict | None:
     return None
 
 
+def _extract_region_progress(text: str) -> dict | None:
+    for line in reversed(text.splitlines()):
+        if not line.startswith(REGION_PROGRESS_MARKER):
+            continue
+        try:
+            payload = json.loads(line[len(REGION_PROGRESS_MARKER) :])
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
 def _latest_recoverable_document_result(jobs_root: str | Path) -> tuple[dict, Path] | None:
     root = Path(jobs_root)
     if not root.is_dir():
@@ -570,10 +714,37 @@ def _render_document_recovery() -> None:
 
 
 def show_document_result(document_result: dict, backend: str) -> dict:
+    if _document_needs_screening_refresh(document_result):
+        try:
+            with st.spinner("正在用最新规则重新筛选旧任务区域（不会运行 OCSR）……"):
+                processor = get_document_processor(backend)
+                rescreen = getattr(processor, "rescreen_document_result", None)
+                if not callable(rescreen):
+                    processor = DocumentOCSRProcessor(
+                        backend=backend,
+                        runtime_config=runtime_config_from_key(current_runtime_key()),
+                    )
+                    rescreen = processor.rescreen_document_result
+                document_result = rescreen(document_result)
+                result_path = persist_document_result_atomic(document_result)
+                record_result_payload(document_result, result_path)
+                st.session_state["document_result"] = document_result
+                refresh = (document_result.get("processing") or {}).get("screening_refresh") or {}
+                st.session_state["document_region_notice"] = {
+                    "level": "success",
+                    "message": (
+                        f"已按最新规则重新筛选 {refresh.get('checked_region_count', 0)} 个区域，"
+                        f"修正 {refresh.get('changed_region_count', 0)} 个区域类型；未运行 OCSR。"
+                    ),
+                }
+            st.rerun()
+        except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+            st.warning(f"旧任务自动重新筛选失败：{exc}")
     notice = st.session_state.pop("document_region_notice", None)
     if notice:
         renderer = st.success if notice.get("level") == "success" else st.error
         renderer(str(notice.get("message") or "区域任务状态已更新。"))
+    _render_region_retry_control(document_result, backend)
     summary = document_result.get("summary") or {}
     st.subheader("文档区域识别结果")
     metrics = st.columns(6)
@@ -585,7 +756,7 @@ def show_document_result(document_result: dict, backend: str) -> dict:
     metrics[5].metric("入审核队列", summary.get("review_queue_count", 0))
     processing = document_result.get("processing") or {}
     if processing.get("total_time_ms") is not None:
-        st.caption(f"文档处理总耗时：{processing.get('total_time_ms')} ms")
+        st.caption(f"文档处理总耗时：{float(processing.get('total_time_ms') or 0) / 1000:.2f} 秒")
     if document_result.get("detection_errors"):
         with st.expander("检测提示", expanded=False):
             st.json(document_result.get("detection_errors"))
@@ -610,7 +781,213 @@ def show_document_result(document_result: dict, backend: str) -> dict:
     return document_result
 
 
+def _render_region_retry_control(document_result: dict, backend: str) -> None:
+    retry = st.session_state.get("document_region_retry")
+    if not retry or _region_job_is_running():
+        return
+    region_ids = [str(value) for value in (retry.get("region_ids") or [retry.get("region_id")]) if value]
+    available = {
+        str(region.get("region_id")): region
+        for region in document_result.get("regions", [])
+        if region.get("status") != "deleted"
+    }
+    region_ids = [region_id for region_id in region_ids if region_id in available]
+    if not region_ids:
+        st.session_state.pop("document_region_retry", None)
+        return
+    controls = st.columns([0.22, 0.22, 0.56])
+    if controls[0].button("重试最近识别任务", key="retry_document_region_job", type="primary"):
+        try:
+            if len(region_ids) == 1:
+                region = available[region_ids[0]]
+                _start_region_ocsr_job(
+                    document_result,
+                    backend,
+                    region_ids[0],
+                    [int(value) for value in (region.get("bbox") or [0, 0, 1, 1])],
+                )
+            else:
+                _start_confirmed_region_batch_job(
+                    document_result,
+                    backend,
+                    region_ids,
+                    scope_label=str(retry.get("scope_label") or "重试批量识别"),
+                    page_number=int(retry.get("page_number") or 1),
+                )
+            st.session_state.pop("document_region_retry", None)
+            st.rerun()
+        except (OSError, RuntimeError, ValueError) as exc:
+            st.error(f"识别任务重试失败：{exc}")
+    if controls[1].button("不再重试", key="dismiss_document_region_retry"):
+        st.session_state.pop("document_region_retry", None)
+        st.rerun()
+    controls[2].caption(
+        f"最近任务包含 {len(region_ids)} 个区域：{str(retry.get('scope_label') or '区域识别')}。"
+    )
+
+
+def _history_key(document_result: dict) -> str:
+    return str(document_result.get("document_id") or document_result.get("output_dir") or "document")
+
+
+def _history_stacks(document_result: dict) -> tuple[list[dict], list[dict]]:
+    identity = _history_key(document_result)
+    if st.session_state.get("document_history_identity") != identity:
+        st.session_state["document_history_identity"] = identity
+        st.session_state["document_undo_stack"] = []
+        st.session_state["document_redo_stack"] = []
+    return (
+        st.session_state.setdefault("document_undo_stack", []),
+        st.session_state.setdefault("document_redo_stack", []),
+    )
+
+
+def _push_document_history(document_result: dict) -> None:
+    undo, redo = _history_stacks(document_result)
+    undo.append(deepcopy(document_result))
+    if len(undo) > DOCUMENT_HISTORY_LIMIT:
+        del undo[:-DOCUMENT_HISTORY_LIMIT]
+    redo.clear()
+
+
+def _restore_document_history(document_result: dict, direction: str) -> dict | None:
+    undo, redo = _history_stacks(document_result)
+    source, destination = (undo, redo) if direction == "undo" else (redo, undo)
+    if not source:
+        return None
+    restored = source.pop()
+    destination.append(deepcopy(document_result))
+    if len(destination) > DOCUMENT_HISTORY_LIMIT:
+        del destination[:-DOCUMENT_HISTORY_LIMIT]
+    result_path = persist_document_result_atomic(restored)
+    record_result_payload(restored, result_path)
+    return restored
+
+
+def _restore_document_review_state(document_result: dict, page_numbers: list[int]) -> None:
+    saved = document_result.get("review_state") or {}
+    if "document_current_page" not in st.session_state:
+        page_number = int(saved.get("page_number") or page_numbers[0])
+        st.session_state["document_current_page"] = page_number if page_number in page_numbers else page_numbers[0]
+    defaults = {
+        "document_region_select": str(saved.get("selected_region_id") or ""),
+        "document_filter_type": str(saved.get("region_type") or "全部"),
+        "document_filter_status": str(saved.get("status") or "全部"),
+        "document_show_advanced_regions": bool(saved.get("show_advanced_regions", False)),
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+def _persist_document_review_state(document_result: dict, page_number: int, selected_id: str | None) -> None:
+    state = {
+        "page_number": int(page_number),
+        "selected_region_id": str(selected_id or ""),
+        "region_type": str(st.session_state.get("document_filter_type") or "全部"),
+        "status": str(st.session_state.get("document_filter_status") or "全部"),
+        "show_advanced_regions": bool(st.session_state.get("document_show_advanced_regions", False)),
+        "saved_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    previous = document_result.get("review_state") or {}
+    comparable = {key: previous.get(key) for key in state if key != "saved_at_utc"}
+    expected = {key: value for key, value in state.items() if key != "saved_at_utc"}
+    if comparable == expected:
+        return
+    document_result["review_state"] = state
+    try:
+        persist_document_result_atomic(document_result)
+    except OSError:
+        pass
+
+
+def _is_strict_molecule_candidate(region: dict) -> bool:
+    if str(region.get("region_type") or "") != "molecule":
+        return False
+    if str(region.get("source") or "") == "user" or bool(region.get("confirmed")):
+        return True
+    if str(region.get("status") or "") == "recognized":
+        return True
+    screening = region.get("screening") or {}
+    diagnostics = screening.get("diagnostics") or {}
+    structural = screening.get("structural_evidence", diagnostics.get("structural_evidence"))
+    return bool(screening.get("passed")) and bool(structural)
+
+
+def _thumbnail_window(page_numbers: list[int], current_page: int, limit: int = 7) -> list[int]:
+    if len(page_numbers) <= limit:
+        return page_numbers
+    index = page_numbers.index(current_page)
+    start = max(0, min(index - limit // 2, len(page_numbers) - limit))
+    return page_numbers[start : start + limit]
+
+
+def _set_document_page(page_number: int) -> None:
+    st.session_state["document_requested_page"] = int(page_number)
+
+
+def _set_document_region(region_id: str) -> None:
+    st.session_state["document_requested_region"] = str(region_id)
+
+
+def _render_page_navigation(pages: list[dict], current_page: int) -> None:
+    page_numbers = [int(page.get("page_number", 0)) for page in pages]
+    index = page_numbers.index(int(current_page))
+    controls = st.columns([0.13, 0.13, 0.48, 0.13, 0.13])
+    controls[0].button(
+        "⏮ 首页",
+        disabled=index == 0,
+        key="document_first_page",
+        on_click=_set_document_page,
+        args=(page_numbers[0],),
+    )
+    controls[1].button(
+        "← 上一页",
+        disabled=index == 0,
+        key="document_previous_page",
+        on_click=_set_document_page,
+        args=(page_numbers[max(0, index - 1)],),
+    )
+    controls[2].caption(f"第 {index + 1} / {len(page_numbers)} 页")
+    controls[3].button(
+        "下一页 →",
+        disabled=index == len(page_numbers) - 1,
+        key="document_next_page",
+        on_click=_set_document_page,
+        args=(page_numbers[min(len(page_numbers) - 1, index + 1)],),
+    )
+    controls[4].button(
+        "末页 ⏭",
+        disabled=index == len(page_numbers) - 1,
+        key="document_last_page",
+        on_click=_set_document_page,
+        args=(page_numbers[-1],),
+    )
+
+    shown = _thumbnail_window(page_numbers, int(current_page))
+    columns = st.columns(len(shown))
+    pages_by_number = {int(page.get("page_number", 0)): page for page in pages}
+    for column, page_number in zip(columns, shown):
+        page = pages_by_number[page_number]
+        image_path = Path(str(page.get("image_path") or ""))
+        if image_path.is_file():
+            column.image(str(image_path), width=95)
+        label = f"✓ 第 {page_number} 页" if page_number == int(current_page) else f"第 {page_number} 页"
+        column.button(
+            label,
+            key=f"document_thumbnail_{page_number}",
+            disabled=page_number == int(current_page),
+            on_click=_set_document_page,
+            args=(page_number,),
+        )
+
+
 def _document_workbench(document_result: dict, backend: str, rows: list[dict]) -> dict:
+    requested_page = st.session_state.pop("document_requested_page", None)
+    if requested_page is not None:
+        st.session_state["document_current_page"] = int(requested_page)
+    requested_region = st.session_state.pop("document_requested_region", None)
+    if requested_region is not None:
+        st.session_state["document_region_select"] = str(requested_region)
     restore = st.session_state.pop("document_region_restore", None)
     if restore:
         st.session_state["document_region_select"] = str(restore.get("region_id") or "")
@@ -622,46 +999,68 @@ def _document_workbench(document_result: dict, backend: str, rows: list[dict]) -
         return document_result
     active = [region for region in document_result.get("regions", []) if region.get("status") != "deleted"]
     page_numbers = [int(page.get("page_number", 0)) for page in pages]
+    _restore_document_review_state(document_result, page_numbers)
     current_page = st.session_state.get("document_current_page")
     if current_page not in page_numbers:
         selected_region_id = str(st.session_state.get("document_region_select") or "")
         selected_region = next((region for region in active if str(region.get("region_id")) == selected_region_id), None)
         st.session_state["document_current_page"] = int((selected_region or {}).get("page_number") or page_numbers[0])
+    selected_page_state = int(st.session_state.get("document_current_page") or page_numbers[0])
     page_number = st.selectbox(
         f"论文页码（全文共 {len(page_numbers)} 页）",
         page_numbers,
-        key="document_current_page",
+        index=page_numbers.index(selected_page_state),
+        key=f"document_page_picker_{selected_page_state}",
     )
-    page = next(item for item in pages if int(item.get("page_number", 0)) == int(page_number))
+    if int(page_number) != selected_page_state:
+        st.session_state["document_requested_page"] = int(page_number)
+        st.rerun()
+    page = dict(next(item for item in pages if int(item.get("page_number", 0)) == int(page_number)))
+    page["review_state"] = document_result.get("review_state") or {}
+    _render_page_navigation(pages, int(page_number))
     st.caption(f"正在审核第 {page_numbers.index(int(page_number)) + 1} / {len(page_numbers)} 页；所有页面均已保留在当前任务中。")
     page_regions = [region for region in active if int(region.get("page_number", 0)) == int(page_number)]
 
-    show_non_molecule = st.checkbox(
-        "显示文本、表格、反应等非分子区域",
-        value=False,
-        key="document_show_non_molecule_regions",
-    )
-    visible = page_regions if show_non_molecule else [region for region in page_regions if region.get("region_type") == "molecule"]
+    with st.expander(
+        "高级筛选：文本、表格、图表标签和宽松候选",
+        expanded=bool(st.session_state.get("document_show_advanced_regions", False)),
+    ):
+        show_advanced = st.checkbox(
+            "显示非严格候选及非分子区域",
+            value=False,
+            key="document_show_advanced_regions",
+        )
+        if show_advanced:
+            st.caption(
+                "高级筛选会显示文本、表格、反应、图表标签，以及缺少明确骨架证据的宽松候选；"
+                "类型和状态筛选会同步作用于区域导航与画布框。"
+            )
+    visible = page_regions if show_advanced else [region for region in page_regions if _is_strict_molecule_candidate(region)]
     if not visible:
         if page_regions:
-            st.info("本页没有分子候选框。勾选上方选项可查看本页文本、表格等其他区域，也可直接拖画新框。")
+            st.info("本页没有严格分子候选框。可在“高级筛选”中查看宽松候选、文本和表格；新增区域请先点击画布上的“新增框模式”。")
         else:
-            st.info("本页未检测到区域；仍可直接在页面上拖画新的分子候选框。")
+            st.info("本页未检测到区域；可在画布上先点击“新增框模式”，再拖画新的分子候选框。")
         _render_region_ocsr_job_status(None)
         _render_document_toolbar(document_result, backend, rows, None)
         _render_bbox_dragger(page, [], "", [0, 0, 1, 1])
+        _persist_document_review_state(document_result, int(page_number), None)
         return document_result
 
-    selected_id = _selected_region_id(visible)
-    selected = next((region for region in visible if region["region_id"] == selected_id), visible[0])
+    selected, filtered = _render_region_navigator(visible, int(page_number))
     document_result = _render_document_toolbar(document_result, backend, rows, selected)
-    bbox = selected.get("bbox") or [0, 0, 1, 1]
-    _sync_region_bbox_state(selected)
-
-    region_list, canvas, inspector = st.columns([0.22, 0.53, 0.25])
-    with region_list:
-        selected = _render_region_list(visible, selected["region_id"])
+    if selected is not None:
         _sync_region_bbox_state(selected)
+
+    canvas, inspector = st.columns([0.72, 0.28], gap="large")
+    if selected is None:
+        with canvas:
+            _render_bbox_dragger(page, filtered, "", [0, 0, 1, 1])
+        with inspector:
+            st.subheader("当前区域")
+            st.info("当前筛选条件下没有可查看的区域。")
+        _persist_document_review_state(document_result, int(page_number), None)
+        return document_result
     with canvas:
         preview_bbox = [
             int(st.session_state.get(f"edit_x1_{selected['region_id']}", (selected.get("bbox") or [0, 0, 1, 1])[0])),
@@ -669,11 +1068,27 @@ def _document_workbench(document_result: dict, backend: str, rows: list[dict]) -
             int(st.session_state.get(f"edit_x2_{selected['region_id']}", (selected.get("bbox") or [0, 0, 1, 1])[2])),
             int(st.session_state.get(f"edit_y2_{selected['region_id']}", (selected.get("bbox") or [0, 0, 1, 1])[3])),
         ]
-        _render_bbox_dragger(page, visible, selected["region_id"], preview_bbox)
-        _render_region_crop_preview(page, preview_bbox)
+        _render_bbox_dragger(page, filtered, selected["region_id"], preview_bbox)
     with inspector:
-        _render_region_inspector(document_result, backend, selected)
+        _render_region_inspector(document_result, backend, selected, page, preview_bbox)
+    _persist_document_review_state(document_result, int(page_number), str(selected.get("region_id") or ""))
     return document_result
+
+
+def _document_needs_screening_refresh(document_result: dict) -> bool:
+    refresh = ((document_result.get("processing") or {}).get("screening_refresh") or {}).get("config_version")
+    if str(refresh or "").endswith(CURRENT_DOCUMENT_SCREENING_SUFFIX):
+        return False
+    for region in document_result.get("regions") or []:
+        if region.get("status") == "deleted" or bool(region.get("confirmed")):
+            continue
+        if str(region.get("source") or "detector") == "user" or str(region.get("status") or "") == "recognized":
+            continue
+        if not str((region.get("screening") or {}).get("config_version") or "").endswith(
+            CURRENT_DOCUMENT_SCREENING_SUFFIX
+        ):
+            return True
+    return False
 
 
 def _render_create_only_canvas(document_result: dict) -> None:
@@ -692,9 +1107,99 @@ def _selected_region_id(active: list[dict]) -> str:
     return current if current in active_ids else active_ids[0]
 
 
-def _render_region_list(active: list[dict], selected_id: str) -> dict:
+def _filter_document_regions(active: list[dict], selected_type: str, selected_status: str) -> list[dict]:
+    return [
+        region
+        for region in active
+        if (selected_type == "全部" or _audit_region_type(region.get("region_type")) == selected_type)
+        and _region_matches_status(region, selected_status)
+    ]
+
+
+def _compact_region_option_label(region: dict) -> str:
+    status = "已确认" if region.get("confirmed") else status_label(region.get("status") or "detected")
+    return (
+        f"{region.get('region_id')} · "
+        f"{region_type_label(region.get('region_type'))} · {status} · {_screening_reason_label(region)}"
+    )
+
+
+def _render_region_navigator(active: list[dict], page_number: int) -> tuple[dict | None, list[dict]]:
+    st.markdown("#### 区域导航")
+    present_types = [
+        value
+        for value in AUDIT_REGION_TYPES
+        if any(_audit_region_type(region.get("region_type")) == value for region in active)
+    ]
+    type_options = ["全部", *present_types]
+    if st.session_state.get("document_filter_type") not in type_options:
+        st.session_state["document_filter_type"] = "全部"
+
+    status_options = ["全部", "待确认", "已确认", "识别成功", "识别失败", "已跳过"]
+    filters = st.columns([0.20, 0.18, 0.46, 0.08, 0.08])
+    selected_type = filters[0].selectbox(
+        "类型",
+        type_options,
+        key="document_filter_type",
+        format_func=lambda value: "全部" if value == "全部" else REGION_TYPE_LABELS.get(value, value),
+    )
+    selected_status = filters[1].selectbox("状态", status_options, key="document_filter_status")
+    filtered = _filter_document_regions(active, selected_type, selected_status)
+    if not filtered:
+        filters[2].selectbox("当前区域", ["没有匹配区域"], disabled=True, key=f"document_empty_region_{page_number}")
+        filters[3].button("←", disabled=True, key=f"document_previous_region_{page_number}", help="上一个区域")
+        filters[4].button("→", disabled=True, key=f"document_next_region_{page_number}", help="下一个区域")
+        st.info("当前类型和状态下没有匹配区域；画布也已同步隐藏其他区域框。")
+        return None, []
+
+    ids = [str(region["region_id"]) for region in filtered]
+    selected_id = _selected_region_id(filtered)
+    if str(st.session_state.get("document_region_select") or "") not in ids:
+        st.session_state["document_region_select"] = selected_id
+    region_by_id = {str(region["region_id"]): region for region in filtered}
+    choice = filters[2].selectbox(
+        f"当前区域（{len(filtered)} 个）",
+        ids,
+        index=ids.index(selected_id),
+        key=f"document_region_picker_{page_number}_{selected_id}",
+        format_func=lambda region_id: _compact_region_option_label(region_by_id[str(region_id)]),
+    )
+    choice = str(choice)
+    if choice != str(st.session_state.get("document_region_select") or ""):
+        st.session_state["document_region_select"] = choice
+    selected_index = ids.index(choice)
+    filters[3].button(
+        "←",
+        disabled=selected_index == 0,
+        key=f"document_previous_region_{page_number}_{choice}",
+        help="上一个匹配区域",
+        on_click=_set_document_region,
+        args=(ids[max(0, selected_index - 1)],),
+    )
+    filters[4].button(
+        "→",
+        disabled=selected_index == len(ids) - 1,
+        key=f"document_next_region_{page_number}_{choice}",
+        help="下一个匹配区域",
+        on_click=_set_document_region,
+        args=(ids[min(len(ids) - 1, selected_index + 1)],),
+    )
+    selected = region_by_id[choice]
+    st.caption(
+        f"第 {selected.get('page_number')} 页 · {choice} · "
+        f"线段 {_screening_value(selected, 'long_line_count', 0)} · "
+        f"组件 {_screening_value(selected, 'valid_component_count', _screening_value(selected, 'significant_component_count', 0))} · "
+        f"{_screening_reason_label(selected)}"
+    )
+    return selected, filtered
+
+
+def _render_region_list(active: list[dict], selected_id: str) -> dict | None:
     st.subheader("区域列表")
-    type_options = ["全部", *AUDIT_REGION_TYPES]
+    present_types = [value for value in AUDIT_REGION_TYPES if any(_audit_region_type(region.get("region_type")) == value for region in active)]
+    type_options = ["全部", *present_types]
+    if st.session_state.get("document_filter_type") not in type_options:
+        st.session_state["document_filter_type"] = "全部"
     selected_type = st.selectbox(
         "类型",
         type_options,
@@ -703,15 +1208,10 @@ def _render_region_list(active: list[dict], selected_id: str) -> dict:
     )
     status_options = ["全部", "待确认", "已确认", "识别成功", "识别失败", "已跳过"]
     selected_status = st.selectbox("状态", status_options, key="document_filter_status")
-    filtered = [
-        region
-        for region in active
-        if (selected_type == "全部" or _audit_region_type(region.get("region_type")) == selected_type)
-        and _region_matches_status(region, selected_status)
-    ]
+    filtered = _filter_document_regions(active, selected_type, selected_status)
     if not filtered:
         st.info("没有匹配区域。")
-        filtered = active
+        return None
     ids = [str(region["region_id"]) for region in filtered]
     if selected_id not in ids:
         selected_id = ids[0]
@@ -745,20 +1245,122 @@ def _region_matches_status(region: dict, selected_status: str) -> bool:
 
 def _region_option_label(region: dict) -> str:
     status = "已确认" if region.get("confirmed") else status_label(region.get("status") or "detected")
+    lines = _screening_value(region, "long_line_count", 0)
+    components = _screening_value(
+        region,
+        "valid_component_count",
+        _screening_value(region, "significant_component_count", 0),
+    )
+    reason = _screening_reason_label(region)
     return (
         f"第 {region.get('page_number')} 页 · "
         f"{region.get('region_id')} · "
-        f"{region_type_label(region.get('region_type'))} · {status}"
+        f"{region_type_label(region.get('region_type'))} · {status} · "
+        f"线段 {lines} · 组件 {components} · {reason}"
     )
 
 
-def _render_region_inspector(document_result: dict, backend: str, selected: dict) -> None:
+SCREENING_REASON_LABELS = {
+    "short_text_hard_reject": "短文本硬拒绝",
+    "pdf_text_token": "PDF 文字层短标签",
+    "short_sparse_label": "稀疏短标签",
+    "pdf_text_layer_overlap": "与 PDF 文字层重叠",
+    "figure_label_without_skeleton": "图表内无骨架标签",
+    "missing_skeleton_evidence": "缺少分子骨架证据",
+    "text_like": "文字形态",
+    "possible_molecule": "具备分子骨架证据",
+    "multiple_or_merged_region": "多个结构或合并区域",
+    "reaction_arrow": "疑似反应箭头",
+    "table_like": "表格线框",
+    "dense_figure": "高密度普通图像",
+    "blank": "空白区域",
+    "too_small": "区域过小",
+    "uncertain": "需要人工判断",
+}
+
+
+def _screening_value(region: dict, key: str, default=None):
+    screening = region.get("screening") or {}
+    diagnostics = screening.get("diagnostics") or {}
+    value = screening.get(key, diagnostics.get(key, default))
+    return default if value is None else value
+
+
+def _screening_reason_codes(region: dict) -> list[str]:
+    screening = region.get("screening") or {}
+    codes = screening.get("reason_codes") or []
+    if isinstance(codes, str):
+        codes = [value.strip() for value in codes.split(",") if value.strip()]
+    if not codes:
+        message = str(region.get("message") or "")
+        codes = [value.strip() for value in message.split(",") if value.strip()]
+    return [str(value) for value in codes]
+
+
+def _screening_reason_label(region: dict) -> str:
+    reason = str((region.get("screening") or {}).get("reason") or "").strip()
+    if reason:
+        return reason[:36]
+    codes = _screening_reason_codes(region)
+    labels = [SCREENING_REASON_LABELS.get(code, code) for code in codes]
+    return "、".join(labels[:2]) or "未记录筛选原因"
+
+
+def _short_text_false_positive(region: dict) -> bool:
+    codes = set(_screening_reason_codes(region))
+    short_text_codes = {
+        "short_text_hard_reject",
+        "pdf_text_token",
+        "short_sparse_label",
+        "pdf_text_layer_overlap",
+        "figure_label_without_skeleton",
+    }
+    return str(region.get("region_type") or "") in {"text", "figure_label"} and bool(codes & short_text_codes)
+
+
+def _crop_quality_warnings(page: dict, bbox: list[int], region: dict | None = None) -> list[str]:
+    page_width = max(1, int(page.get("width") or 1))
+    page_height = max(1, int(page.get("height") or 1))
+    x1, y1, x2, y2 = [int(value) for value in bbox]
+    width = max(0, x2 - x1)
+    height = max(0, y2 - y1)
+    warnings: list[str] = []
+    if width < 48 or height < 48:
+        warnings.append("裁剪尺寸过小，文字、键型或立体标记可能无法可靠识别。")
+    if width * height / float(page_width * page_height) < 0.0008:
+        warnings.append("裁剪占页面比例过低，建议适当扩大框选并保留结构四周留白。")
+    aspect = max(width / max(height, 1), height / max(width, 1))
+    if aspect > 12:
+        warnings.append("裁剪长宽比异常，可能只框到了文字、坐标轴或一段化学键。")
+    reason_codes = set(_screening_reason_codes(region or {}))
+    if reason_codes & {"blank", "too_small", "text_like", "missing_skeleton_evidence"}:
+        warnings.append("检测诊断显示当前裁剪缺少稳定的分子骨架证据。")
+    return warnings
+
+
+def _render_region_inspector(
+    document_result: dict,
+    backend: str,
+    selected: dict,
+    page: dict,
+    preview_bbox: list[int],
+) -> None:
     selected_id = str(selected["region_id"])
     st.subheader("当前区域")
     st.caption(f"页码：{selected.get('page_number')}；ID：{selected_id}")
+    _render_region_crop_preview(page, preview_bbox, width=300)
+    quality_warnings = _crop_quality_warnings(page, preview_bbox, selected)
+    if quality_warnings:
+        st.warning("低质量裁剪警告：\n\n" + "\n\n".join(f"- {message}" for message in quality_warnings))
     st.write(f"**类型：** {region_type_label(selected.get('region_type'))}")
     st.write(f"**状态：** {status_label(selected.get('status'))}")
     st.write(f"**置信度：** {selected.get('detection_confidence') if selected.get('detection_confidence') is not None else '-'}")
+    st.write(f"**筛选原因：** {_screening_reason_label(selected)}")
+    st.caption(
+        f"结构线段：{_screening_value(selected, 'long_line_count', 0)}；"
+        f"有效组件：{_screening_value(selected, 'valid_component_count', _screening_value(selected, 'significant_component_count', 0))}；"
+        f"骨架证据：{'有' if _screening_value(selected, 'structural_evidence', False) else '无'}"
+    )
     candidate_smiles = _region_candidate_smiles(selected)
     if candidate_smiles:
         st.write("**候选 SMILES：**")
@@ -766,7 +1368,22 @@ def _render_region_inspector(document_result: dict, backend: str, selected: dict
         redrawn = str((((selected.get("report") or {}).get("images") or {}).get("redrawn_molecule")) or "")
         if redrawn and Path(redrawn).is_file():
             st.image(redrawn, caption="候选结构重绘", width=300)
-    elif str(selected.get("status") or "") == "failed":
+        with st.expander("修正候选 SMILES", expanded=False):
+            corrected_smiles = st.text_input(
+                "SMILES",
+                value=candidate_smiles,
+                key=f"document_corrected_smiles_{selected_id}",
+            )
+            st.caption("保存修正时会执行 RDKit 校验、canonical 化、性质重算和结构重绘；原始预测保留在审计数据中。")
+            if st.button("应用 SMILES 修正", key=f"document_apply_smiles_{selected_id}", disabled=_region_job_is_running()):
+                _apply_edits_with_notice(
+                    document_result,
+                    backend,
+                    [{"action": "correct_smiles", "region_id": selected_id, "smiles": corrected_smiles}],
+                    rerun_ocsr=False,
+                    message="SMILES 修正已通过校验并完成结构重绘，请再次人工确认。",
+                )
+    if str(selected.get("status") or "") == "failed":
         st.error(f"识别失败：{selected.get('message') or '模型未返回可用结构。'}")
 
     bbox = selected.get("bbox") or [0, 0, 1, 1]
@@ -787,7 +1404,7 @@ def _render_region_inspector(document_result: dict, backend: str, selected: dict
             key=f"edit_type_{selected_id}",
         )
     job_running = _region_job_is_running()
-    st.caption("“仅保存框选”不会运行模型；“保存并识别”会将类型设为分子并确认后启动后台 OCSR。")
+    st.caption("“仅保存框选”不会运行模型；“识别当前区域”会将类型设为分子并确认后启动后台 OCSR。")
     _render_region_ocsr_job_status(selected_id)
     actions = st.columns(2)
     if actions[0].button("仅保存框选", key=f"save_region_{selected_id}", disabled=job_running):
@@ -799,6 +1416,7 @@ def _render_region_inspector(document_result: dict, backend: str, selected: dict
                 recognize=False,
                 region_type=region_type,
             )
+            _push_document_history(document_result)
             result_path = persist_document_result_atomic(updated)
             record_result_payload(updated, result_path)
             st.session_state["document_result"] = updated
@@ -807,13 +1425,54 @@ def _render_region_inspector(document_result: dict, backend: str, selected: dict
             st.rerun()
         except (OSError, RuntimeError, ValueError) as exc:
             st.error(f"框选保存失败：{exc}")
-    if actions[1].button("保存并识别", key=f"recognize_region_{selected_id}", type="primary", disabled=job_running):
+    if actions[1].button("识别当前区域", key=f"recognize_region_{selected_id}", type="primary", disabled=job_running):
         try:
             _start_region_ocsr_job(document_result, backend, selected_id, [x1, y1, x2, y2])
             st.session_state["document_region_select"] = selected_id
             st.rerun()
         except (OSError, RuntimeError, ValueError) as exc:
             st.error(f"后台识别启动失败：{exc}")
+    review = (selected.get("report") or {}).get("human_review") or {}
+    structurally_confirmed = bool(review.get("confirmed"))
+    confirmation = st.columns(2)
+    if candidate_smiles and not structurally_confirmed:
+        if confirmation[0].button("确认候选结构", key=f"confirm_structure_{selected_id}", disabled=job_running):
+            _apply_edits_with_notice(
+                document_result,
+                backend,
+                [{"action": "confirm_structure", "region_id": selected_id}],
+                rerun_ocsr=False,
+                message="候选结构已人工确认，可进入正式结构导出。",
+            )
+    elif candidate_smiles:
+        confirmation[0].success("候选结构已人工确认")
+        if confirmation[1].button("撤销结构确认", key=f"revoke_structure_{selected_id}", disabled=job_running):
+            _apply_edits_with_notice(
+                document_result,
+                backend,
+                [{"action": "revoke_structure_confirmation", "region_id": selected_id}],
+                rerun_ocsr=False,
+                message="已撤销候选结构确认。",
+            )
+    elif not bool(selected.get("confirmed")):
+        if confirmation[0].button("确认区域", key=f"confirm_region_{selected_id}", disabled=job_running):
+            _apply_edits_with_notice(
+                document_result,
+                backend,
+                [{"action": "confirm", "region_id": selected_id, "region_type": "molecule"}],
+                rerun_ocsr=False,
+                message="区域已确认，可使用本页或全文批量识别。",
+            )
+    else:
+        confirmation[0].success("区域已确认")
+        if confirmation[1].button("撤销区域确认", key=f"unconfirm_region_{selected_id}", disabled=job_running):
+            _apply_edits_with_notice(
+                document_result,
+                backend,
+                [{"action": "unconfirm", "region_id": selected_id}],
+                rerun_ocsr=False,
+                message="已撤销区域确认。",
+            )
     minor = st.columns(2)
     if minor[0].button("标记忽略", key=f"mark_region_{selected_id}", disabled=job_running):
         _apply_edits_with_notice(
@@ -852,23 +1511,120 @@ def _region_candidate_smiles(region: dict) -> str | None:
 
 def _region_job_is_running() -> bool:
     job = st.session_state.get("document_region_job") or {}
-    process = job.get("process")
-    return bool(process is not None and process.poll() is None)
+    return bool(job and _poll_region_job(job) is None)
+
+
+def _copy_region_edit(document_result: dict, region: dict, target_page_number: int) -> dict:
+    pages = {int(page.get("page_number", 0)): page for page in document_result.get("pages", [])}
+    source_page = pages.get(int(region.get("page_number", 0)))
+    target_page = pages.get(int(target_page_number))
+    if source_page is None or target_page is None:
+        raise ValueError("复制区域的源页面或目标页面不存在。")
+    source_width = max(1, int(source_page.get("width") or 1))
+    source_height = max(1, int(source_page.get("height") or 1))
+    target_width = max(1, int(target_page.get("width") or 1))
+    target_height = max(1, int(target_page.get("height") or 1))
+    x1, y1, x2, y2 = [int(value) for value in (region.get("bbox") or [0, 0, 1, 1])]
+    bbox = [
+        round(x1 * target_width / source_width),
+        round(y1 * target_height / source_height),
+        round(x2 * target_width / source_width),
+        round(y2 * target_height / source_height),
+    ]
+    return {
+        "action": "add",
+        "page_number": int(target_page_number),
+        "bbox": bbox,
+        "region_type": str(region.get("region_type") or "molecule"),
+        "confirmed": False,
+        "note": f"Copied from {region.get('region_id')} on adjacent page.",
+    }
+
+
+def _bbox_iou(left: list[int], right: list[int]) -> float:
+    lx1, ly1, lx2, ly2 = [int(value) for value in left]
+    rx1, ry1, rx2, ry2 = [int(value) for value in right]
+    intersection = max(0, min(lx2, rx2) - max(lx1, rx1)) * max(0, min(ly2, ry2) - max(ly1, ry1))
+    union = max(1, (lx2 - lx1) * (ly2 - ly1) + (rx2 - rx1) * (ry2 - ry1) - intersection)
+    return intersection / union
+
+
+def _duplicate_region_groups(regions: list[dict], threshold: float = 0.82) -> list[list[str]]:
+    active = [
+        region for region in regions
+        if region.get("status") != "deleted" and str(region.get("region_type") or "") == "molecule"
+    ]
+    used: set[str] = set()
+    groups: list[list[str]] = []
+    for region in active:
+        region_id = str(region.get("region_id") or "")
+        if not region_id or region_id in used:
+            continue
+        group = [region_id]
+        for candidate in active:
+            candidate_id = str(candidate.get("region_id") or "")
+            if candidate_id == region_id or candidate_id in used:
+                continue
+            if int(candidate.get("page_number", 0)) != int(region.get("page_number", 0)):
+                continue
+            if _bbox_iou(list(region.get("bbox") or [0, 0, 1, 1]), list(candidate.get("bbox") or [0, 0, 1, 1])) >= threshold:
+                group.append(candidate_id)
+        if len(group) > 1:
+            groups.append(group)
+            used.update(group)
+    return groups
+
+
+def _render_copy_region_popover(document_result: dict, backend: str, selected: dict | None) -> None:
+    if selected is None:
+        st.info("请先选择一个区域。")
+        return
+    page_numbers = sorted(int(page.get("page_number", 0)) for page in document_result.get("pages", []))
+    current = int(selected.get("page_number", 0))
+    adjacent = [page for page in (current - 1, current + 1) if page in page_numbers]
+    if not adjacent:
+        st.info("当前页没有相邻页面。")
+        return
+    target = st.radio("目标页面", adjacent, format_func=lambda page: f"第 {page} 页", key=f"copy_target_{selected.get('region_id')}")
+    st.caption("将按页面尺寸比例映射坐标；复制后的区域默认保持未确认。")
+    if st.button("复制区域", key=f"copy_region_{selected.get('region_id')}", disabled=_region_job_is_running()):
+        _apply_edits_with_notice(
+            document_result,
+            backend,
+            [_copy_region_edit(document_result, selected, int(target))],
+            rerun_ocsr=False,
+            message=f"区域已复制到第 {target} 页。",
+        )
 
 
 def _render_document_toolbar(document_result: dict, backend: str, rows: list[dict], selected: dict | None) -> dict:
-    toolbar = st.columns([0.12, 0.12, 0.14, 0.16, 0.12, 0.34])
-    with toolbar[0].popover("新增区域"):
-        st.caption("请直接在页面空白处按住鼠标并拖动创建分子框。")
-    with toolbar[1].popover("合并"):
+    undo, redo = _history_stacks(document_result)
+    toolbar = st.columns([0.09, 0.09, 0.11, 0.11, 0.11, 0.11, 0.14, 0.1, 0.14])
+    if toolbar[0].button("↶ 撤销", disabled=_region_job_is_running() or not undo, key="document_undo"):
+        restored = _restore_document_history(document_result, "undo")
+        if restored is not None:
+            st.session_state["document_result"] = restored
+            st.session_state["document_region_notice"] = {"level": "success", "message": "已撤销上一步区域操作。"}
+            st.rerun()
+    if toolbar[1].button("↷ 重做", disabled=_region_job_is_running() or not redo, key="document_redo"):
+        restored = _restore_document_history(document_result, "redo")
+        if restored is not None:
+            st.session_state["document_result"] = restored
+            st.session_state["document_region_notice"] = {"level": "success", "message": "已重做区域操作。"}
+            st.rerun()
+    with toolbar[2].popover("新增区域"):
+        st.caption("请先点击画布工具栏中的“＋ 新增框模式”，再在页面上拖动画框；画错可直接取消新增。")
+    with toolbar[3].popover("复制"):
+        _render_copy_region_popover(document_result, backend, selected)
+    with toolbar[4].popover("合并"):
         _render_merge_popover(document_result, backend, selected)
-    with toolbar[2].popover("拆分"):
+    with toolbar[5].popover("拆分"):
         _render_split_popover(document_result, backend, selected)
-    with toolbar[3].popover("批量操作"):
+    with toolbar[6].popover("批量操作"):
         _render_batch_region_popover(document_result, backend)
-    with toolbar[4].popover("导出"):
+    with toolbar[7].popover("导出"):
         _download_panel(document_result)
-    with toolbar[5].popover("结果表"):
+    with toolbar[8].popover("结果表"):
         important = [
             "page_number",
             "region_id",
@@ -1026,7 +1782,7 @@ def _render_batch_region_popover(document_result: dict, backend: str) -> None:
         except (OSError, RuntimeError, ValueError) as exc:
             st.error(f"本页批量识别启动失败：{exc}")
     if st.button(
-        "识别全文全部已确认区域",
+        "批量识别全部已确认区域",
         key="recognize_all_confirmed_regions",
         type="primary",
         disabled=running or not all_ids,
@@ -1043,6 +1799,80 @@ def _render_batch_region_popover(document_result: dict, backend: str) -> None:
         except (OSError, RuntimeError, ValueError) as exc:
             st.error(f"全文批量识别启动失败：{exc}")
 
+    st.divider()
+    st.markdown("**重复区域合并**")
+    duplicate_groups = _duplicate_region_groups(active)
+    if duplicate_groups:
+        st.warning(
+            f"检测到 {len(duplicate_groups)} 组高度重叠的分子框，共涉及 "
+            f"{sum(len(group) for group in duplicate_groups)} 个区域。"
+        )
+        with st.expander("查看重复区域组", expanded=False):
+            for index, group in enumerate(duplicate_groups, start=1):
+                st.caption(f"第 {index} 组：{'、'.join(group)}")
+        if st.button("合并全部重复区域", key="merge_all_duplicate_regions", disabled=running):
+            _apply_edits_with_notice(
+                document_result,
+                backend,
+                [
+                    {
+                        "action": "merge",
+                        "region_ids": group,
+                        "region_type": "molecule",
+                        "confirmed": False,
+                        "note": "Merged automatically detected duplicate regions.",
+                    }
+                    for group in duplicate_groups
+                ],
+                rerun_ocsr=False,
+                message=f"已合并 {len(duplicate_groups)} 组重复区域；合并结果需要重新确认。",
+            )
+    else:
+        st.caption("未检测到 IoU 高于 0.82 的重复分子框。")
+
+    st.divider()
+    st.markdown("**批量清理短文本误框**")
+    short_text_regions = [region for region in active if _short_text_false_positive(region)]
+    short_text_ids = [str(region.get("region_id")) for region in short_text_regions]
+    page_short_ids = [
+        str(region.get("region_id"))
+        for region in short_text_regions
+        if int(region.get("page_number", 0)) == int(page_number_for_batch)
+    ]
+    if not short_text_ids:
+        st.caption("当前文档没有被规则标记为短文本误框的区域。")
+        return
+    cleanup_ids = st.multiselect(
+        "待删除误框",
+        short_text_ids,
+        default=page_short_ids,
+        format_func=lambda region_id: _region_option_label(
+            next(region for region in short_text_regions if str(region.get("region_id")) == region_id)
+        ),
+        key="document_short_text_cleanup_ids",
+    )
+    st.caption("默认选择当前页误框；删除前可逐项取消。此操作不会删除分子候选框。")
+    cleanup_confirmed = st.checkbox(
+        f"确认删除所选 {len(cleanup_ids)} 个短文本误框",
+        value=False,
+        key="document_short_text_cleanup_confirmed",
+    )
+    if st.button(
+        "删除所选短文本误框",
+        disabled=running or not cleanup_ids or not cleanup_confirmed,
+        key="document_delete_short_text_false_positives",
+    ):
+        _apply_edits_with_notice(
+            document_result,
+            backend,
+            [
+                {"action": "delete", "region_id": region_id, "note": "批量删除规则标记的短文本误框。"}
+                for region_id in cleanup_ids
+            ],
+            rerun_ocsr=False,
+            message=f"已删除 {len(cleanup_ids)} 个短文本误框。",
+        )
+
 
 def _apply_edits_with_notice(
     document_result: dict,
@@ -1057,10 +1887,11 @@ def _apply_edits_with_notice(
         return
     try:
         updated = _apply_document_edits(document_result, backend, edits, rerun_ocsr=rerun_ocsr)
+        _push_document_history(document_result)
         st.session_state["document_result"] = updated
         st.success(message)
         st.rerun()
-    except RuntimeError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         st.error(str(exc))
 
 
@@ -1290,6 +2121,8 @@ def _audit_region_type(region_type: str | None) -> str:
         return value
     if value in {"reaction_arrow", "reaction_condition", "reaction_like"}:
         return "reaction"
+    if value == "figure_label":
+        return "text"
     if value in {"text", "table", "molecule"}:
         return value
     return "ignore"
@@ -1331,10 +2164,11 @@ def _consume_document_canvas_event(document_result: dict) -> dict:
             return document_result
         updated, selected_id = apply_canvas_event(document_result, event)
         if updated is not document_result:
+            _push_document_history(document_result)
             result_path = persist_document_result_atomic(updated)
             record_result_payload(updated, result_path)
             st.session_state["document_result"] = updated
-            action_label = {"create": "新框已创建", "update": "框选已自动保存", "delete": "区域已删除"}.get(event["action"], "区域已更新")
+            action_label = {"create": "新框已创建", "update": "框选调整已保存", "delete": "区域已删除"}.get(event["action"], "区域已更新")
             st.success(f"{action_label}（原始页面坐标）。")
         if selected_id:
             st.session_state["document_region_select"] = str(selected_id)
@@ -1369,6 +2203,7 @@ def _render_bbox_dragger(page: dict, regions: list[dict], selected_id: str, bbox
     height = int(page.get("height") or 1)
     display_width = min(860, width)
     display_height = max(160, int(display_width * height / max(width, 1)))
+    viewport_height = min(680, display_height)
     mime = "image/jpeg" if image_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
     encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
     overlay_regions = [
@@ -1383,6 +2218,8 @@ def _render_bbox_dragger(page: dict, regions: list[dict], selected_id: str, bbox
     ]
     payload = {
         "key": selected_id or f"page-{int(page.get('page_number', 0))}-new",
+        "document_id": str(page.get("document_id") or image_path.parent.name),
+        "review_saved_at_utc": str((page.get("review_state") or {}).get("saved_at_utc") or ""),
         "selected_region_id": selected_id,
         "has_selection": bool(selected_id),
         "locked": _region_job_is_running(),
@@ -1395,24 +2232,155 @@ def _render_bbox_dragger(page: dict, regions: list[dict], selected_id: str, bbox
     }
     html = f"""
     <div style="font: 14px system-ui, sans-serif; color: #163232;">
-      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:6px;">
-        <span>空白处拖动画新框；点击框选择，拖动框移动，拖动角点缩放。松手后自动保存。</span>
-        <button id="delete-region" type="button" style="white-space:nowrap; border:1px solid #b42318; color:#b42318; background:white; border-radius:6px; padding:5px 9px;">删除选中框</button>
+      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:6px;">
+        <span id="editor-status" style="padding:5px 9px; border-radius:6px; background:#edf7f6;">点击任意框即可立即选择；新增框请先进入新增模式。</span>
+        <span style="display:flex; gap:7px;">
+          <button id="zoom-out" type="button" title="缩小" style="border:1px solid #94a3b8; background:white; border-radius:6px; padding:5px 9px;">−</button>
+          <button id="zoom-reset" type="button" title="恢复 100%" style="border:1px solid #94a3b8; background:white; border-radius:6px; padding:5px 9px;"><span id="zoom-label">100%</span></button>
+          <button id="zoom-in" type="button" title="放大" style="border:1px solid #94a3b8; background:white; border-radius:6px; padding:5px 9px;">＋</button>
+          <button id="pan-mode" type="button" style="white-space:nowrap; border:1px solid #64748b; color:#475569; background:white; border-radius:6px; padding:5px 9px;">✋ 拖动画布</button>
+          <span id="draft-actions" style="display:none; gap:7px;">
+            <button id="save-draft" type="button" style="white-space:nowrap; border:1px solid #0f766e; color:white; background:#0f766e; border-radius:6px; padding:5px 9px;">保存调整</button>
+            <button id="cancel-draft" type="button" style="white-space:nowrap; border:1px solid #64748b; color:#475569; background:white; border-radius:6px; padding:5px 9px;">取消调整</button>
+          </span>
+          <button id="new-region" type="button" style="white-space:nowrap; border:1px solid #0f766e; color:#0f766e; background:white; border-radius:6px; padding:5px 9px;">＋ 新增框模式</button>
+          <button id="delete-region" type="button" style="white-space:nowrap; border:1px solid #b42318; color:#b42318; background:white; border-radius:6px; padding:5px 9px;">删除当前框（Delete）</button>
+        </span>
       </div>
-      <div style="position: relative; display: inline-block; max-width: 100%;">
-        <img id="doc-region-image" src="{payload['src']}" style="width: min(100%, {display_width}px); display: block; cursor: crosshair; border: 1px solid #9ab8b8; border-radius: 6px;" />
-        <canvas id="doc-region-overlay" tabindex="0" style="position:absolute; inset:0; outline:none;"></canvas>
+      <div style="font-size:12px; color:#607575; margin-bottom:6px;">进入新增模式后，在空白处拖动画新框；拖动框内移动；拖动四角缩放；方向键微调（Shift 为 10 像素）；Esc 取消当前拖动或草稿。松手后先预览，点击保存才提交。</div>
+      <div id="canvas-viewport" style="width:100%; height:{viewport_height}px; overflow:auto; border:1px solid #c8d7d7; border-radius:6px; background:#eef3f3;">
+        <div id="canvas-stage" style="position:relative; display:inline-block; line-height:0;">
+          <img id="doc-region-image" src="{payload['src']}" style="width:{display_width}px; max-width:none; display:block; user-select:none; border-radius:5px;" draggable="false" />
+          <canvas id="doc-region-overlay" tabindex="0" style="position:absolute; inset:0; outline:none;"></canvas>
+        </div>
       </div>
     </div>
     <script>
       const payload = {json.dumps(payload, ensure_ascii=False)};
       const image = document.getElementById("doc-region-image");
       const canvas = document.getElementById("doc-region-overlay");
+      const viewport = document.getElementById("canvas-viewport");
+      const zoomOutButton = document.getElementById("zoom-out");
+      const zoomResetButton = document.getElementById("zoom-reset");
+      const zoomInButton = document.getElementById("zoom-in");
+      const zoomLabel = document.getElementById("zoom-label");
+      const panButton = document.getElementById("pan-mode");
       const deleteButton = document.getElementById("delete-region");
+      const newButton = document.getElementById("new-region");
+      const draftActions = document.getElementById("draft-actions");
+      const saveButton = document.getElementById("save-draft");
+      const cancelButton = document.getElementById("cancel-draft");
+      const status = document.getElementById("editor-status");
       const ctx = canvas.getContext("2d");
+      const localRegions = (payload.regions || []).map((region) => ({{
+        ...region,
+        bbox: (region.bbox || []).slice(),
+      }}));
+      let selectedId = payload.selected_region_id || null;
       let bbox = payload.bbox.slice();
+      let originalBbox = bbox.slice();
       let drag = null;
-      deleteButton.style.display = payload.has_selection && !payload.locked ? "inline-block" : "none";
+      let createMode = false;
+      let pendingAction = null;
+      let previousSelection = null;
+      let submitting = false;
+      let zoom = 1;
+      let panMode = false;
+      let panDrag = null;
+      const selectionStorageKey = `document-region-selection:${{payload.document_id}}:${{payload.page_number}}`;
+
+      try {{
+        const storedValue = JSON.parse(window.localStorage.getItem(selectionStorageKey) || "null");
+        const serverSavedAt = Date.parse(payload.review_saved_at_utc || "") || 0;
+        const restoredSelection = storedValue && storedValue.savedAt > serverSavedAt ? storedValue.regionId : null;
+        const restoredRegion = localRegions.find((region) => String(region.region_id) === String(restoredSelection));
+        if (restoredRegion) {{
+          selectedId = String(restoredRegion.region_id);
+          bbox = restoredRegion.bbox.slice();
+          originalBbox = bbox.slice();
+        }}
+      }} catch (_error) {{}}
+
+      function applyZoom(nextZoom) {{
+        const oldWidth = Math.max(1, image.getBoundingClientRect().width);
+        const centerX = viewport.scrollLeft + viewport.clientWidth / 2;
+        const centerY = viewport.scrollTop + viewport.clientHeight / 2;
+        zoom = Math.max(0.5, Math.min(3, Math.round(nextZoom * 10) / 10));
+        image.style.width = `${{Math.round({display_width} * zoom)}}px`;
+        zoomLabel.textContent = `${{Math.round(zoom * 100)}}%`;
+        requestAnimationFrame(() => {{
+          draw();
+          const ratio = image.getBoundingClientRect().width / oldWidth;
+          viewport.scrollLeft = centerX * ratio - viewport.clientWidth / 2;
+          viewport.scrollTop = centerY * ratio - viewport.clientHeight / 2;
+        }});
+      }}
+
+      function syncControls() {{
+        const hasDraft = Boolean(pendingAction);
+        draftActions.style.display = hasDraft ? "inline-flex" : "none";
+        saveButton.textContent = pendingAction === "create" ? "确认新增" : "保存调整";
+        cancelButton.textContent = pendingAction === "create" ? "取消新增" : "取消调整";
+        deleteButton.style.display = selectedId && !hasDraft && !payload.locked ? "inline-block" : "none";
+        newButton.style.display = payload.locked ? "none" : "inline-block";
+        newButton.disabled = hasDraft || submitting;
+        deleteButton.disabled = submitting;
+        saveButton.disabled = submitting;
+        cancelButton.disabled = submitting;
+        newButton.style.opacity = newButton.disabled ? "0.55" : "1";
+        newButton.textContent = createMode ? "取消新增模式" : "＋ 新增框模式";
+        newButton.style.background = createMode ? "#dff3f0" : "white";
+        panButton.style.background = panMode ? "#dff3f0" : "white";
+        panButton.textContent = panMode ? "✓ 正在拖动画布" : "✋ 拖动画布";
+      }}
+      function selectRegion(region) {{
+        if (!region || !Array.isArray(region.bbox) || region.bbox.length !== 4) return;
+        selectedId = String(region.region_id);
+        try {{
+          window.localStorage.setItem(selectionStorageKey, JSON.stringify({{ regionId: selectedId, savedAt: Date.now() }}));
+        }} catch (_error) {{}}
+        bbox = region.bbox.slice();
+        originalBbox = bbox.slice();
+        previousSelection = null;
+        createMode = false;
+        pendingAction = null;
+        status.textContent = `已选择 ${{selectedId}}：可直接移动、缩放、删除或方向键微调。`;
+        syncControls();
+        draw();
+      }}
+      function restorePreviousSelection(message) {{
+        if (previousSelection) {{
+          selectedId = previousSelection.id;
+          bbox = previousSelection.bbox.slice();
+          originalBbox = bbox.slice();
+        }} else {{
+          selectedId = null;
+          bbox = [0, 0, 1, 1];
+          originalBbox = bbox.slice();
+        }}
+        previousSelection = null;
+        createMode = false;
+        pendingAction = null;
+        drag = null;
+        status.textContent = message;
+        syncControls();
+        draw();
+      }}
+      function cancelPending() {{
+        if (pendingAction === "create" || createMode) {{
+          restorePreviousSelection("已取消本次新增，未保存任何新框。");
+          return;
+        }}
+        if (drag) bbox = drag.bbox.slice();
+        else bbox = originalBbox.slice();
+        drag = null;
+        pendingAction = null;
+        status.textContent = selectedId ? `已取消调整，仍选择 ${{selectedId}}。` : "已取消调整。";
+        syncControls();
+        draw();
+      }}
+      syncControls();
+      if (selectedId) status.textContent = `已选择 ${{selectedId}}：可直接移动、缩放、删除或方向键微调。`;
 
       function scale() {{
         return {{ sx: canvas.width / payload.width, sy: canvas.height / payload.height }};
@@ -1434,7 +2402,7 @@ def _render_bbox_dragger(page: dict, regions: list[dict], selected_id: str, bbox
         }};
       }}
       function hitHandle(p) {{
-        if (!payload.has_selection) return null;
+        if (!selectedId || pendingAction === "create") return null;
         const handles = [
           ["nw", bbox[0], bbox[1]], ["ne", bbox[2], bbox[1]],
           ["sw", bbox[0], bbox[3]], ["se", bbox[2], bbox[3]],
@@ -1446,11 +2414,16 @@ def _render_bbox_dragger(page: dict, regions: list[dict], selected_id: str, bbox
         return null;
       }}
       function hitRegion(p) {{
-        const regions = (payload.regions || []).slice().reverse();
-        return regions.find((region) => {{
+        const regions = localRegions.filter((region) => {{
           const box = region.bbox || [];
           return box.length === 4 && p.x >= box[0] && p.x <= box[2] && p.y >= box[1] && p.y <= box[3];
-        }}) || null;
+        }});
+        regions.sort((left, right) => {{
+          const a = (left.bbox[2] - left.bbox[0]) * (left.bbox[3] - left.bbox[1]);
+          const b = (right.bbox[2] - right.bbox[0]) * (right.bbox[3] - right.bbox[1]);
+          return a - b;
+        }});
+        return regions[0] || null;
       }}
       function draw() {{
         const rect = image.getBoundingClientRect();
@@ -1460,24 +2433,24 @@ def _render_bbox_dragger(page: dict, regions: list[dict], selected_id: str, bbox
         canvas.style.height = rect.height + "px";
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         const s = scale();
-        for (const region of payload.regions || []) {{
-          const box = region.bbox || [];
+        for (const region of localRegions) {{
+          const selected = String(region.region_id) === String(selectedId);
+          const box = selected ? bbox : (region.bbox || []);
           if (box.length !== 4) continue;
-          const selected = region.region_id === payload.key;
           ctx.strokeStyle = selected ? "#0f766e" : (region.confirmed ? "#2563eb" : "#8a8f98");
           ctx.lineWidth = selected ? 3 : 1.5;
           ctx.setLineDash(selected ? [] : [5, 4]);
           ctx.strokeRect(box[0] * s.sx, box[1] * s.sy, (box[2] - box[0]) * s.sx, (box[3] - box[1]) * s.sy);
           ctx.setLineDash([]);
         }}
-        if (payload.has_selection || (drag && drag.mode === "create")) {{
+        if (pendingAction === "create" || (drag && drag.mode === "create")) {{
           ctx.fillStyle = "rgba(15, 118, 110, 0.13)";
           ctx.strokeStyle = "#0f766e";
           ctx.lineWidth = 3;
           ctx.fillRect(bbox[0] * s.sx, bbox[1] * s.sy, (bbox[2] - bbox[0]) * s.sx, (bbox[3] - bbox[1]) * s.sy);
           ctx.strokeRect(bbox[0] * s.sx, bbox[1] * s.sy, (bbox[2] - bbox[0]) * s.sx, (bbox[3] - bbox[1]) * s.sy);
         }}
-        if (payload.has_selection) {{
+        if (selectedId && pendingAction !== "create") {{
           for (const [x, y] of [[bbox[0], bbox[1]], [bbox[2], bbox[1]], [bbox[0], bbox[3]], [bbox[2], bbox[3]]]) {{
             ctx.fillStyle = "#0f766e";
             ctx.fillRect(x * s.sx - 5, y * s.sy - 5, 10, 10);
@@ -1488,6 +2461,16 @@ def _render_bbox_dragger(page: dict, regions: list[dict], selected_id: str, bbox
         }}
       }}
       function submitEvent(action, regionId, box) {{
+        if (submitting) return;
+        submitting = true;
+        syncControls();
+        try {{
+          if (action === "create" || action === "delete") window.localStorage.removeItem(selectionStorageKey);
+          else if (regionId) window.localStorage.setItem(
+            selectionStorageKey,
+            JSON.stringify({{ regionId: String(regionId), savedAt: Date.now() }}),
+          );
+        }} catch (_error) {{}}
         const params = new URLSearchParams(window.top.location.search);
         params.set("document_region_editor_key", payload.key);
         params.set("doc_bbox_action", action);
@@ -1506,29 +2489,71 @@ def _render_bbox_dragger(page: dict, regions: list[dict], selected_id: str, bbox
         window.top.location.href = window.top.location.pathname + "?" + params.toString();
       }}
       canvas.addEventListener("mousedown", (event) => {{
+        if (submitting) return;
+        if (panMode) {{
+          panDrag = {{
+            x: event.clientX,
+            y: event.clientY,
+            left: viewport.scrollLeft,
+            top: viewport.scrollTop,
+          }};
+          canvas.style.cursor = "grabbing";
+          event.preventDefault();
+          return;
+        }}
         if (payload.locked) return;
+        if (pendingAction) {{
+          status.textContent = "当前调整尚未处理，请先保存或取消。";
+          return;
+        }}
         const p = point(event);
-        const mode = hitHandle(p);
-        if (mode) {{
-          drag = {{ mode, start: p, bbox: bbox.slice() }};
+        if (createMode) {{
+          bbox = [p.x, p.y, p.x + 1, p.y + 1];
+          drag = {{ mode: "create", start: p, bbox: bbox.slice(), changed: false }};
+          status.textContent = "正在新增框：拖到合适大小后松开鼠标。";
+          draw();
         }} else {{
           const region = hitRegion(p);
-          if (region && region.region_id !== payload.selected_region_id) {{
-            submitEvent("select", region.region_id, null);
+          if (region && String(region.region_id) !== String(selectedId)) {{
+            selectRegion(region);
+            canvas.focus();
+            event.preventDefault();
             return;
           }}
-          bbox = [p.x, p.y, p.x + 1, p.y + 1];
-          drag = {{ mode: "create", start: p, bbox: bbox.slice() }};
-          draw();
+          const mode = hitHandle(p);
+          if (mode) {{
+            originalBbox = bbox.slice();
+            drag = {{ mode, start: p, bbox: bbox.slice(), changed: false }};
+            status.textContent = mode === "move" ? "正在移动框选；松手后可预览并决定是否保存。" : "正在缩放框选；松手后可预览并决定是否保存。";
+          }} else if (region) {{
+            selectRegion(region);
+          }} else {{
+            status.textContent = "空白处不会直接新增；请先点击“＋ 新增框模式”。";
+          }}
         }}
         canvas.focus();
         event.preventDefault();
       }});
       canvas.addEventListener("mousemove", (event) => {{
-        if (!drag) return;
+        if (panDrag) {{
+          viewport.scrollLeft = panDrag.left - (event.clientX - panDrag.x);
+          viewport.scrollTop = panDrag.top - (event.clientY - panDrag.y);
+          return;
+        }}
         const p = point(event);
+        if (!drag) {{
+          if (panMode) {{ canvas.style.cursor = "grab"; return; }}
+          const hover = createMode ? "create" : hitHandle(p);
+          canvas.style.cursor = hover === "move" ? "move" : (
+            hover === "nw" || hover === "se" ? "nwse-resize" : (
+              hover === "ne" || hover === "sw" ? "nesw-resize" : "crosshair"
+            )
+          );
+          return;
+        }}
         const dx = p.x - drag.start.x;
         const dy = p.y - drag.start.y;
+        if (Math.abs(dx) > 1 || Math.abs(dy) > 1) drag.changed = true;
         const next = drag.bbox.slice();
         if (drag.mode === "create") {{
           next[0] = Math.min(drag.start.x, p.x);
@@ -1552,19 +2577,105 @@ def _render_bbox_dragger(page: dict, regions: list[dict], selected_id: str, bbox
         draw();
       }});
       window.addEventListener("mouseup", () => {{
+        if (panDrag) {{
+          panDrag = null;
+          canvas.style.cursor = panMode ? "grab" : "crosshair";
+          return;
+        }}
         if (!drag) return;
-        const action = drag.mode === "create" ? "create" : "update";
+        const finished = drag;
         drag = null;
-        if ((bbox[2] - bbox[0]) < 3 || (bbox[3] - bbox[1]) < 3) {{ draw(); return; }}
-        submitEvent(action, action === "update" ? payload.selected_region_id : null, bbox);
+        if (finished.mode === "create") {{
+          if (!finished.changed || (bbox[2] - bbox[0]) < 3 || (bbox[3] - bbox[1]) < 3) {{
+            bbox = [0, 0, 1, 1];
+            status.textContent = "框选范围太小，请继续在页面上拖动；也可点击“取消新增模式”。";
+            draw();
+            return;
+          }}
+          createMode = false;
+          pendingAction = "create";
+          status.textContent = "新框仅为本地草稿：确认无误后点击“确认新增”，或点击“取消新增”。";
+        }} else if (finished.changed) {{
+          pendingAction = "update";
+          status.textContent = "调整仅为本地预览：点击“保存调整”提交，或点击“取消调整”恢复。";
+        }} else {{
+          bbox = finished.bbox.slice();
+          status.textContent = `已选择 ${{selectedId}}，位置未改变。`;
+        }}
+        syncControls();
+        draw();
       }});
+      newButton.addEventListener("click", () => {{
+        if (submitting || pendingAction) return;
+        if (createMode) {{
+          restorePreviousSelection("已取消新增模式，未保存任何新框。");
+          return;
+        }}
+        previousSelection = selectedId ? {{ id: selectedId, bbox: bbox.slice() }} : null;
+        selectedId = null;
+        createMode = true;
+        bbox = [0, 0, 1, 1];
+        status.textContent = "新增框模式：请在页面上按住鼠标并拖动；Esc 可随时取消。";
+        syncControls();
+        draw();
+        canvas.focus();
+      }});
+      zoomOutButton.addEventListener("click", () => applyZoom(zoom - 0.2));
+      zoomResetButton.addEventListener("click", () => applyZoom(1));
+      zoomInButton.addEventListener("click", () => applyZoom(zoom + 0.2));
+      panButton.addEventListener("click", () => {{
+        if (pendingAction || createMode || drag) {{
+          status.textContent = "请先保存或取消当前框选草稿，再切换拖动画布。";
+          return;
+        }}
+        panMode = !panMode;
+        syncControls();
+        canvas.style.cursor = panMode ? "grab" : "crosshair";
+        status.textContent = panMode ? "拖动画布已开启：按住页面并拖动查看放大后的区域。" : "已退出拖动画布，可继续选择或编辑区域。";
+        canvas.focus();
+      }});
+      saveButton.addEventListener("click", () => {{
+        if (!pendingAction || submitting) return;
+        const action = pendingAction;
+        status.textContent = action === "create" ? "正在保存新框…" : "正在保存调整…";
+        submitEvent(action, action === "update" ? selectedId : null, bbox);
+      }});
+      cancelButton.addEventListener("click", cancelPending);
       deleteButton.addEventListener("click", () => {{
-        if (window.confirm("确认删除当前区域框？")) submitEvent("delete", payload.selected_region_id, null);
+        if (selectedId && !pendingAction && window.confirm(`确认删除区域 ${{selectedId}}？`)) {{
+          status.textContent = "正在删除当前框…";
+          submitEvent("delete", selectedId, null);
+        }}
       }});
       canvas.addEventListener("keydown", (event) => {{
-        if ((event.key === "Delete" || event.key === "Backspace") && window.confirm("确认删除当前区域框？")) {{
+        if (event.key === "Escape" && (drag || pendingAction || createMode)) {{
+          cancelPending();
           event.preventDefault();
-          submitEvent("delete", payload.selected_region_id, null);
+          return;
+        }}
+        if (selectedId && !pendingAction && (event.key === "Delete" || event.key === "Backspace") && window.confirm(`确认删除区域 ${{selectedId}}？`)) {{
+          event.preventDefault();
+          status.textContent = "正在删除当前框…";
+          submitEvent("delete", selectedId, null);
+          return;
+        }}
+        if (selectedId && !createMode && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {{
+          if (!pendingAction) originalBbox = bbox.slice();
+          const step = event.shiftKey ? 10 : 1;
+          const dx = event.key === "ArrowLeft" ? -step : (event.key === "ArrowRight" ? step : 0);
+          const dy = event.key === "ArrowUp" ? -step : (event.key === "ArrowDown" ? step : 0);
+          const moved = [bbox[0] + dx, bbox[1] + dy, bbox[2] + dx, bbox[3] + dy];
+          const width = bbox[2] - bbox[0], height = bbox[3] - bbox[1];
+          if (moved[0] < 0) {{ moved[0] = 0; moved[2] = width; }}
+          if (moved[1] < 0) {{ moved[1] = 0; moved[3] = height; }}
+          if (moved[2] > payload.width) {{ moved[2] = payload.width; moved[0] = payload.width - width; }}
+          if (moved[3] > payload.height) {{ moved[3] = payload.height; moved[1] = payload.height - height; }}
+          bbox = clampBox(moved);
+          pendingAction = "update";
+          draw();
+          syncControls();
+          status.textContent = "已在本地微调；点击“保存调整”提交，或点击“取消调整”恢复。";
+          event.preventDefault();
         }}
       }});
       image.addEventListener("load", draw);
@@ -1572,10 +2683,10 @@ def _render_bbox_dragger(page: dict, regions: list[dict], selected_id: str, bbox
       draw();
     </script>
     """
-    components.html(html, height=display_height + 48)
+    components.html(html, height=viewport_height + 148)
 
 
-def _render_region_crop_preview(page: dict, bbox: list[int]) -> None:
+def _render_region_crop_preview(page: dict, bbox: list[int], *, width: int = 420) -> None:
     image_path = Path(str(page.get("image_path") or ""))
     if not image_path.is_file():
         return
@@ -1583,16 +2694,16 @@ def _render_region_crop_preview(page: dict, bbox: list[int]) -> None:
     if image is None:
         st.warning("无法生成当前框选的裁剪预览。")
         return
-    height, width = image.shape[:2]
+    image_height, image_width = image.shape[:2]
     x1, y1, x2, y2 = [int(value) for value in bbox]
-    x1, x2 = sorted((max(0, min(width - 1, x1)), max(1, min(width, x2))))
-    y1, y2 = sorted((max(0, min(height - 1, y1)), max(1, min(height, y2))))
+    x1, x2 = sorted((max(0, min(image_width - 1, x1)), max(1, min(image_width, x2))))
+    y1, y2 = sorted((max(0, min(image_height - 1, y1)), max(1, min(image_height, y2))))
     if x2 <= x1 or y2 <= y1:
         st.warning("当前框选为空，无法生成裁剪预览。")
         return
     success, encoded = cv2.imencode(".png", image[y1:y2, x1:x2])
     if success:
-        st.image(encoded.tobytes(), caption=f"裁剪预览 · 原始页坐标 [{x1}, {y1}, {x2}, {y2}]", width=420)
+        st.image(encoded.tobytes(), caption=f"裁剪预览 · 原始页坐标 [{x1}, {y1}, {x2}, {y2}]", width=width)
 
 
 def _download_panel(document_result: dict) -> None:
@@ -1600,19 +2711,17 @@ def _download_panel(document_result: dict) -> None:
     st.subheader("结果导出")
     json_path = Path(exports.get("json") or "")
     csv_path = Path(exports.get("regions_csv") or "")
+    sdf_path = Path(exports.get("structures_sdf") or "")
+    smi_path = Path(exports.get("structures_smi") or "")
     detection_annotations_path = Path(exports.get("detection_annotations_json") or "")
     zip_path = Path(exports.get("zip") or "")
-    if json_path.is_file():
-        st.download_button("下载文档分析结果", json_path.read_bytes(), "document_result.json", "application/json")
     if csv_path.is_file():
-        st.download_button("下载区域结果表", csv_path.read_bytes(), "regions.csv", "text/csv")
-    if detection_annotations_path.is_file():
-        st.download_button(
-            "下载检测训练标注",
-            detection_annotations_path.read_bytes(),
-            "detection_annotations.json",
-            "application/json",
-        )
+        st.download_button("CSV 区域结果", csv_path.read_bytes(), "regions.csv", "text/csv")
+    structures = st.columns(2)
+    if sdf_path.is_file():
+        structures[0].download_button("SDF 结构合集", sdf_path.read_bytes(), "document_structures.sdf", "chemical/x-mdl-sdfile")
+    if smi_path.is_file():
+        structures[1].download_button("SMI 结构合集", smi_path.read_bytes(), "document_structures.smi", "chemical/x-daylight-smiles")
     if zip_path.is_file():
         st.caption(f"完整结果包已生成：{zip_path.name}（{zip_path.stat().st_size / 1024 / 1024:.2f} MB）")
         if st.button("准备完整结果包下载", key="prepare_document_zip_download"):
@@ -1623,4 +2732,15 @@ def _download_panel(document_result: dict) -> None:
                 st.session_state["document_zip_download_bytes"],
                 "document_results.zip",
                 "application/zip",
+            )
+    with st.expander("高级导出", expanded=False):
+        st.caption("JSON 与检测训练标注用于程序对接、审计和模型训练，不作为普通结果入口。")
+        if json_path.is_file():
+            st.download_button("JSON 完整审计数据", json_path.read_bytes(), "document_result.json", "application/json")
+        if detection_annotations_path.is_file():
+            st.download_button(
+                "JSON 检测训练标注",
+                detection_annotations_path.read_bytes(),
+                "detection_annotations.json",
+                "application/json",
             )

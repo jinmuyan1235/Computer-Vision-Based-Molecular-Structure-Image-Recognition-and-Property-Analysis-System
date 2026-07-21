@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import cv2
 from PIL import Image, ImageDraw
 from reportlab.pdfgen import canvas
 
@@ -128,6 +129,18 @@ class FailingReportGenerator(FakeReportGenerator):
         }
 
 
+class SingleAtomReportGenerator(FakeReportGenerator):
+    def generate(self, image_path: str | Path) -> dict:
+        self.calls.append(Path(image_path))
+        return {
+            "status": "success",
+            "message": "model returned candidate",
+            "input": {},
+            "ocsr": {"backend": "fake", "status": "success", "smiles": "C"},
+            "final": {"smiles": "C", "canonical_smiles": "C"},
+        }
+
+
 def test_single_page_pdf_processes_with_fake_renderer(tmp_path: Path) -> None:
     page = _make_page(tmp_path / "aspirin_page.png", ["aspirin"], text="single molecule")
     pdf = _make_pdf(tmp_path / "aspirin_doc.pdf")
@@ -145,6 +158,7 @@ def test_single_page_pdf_processes_with_fake_renderer(tmp_path: Path) -> None:
     assert Path(result["exports"]["json"]).is_file()
     assert Path(result["exports"]["regions_csv"]).is_file()
     assert Path(result["exports"]["structures_sdf"]).is_file()
+    assert Path(result["exports"]["structures_smi"]).is_file()
     assert Path(result["exports"]["structures_zip"]).is_file()
     assert Path(result["exports"]["structure_failed_csv"]).is_file()
     assert Path(result["exports"]["structure_review_csv"]).is_file()
@@ -197,6 +211,8 @@ def test_real_pymupdf_pdf_rendering_when_available(tmp_path: Path) -> None:
     assert molecule_region["page_number"] == 1
     assert molecule_region["bbox"][2] > molecule_region["bbox"][0]
     assert molecule_region["confirmed"] is False
+    assert any(box["text"] == "Aspirin" for box in result["pages"][0]["text_boxes"])
+    assert result["pages"][0]["figure_boxes"]
     assert Path(result["exports"]["json"]).is_file()
 
 
@@ -326,13 +342,87 @@ def test_full_document_mode_only_recognizes_screened_molecule_regions(tmp_path: 
     result = processor.process(page_path, run_ocsr=True)
 
     assert result["processing"]["mode"] == "detect_and_recognize"
-    assert result["processing"]["confirmed_candidate_region_count"] == 2
+    assert result["processing"]["confirmed_candidate_region_count"] == 1
     assert len(fake_generator.calls) == 1
     statuses = {region["region_id"]: region for region in result["regions"]}
     assert statuses["p001_r001"]["status"] == "recognized"
     assert statuses["p001_r002"]["status"] == "skipped"
-    assert "文字" in statuses["p001_r002"]["message"] or "过小" in statuses["p001_r002"]["message"]
+    assert any(value in statuses["p001_r002"]["message"] for value in ("文字", "文本", "过小"))
     assert statuses["p001_r003"]["status"] == "skipped"
+
+
+def test_model_output_complexity_mismatch_is_rejected_after_inference(tmp_path: Path) -> None:
+    page_path = _make_page(tmp_path / "complex_input.png", ["caffeine"])
+    page = DocumentPage("doc", 1, str(page_path), 900, 600)
+    region = DocumentRegion(
+        "doc",
+        1,
+        "p001_r001",
+        (70, 120, 360, 380),
+        "molecule",
+        0.9,
+        confirmed=True,
+        screening={
+            "diagnostics": {
+                "structural_evidence": True,
+                "long_line_count": 18,
+                "valid_component_count": 5,
+                "ring_count": 2,
+                "branch_junction_count": 1,
+            }
+        },
+    )
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out")
+    processor.report_generator = SingleAtomReportGenerator()
+
+    processor.recognize_region(region, [page], tmp_path / "out", screen=False)
+
+    gate = region.report["recognition_gate"]["input_output_complexity"]
+    assert region.status == "failed"
+    assert gate["passed"] is False
+    assert gate["reason_code"] == "output_too_simple_for_input"
+    assert region.final_result == {}
+    assert region.report["rejected_candidate"]["canonical_smiles"] == "C"
+
+
+def test_existing_document_can_be_rescreened_without_ocsr(tmp_path: Path) -> None:
+    image = Image.new("RGB", (300, 180), "white")
+    image_path = tmp_path / "old_label_region.png"
+    image.save(image_path)
+    array = cv2.imread(str(image_path))
+    cv2.putText(array, "(B)", (85, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.imwrite(str(image_path), array)
+    result = {
+        "document_id": "old-doc",
+        "output_dir": str(tmp_path),
+        "pages": [{"page_number": 1, "width": 300, "height": 180, "image_path": str(image_path)}],
+        "regions": [{
+            "document_id": "old-doc",
+            "page_number": 1,
+            "region_id": "p001_r001",
+            "bbox": [65, 60, 175, 125],
+            "region_type": "molecule",
+            "detection_confidence": 0.99,
+            "source": "detector",
+            "status": "detected",
+            "confirmed": False,
+            "screening": {"config_version": "crop-screening-candidate-v2"},
+        }],
+        "summary": {},
+        "exports": {},
+        "detection_errors": [],
+    }
+    processor = DocumentOCSRProcessor("demo", tmp_path / "out")
+    processor.export = lambda updated, _output: updated.get("exports", {})  # type: ignore[method-assign]
+
+    refreshed = processor.rescreen_document_result(result)
+    region = refreshed["regions"][0]
+
+    assert result["regions"][0]["region_type"] == "molecule"
+    assert region["region_type"] == "text"
+    assert region["screening"]["config_version"] == "crop-screening-candidate-v3"
+    assert region["audit"][-1]["operation"] == "automatic_rescreen"
+    assert refreshed["processing"]["screening_refresh"]["changed_region_count"] == 1
 
 
 def test_invalid_bbox_is_not_sent_to_ocsr(tmp_path: Path) -> None:

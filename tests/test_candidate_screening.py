@@ -18,7 +18,7 @@ import src.documents.detectors as detectors_module
 import src.documents.processor as processor_module
 from scripts.collect_ocsr_dataset import _pipeline, build_parser
 from src.documents.candidate_screening import (
-    get_crop_screening_config, get_proposal_config, get_screening_config,
+    assess_output_complexity, get_crop_screening_config, get_proposal_config, get_screening_config,
     screen_region_candidate,
 )
 from src.documents.detectors import HeuristicMoleculeRegionDetector
@@ -152,7 +152,105 @@ def test_three_way_crop_decisions_are_explicit() -> None:
     assert accepted.decision == "accept_molecule"
     assert rejected.decision == "reject_negative"
     assert review.decision == "review_needed"
-    assert accepted.config_version == "crop-screening-candidate-v1"
+    assert accepted.config_version == "crop-screening-candidate-v3"
+
+
+@pytest.mark.parametrize("token", ["(A)", "(B)", "Fig. 2", "nm", "12", "3.1"])
+def test_pdf_short_text_tokens_are_hard_rejected(token: str) -> None:
+    image = np.full((140, 260, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (80, 55), (110, 85), (0, 0, 0), thickness=-1)
+
+    result = screen_region_candidate(
+        image,
+        (0, 0, 260, 140),
+        "molecule",
+        0.99,
+        text_boxes=[{"bbox": [70, 45, 150, 95], "text": token}],
+    )
+
+    assert result.recommended_region_type == "text"
+    assert "short_text_hard_reject" in result.reason_codes
+    assert "pdf_text_token" in result.reason_codes
+
+
+def test_rasterized_parenthesized_letter_is_not_mistaken_for_ring_structure() -> None:
+    image = np.full((180, 300, 3), 255, dtype=np.uint8)
+    cv2.putText(image, "(B)", (85, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+
+    result = screen_region_candidate(image, (65, 60, 175, 125), "molecule", 0.99)
+
+    assert result.recommended_region_type == "text"
+    assert "short_text_hard_reject" in result.reason_codes
+    assert "short_sparse_label" in result.reason_codes
+
+
+def test_components_and_detector_confidence_alone_cannot_accept_candidate() -> None:
+    image = np.full((180, 360, 3), 255, dtype=np.uint8)
+    for x in (80, 160, 240):
+        cv2.circle(image, (x, 90), 12, (0, 0, 0), thickness=-1)
+
+    low = screen_region_candidate(image, (0, 0, 360, 180), "molecule", 0.0)
+    high = screen_region_candidate(image, (0, 0, 360, 180), "molecule", 0.99)
+
+    assert low.decision != "accept_molecule"
+    assert high.decision != "accept_molecule"
+    assert high.diagnostics["structural_evidence"] is False
+    assert low.diagnostics["molecule_score"] == high.diagnostics["molecule_score"]
+    assert high.diagnostics["detector_confidence_contribution"] == 0.0
+
+
+def test_pdf_text_overlap_and_figure_context_override_weak_visual_candidate() -> None:
+    image = np.full((300, 500, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (65, 65), (85, 85), (0, 0, 0), thickness=-1)
+    cv2.rectangle(image, (110, 65), (130, 85), (0, 0, 0), thickness=-1)
+
+    text = screen_region_candidate(
+        image,
+        (40, 40, 190, 120),
+        "molecule",
+        0.95,
+        text_boxes=[{"bbox": [45, 45, 185, 115], "text": "ordinary"}],
+    )
+    figure_label = screen_region_candidate(
+        image,
+        (40, 40, 190, 120),
+        "molecule",
+        0.95,
+        figure_boxes=[{"bbox": [0, 0, 500, 300]}],
+    )
+
+    assert text.recommended_region_type == "text"
+    assert "pdf_text_layer_overlap" in text.reason_codes
+    assert figure_label.recommended_region_type == "figure_label"
+    assert "figure_label_without_skeleton" in figure_label.reason_codes
+
+
+def test_input_output_complexity_mismatch_gate_rejects_both_directions() -> None:
+    too_simple = assess_output_complexity(
+        {
+            "structural_evidence": True,
+            "long_line_count": 16,
+            "valid_component_count": 5,
+            "ring_count": 1,
+            "branch_junction_count": 1,
+        },
+        "C",
+    )
+    too_complex = assess_output_complexity(
+        {
+            "structural_evidence": False,
+            "long_line_count": 0,
+            "valid_component_count": 1,
+            "ring_count": 0,
+            "branch_junction_count": 0,
+        },
+        "CCCCCCCC",
+    )
+
+    assert too_simple["passed"] is False
+    assert too_simple["reason_code"] == "output_too_simple_for_input"
+    assert too_complex["passed"] is False
+    assert too_complex["reason_code"] == "output_too_complex_for_input"
 
 
 def _evaluation_manifest(tmp_path: Path) -> Path:

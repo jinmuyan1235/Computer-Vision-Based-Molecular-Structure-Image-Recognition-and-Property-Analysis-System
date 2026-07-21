@@ -12,7 +12,7 @@ from config import OUTPUT_DIR
 from src.utils.file_utils import ensure_directory
 
 
-BATCH_JOB_STATUSES = {"queued", "running", "cancelling", "cancelled", "completed", "failed"}
+BATCH_JOB_STATUSES = {"queued", "running", "paused", "cancelling", "cancelled", "completed", "failed"}
 BATCH_SUMMARY_SCHEMA_VERSION = 2
 
 
@@ -38,6 +38,12 @@ class BatchJobStore:
     def skip_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "skip_current.request"
 
+    def pause_path(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "pause.request"
+
+    def checkpoint_path(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "checkpoint.json"
+
     def stdout_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "stdout.log"
 
@@ -57,6 +63,7 @@ class BatchJobStore:
         runtime_config: dict[str, Any] | None = None,
         parent_job_id: str | None = None,
         retry_mode: str | None = None,
+        input_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         directory = ensure_directory(self.job_dir(job_id))
         state = {
@@ -68,13 +75,17 @@ class BatchJobStore:
             "output_dir": str(Path(output_dir).expanduser().resolve()),
             "total": total,
             "completed": 0,
+            "successful": 0,
             "accepted": 0,
             "accepted_with_warning": 0,
             "review_needed": 0,
             "manual_review_total": 0,
+            "pending_confirmation": 0,
             "rejected": 0,
             "failed": 0,
             "skipped": 0,
+            "cache_hits": 0,
+            "duplicate_files": int((input_summary or {}).get("duplicate_files") or 0),
             "current_file": None,
             "current_index": None,
             "pid": None,
@@ -82,6 +93,9 @@ class BatchJobStore:
             "runtime_config": runtime_config or {},
             "parent_job_id": parent_job_id,
             "retry_mode": retry_mode,
+            "input_summary": input_summary or {},
+            "checkpoint_path": str(self.checkpoint_path(job_id)),
+            "max_concurrency": 1,
             "result_path": None,
             "exports": {},
             "message": "",
@@ -113,7 +127,8 @@ class BatchJobStore:
         return state
 
     def mark_running(self, job_id: str, pid: int, command: list[str] | None = None) -> dict[str, Any]:
-        fields: dict[str, Any] = {"status": "running", "pid": pid, "started_at": utc_now()}
+        state = self.read(job_id)
+        fields: dict[str, Any] = {"status": "running", "pid": pid, "started_at": state.get("started_at") or utc_now()}
         if command is not None:
             fields["command"] = command
         return self.update(job_id, **fields)
@@ -122,19 +137,24 @@ class BatchJobStore:
         summary = progress.get("summary") or {}
         counts = _batch_summary_counts(summary)
         status = str(progress.get("status") or "running")
+        if self.pause_requested(job_id) and status == "running":
+            status = "paused"
         if status not in BATCH_JOB_STATUSES:
             status = "running"
         fields = {
             "status": status,
             "total": int(progress.get("total") or summary.get("total") or 0),
             "completed": int(progress.get("completed") or summary.get("completed") or 0),
+            "successful": int(summary.get("successful") or 0),
             "accepted": counts["accepted"],
             "accepted_with_warning": counts["accepted_with_warning"],
             "review_needed": counts["review_needed"],
             "manual_review_total": counts["manual_review_total"],
+            "pending_confirmation": int(summary.get("pending_confirmation") or 0),
             "rejected": counts["rejected"],
             "failed": counts["failed"],
             "skipped": counts["skipped"],
+            "cache_hits": int(progress.get("cache_hits") or summary.get("cache_hits") or 0),
             "current_file": progress.get("current_file"),
             "current_index": progress.get("current_index"),
             "summary": summary,
@@ -157,10 +177,12 @@ class BatchJobStore:
             summary=summary,
             total=int(summary.get("total") or 0),
             completed=int(summary.get("completed") or summary.get("total") or 0),
+            successful=int(summary.get("successful") or 0),
             accepted=counts["accepted"],
             accepted_with_warning=counts["accepted_with_warning"],
             review_needed=counts["review_needed"],
             manual_review_total=counts["manual_review_total"],
+            pending_confirmation=int(summary.get("pending_confirmation") or 0),
             rejected=counts["rejected"],
             failed=counts["failed"],
             skipped=counts["skipped"],
@@ -177,12 +199,33 @@ class BatchJobStore:
     def request_cancel(self, job_id: str) -> dict[str, Any]:
         self.cancel_path(job_id).write_text(utc_now(), encoding="utf-8")
         state = self.read(job_id)
-        if state.get("status") in {"queued", "running"}:
+        if state.get("status") in {"queued", "running", "paused"}:
             state = self.update(job_id, status="cancelling", message="正在取消任务……")
         return state
 
     def cancel_requested(self, job_id: str) -> bool:
         return self.cancel_path(job_id).is_file()
+
+    def request_pause(self, job_id: str) -> dict[str, Any]:
+        state = self.read(job_id)
+        if state.get("status") not in {"queued", "running"}:
+            return state
+        self.pause_path(job_id).write_text(utc_now(), encoding="utf-8")
+        return self.update(job_id, status="paused", message="任务将在当前文件完成后暂停。")
+
+    def resume(self, job_id: str) -> dict[str, Any]:
+        self.pause_path(job_id).unlink(missing_ok=True)
+        state = self.read(job_id)
+        if state.get("status") == "paused":
+            return self.update(job_id, status="running", message="任务已继续。")
+        return state
+
+    def pause_requested(self, job_id: str) -> bool:
+        return self.pause_path(job_id).is_file()
+
+    def clear_control_requests(self, job_id: str) -> None:
+        for path in (self.cancel_path(job_id), self.pause_path(job_id), self.skip_path(job_id)):
+            path.unlink(missing_ok=True)
 
     def request_skip_current(self, job_id: str) -> dict[str, Any]:
         self.skip_path(job_id).write_text(utc_now(), encoding="utf-8")

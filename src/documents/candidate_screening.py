@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import re
 from typing import Any, Literal
 
 import cv2
@@ -331,16 +332,24 @@ def _line_diagnostics(binary: np.ndarray, config: CropScreeningConfig) -> dict[s
     height, width = binary.shape[:2]
     edges = cv2.Canny(binary, 60, 180)
     lines = cv2.HoughLinesP(
-        edges, 1, np.pi / 180, threshold=config.arrow_hough_threshold,
-        minLineLength=max(config.features.hough_min_line_pixels, int(width * config.arrow_min_length_ratio)),
+        edges, 1, np.pi / 180, threshold=min(config.arrow_hough_threshold, 24),
+        minLineLength=max(
+            config.features.hough_min_line_pixels,
+            int(min(width, height) * config.features.long_line_min_dimension_ratio),
+        ),
         maxLineGap=config.features.hough_max_line_gap,
     )
     total = long_segments = long_horizontal = 0
     longest_horizontal_ratio = 0.0
+    endpoints: list[tuple[int, int, float]] = []
+    orientation_bins: set[int] = set()
     if lines is not None:
         for x1, y1, x2, y2 in lines.reshape(-1, 4):
             length = float(((int(x2) - int(x1)) ** 2 + (int(y2) - int(y1)) ** 2) ** 0.5)
             total += 1
+            angle = float(np.degrees(np.arctan2(int(y2) - int(y1), int(x2) - int(x1))) % 180)
+            orientation_bins.add(int(angle // 30))
+            endpoints.extend([(int(x1), int(y1), angle), (int(x2), int(y2), angle)])
             thresholds = config.features
             long_segments += int(length >= max(
                 thresholds.long_line_min_pixels,
@@ -354,11 +363,23 @@ def _line_diagnostics(binary: np.ndarray, config: CropScreeningConfig) -> dict[s
                 if ratio >= config.arrow_min_length_ratio:
                     long_horizontal += 1
                     longest_horizontal_ratio = max(longest_horizontal_ratio, ratio)
+    junctions = 0
+    tolerance = max(7, int(min(width, height) * 0.035))
+    for index, (x, y, _) in enumerate(endpoints):
+        nearby_angles = {
+            int(angle // 30)
+            for other_index, (other_x, other_y, angle) in enumerate(endpoints)
+            if other_index != index and (other_x - x) ** 2 + (other_y - y) ** 2 <= tolerance ** 2
+        }
+        if len(nearby_angles) >= 3:
+            junctions += 1
     return {
         "edge_ratio": float(np.count_nonzero(edges) / max(width * height, 1)),
         "line_count": total, "long_line_count": long_segments,
         "long_horizontal_line_count": long_horizontal,
         "longest_horizontal_ratio": longest_horizontal_ratio,
+        "orientation_bin_count": len(orientation_bins),
+        "branch_junction_count": junctions,
     }
 
 
@@ -383,6 +404,89 @@ def _structure_cluster_count(binary: np.ndarray, config: CropScreeningConfig) ->
     return clusters
 
 
+def _ring_count(binary: np.ndarray) -> int:
+    height, width = binary.shape[:2]
+    crop_area = max(width * height, 1)
+    contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    rings = 0
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        perimeter = float(cv2.arcLength(contour, True))
+        if area < max(45.0, crop_area * 0.0015) or perimeter <= 0:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        if min(w, h) < 12 or x <= 0 or y <= 0 or x + w >= width - 1 or y + h >= height - 1:
+            continue
+        vertices = len(cv2.approxPolyDP(contour, 0.055 * perimeter, True))
+        circularity = 4.0 * np.pi * area / max(perimeter * perimeter, 1.0)
+        if 5 <= vertices <= 10 and circularity >= 0.12:
+            rings += 1
+    return rings
+
+
+def _bbox_overlap(candidate: tuple[int, int, int, int], other: list[int] | tuple[int, int, int, int]) -> tuple[float, float]:
+    ax1, ay1, ax2, ay2 = candidate
+    bx1, by1, bx2, by2 = [int(value) for value in other]
+    intersection = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(0, min(ay2, by2) - max(ay1, by1))
+    area_a = max((ax2 - ax1) * (ay2 - ay1), 1)
+    area_b = max((bx2 - bx1) * (by2 - by1), 1)
+    return intersection / area_a, intersection / min(area_a, area_b)
+
+
+def _short_text_token(value: str) -> bool:
+    token = re.sub(r"\s+", "", str(value or "").strip())
+    if not token or len(token) > 18:
+        return False
+    patterns = (
+        r"^\(?[A-Za-z]\)?[.:]?$",
+        r"^(?:fig(?:ure)?|scheme|table|eq(?:uation)?)\.?\d*[A-Za-z]?$",
+        r"^\d+(?:[.)]|[A-Za-z]?)?$",
+        r"^\d+(?:\.\d+)+$",
+        r"^(?:nm|mm|cm|μm|um|pm|hz|khz|mhz|ghz|°c|k|h|min|sec|s|ml|μl|ul|mg|g|kg|mol|mmol|%)$",
+    )
+    return any(re.fullmatch(pattern, token, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _page_context_diagnostics(
+    bbox: tuple[int, int, int, int],
+    text_boxes: list[dict[str, Any]] | None,
+    figure_boxes: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    matched_text: list[str] = []
+    text_candidate_coverage = 0.0
+    text_overlap = 0.0
+    for item in text_boxes or []:
+        other = item.get("bbox") if isinstance(item, dict) else None
+        if not other or len(other) != 4:
+            continue
+        candidate_coverage, overlap = _bbox_overlap(bbox, other)
+        if overlap >= 0.35:
+            text_candidate_coverage = min(1.0, text_candidate_coverage + candidate_coverage)
+            text_overlap = max(text_overlap, overlap)
+            text = str(item.get("text") or "").strip()
+            if text:
+                matched_text.append(text)
+    figure_containment = 0.0
+    figure_relative_area = 1.0
+    for item in figure_boxes or []:
+        other = item.get("bbox") if isinstance(item, dict) else item
+        if not other or len(other) != 4:
+            continue
+        containment, _ = _bbox_overlap(bbox, other)
+        candidate_area = max((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]), 1)
+        figure_area = max((int(other[2]) - int(other[0])) * (int(other[3]) - int(other[1])), 1)
+        if containment > figure_containment:
+            figure_containment = containment
+            figure_relative_area = candidate_area / figure_area
+    return {
+        "pdf_text_overlap": round(max(text_overlap, text_candidate_coverage), 4),
+        "pdf_text_candidate_coverage": round(text_candidate_coverage, 4),
+        "matched_pdf_text": " ".join(dict.fromkeys(matched_text))[:160],
+        "inside_figure_ratio": round(figure_containment, 4),
+        "figure_relative_area": round(figure_relative_area, 4),
+    }
+
+
 def screen_region_candidate(
     page_image: str | Path | np.ndarray,
     bbox: tuple[int, int, int, int] | list[int],
@@ -390,6 +494,8 @@ def screen_region_candidate(
     initial_detector_confidence: float | None,
     *,
     config: ScreeningProfile | CropScreeningConfig | CandidateScreeningConfig = "candidate",
+    text_boxes: list[dict[str, Any]] | None = None,
+    figure_boxes: list[dict[str, Any]] | None = None,
 ) -> CandidateScreeningResult:
     """Classify one proposed page region without invoking any OCSR model."""
     settings = get_crop_screening_config(config)
@@ -421,6 +527,13 @@ def screen_region_candidate(
     vertical_projection = float(np.max(np.sum(binary > 0, axis=0)) / max(height, 1))
     line_info = _line_diagnostics(binary, settings)
     clusters = _structure_cluster_count(binary, settings)
+    rings = _ring_count(binary)
+    valid_components = sum(
+        1
+        for index in range(1, component_count)
+        if int(stats[index, cv2.CC_STAT_AREA]) >= max(18, thresholds.component_min_area)
+        and max(int(stats[index, cv2.CC_STAT_WIDTH]), int(stats[index, cv2.CC_STAT_HEIGHT])) >= 8
+    )
     page_area_ratio = area / max(page_width * page_height, 1)
     skeletal = (
         line_info["long_line_count"] >= thresholds.skeletal_min_long_lines
@@ -430,6 +543,22 @@ def screen_region_candidate(
         and horizontal_projection < thresholds.skeletal_max_projection_ratio
         and vertical_projection < thresholds.skeletal_max_projection_ratio
     )
+    evidence_codes: list[str] = []
+    if line_info["long_line_count"] >= 3 and line_info["orientation_bin_count"] >= 2:
+        evidence_codes.append("multiple_long_lines")
+    if (
+        valid_components >= 3
+        and small_ratio < 0.60
+        and line_info["line_count"] >= 3
+        and line_info["orientation_bin_count"] >= 2
+    ):
+        evidence_codes.append("multiple_valid_components")
+    if rings >= 1:
+        evidence_codes.append("ring_structure")
+    if line_info["branch_junction_count"] >= 1:
+        evidence_codes.append("branch_structure")
+    structural_evidence = bool(evidence_codes)
+    context = _page_context_diagnostics((x1, y1, x2, y2), text_boxes, figure_boxes)
     diagnostics = {
         "config": settings.name, "config_values": asdict(settings),
         "width": width, "height": height, "aspect": round(aspect, 4),
@@ -438,8 +567,11 @@ def screen_region_candidate(
         "text_line_count": text_lines, "horizontal_projection": round(horizontal_projection, 4),
         "vertical_projection": round(vertical_projection, 4), "page_area_ratio": round(page_area_ratio, 6),
         "structure_cluster_count": clusters, "skeletal_linework": skeletal,
+        "valid_component_count": valid_components, "ring_count": rings,
+        "structural_evidence": structural_evidence, "structural_evidence_codes": evidence_codes,
         "initial_region_type": initial_region_type,
         "initial_detector_confidence": initial_detector_confidence,
+        **context,
         **{key: round(value, 4) if isinstance(value, float) else value for key, value in line_info.items()},
     }
     initial = _normalize_initial(initial_region_type)
@@ -447,7 +579,7 @@ def screen_region_candidate(
     def result(label: str, score: float, *reasons: str) -> CandidateScreeningResult:
         if label == "molecule":
             decision: ScreeningDecision = "accept_molecule"
-        elif label in {"blank", "text", "table", "reaction", "logo"}:
+        elif label in {"blank", "text", "table", "reaction", "logo", "figure_label"}:
             decision = "reject_negative"
         else:
             decision = "review_needed"
@@ -456,11 +588,32 @@ def screen_region_candidate(
             recommended_region_type=label,
             screening_score=round(max(0.0, min(score, 1.0)), 4),
             reason_codes=tuple(dict.fromkeys(reasons)), diagnostics=diagnostics,
-            config_version=f"crop-screening-{settings.name}-v1",
+            config_version=f"crop-screening-{settings.name}-v3",
         )
 
     if ink_ratio < settings.blank_ink_ratio:
         return result("blank", 1.0 - ink_ratio, "blank")
+    matched_text = str(context["matched_pdf_text"] or "")
+    visual_short_text = (
+        min(width, height) <= 105 and max(width, height) <= 220
+        and len(significant) <= 6 and line_info["long_line_count"] <= 2
+    )
+    if (
+        matched_text
+        and _short_text_token(matched_text)
+        and (not structural_evidence or context["pdf_text_candidate_coverage"] >= 0.12)
+    ):
+        return result("text", 0.99, "short_text_hard_reject", "pdf_text_token")
+    if context["pdf_text_overlap"] >= 0.72 and not structural_evidence:
+        return result("text", 0.98, "pdf_text_layer_overlap", "text_like")
+    if (
+        context["inside_figure_ratio"] >= 0.88
+        and context["figure_relative_area"] <= 0.22
+        and not structural_evidence
+    ):
+        return result("figure_label", 0.93, "figure_label_without_skeleton", "text_like")
+    if visual_short_text:
+        return result("text", 0.94, "short_text_hard_reject", "short_sparse_label")
     if width < settings.minimum_crop_width or height < settings.minimum_crop_height:
         return result("text", 0.75, "too_small", "text_like")
     table_like = (
@@ -506,7 +659,7 @@ def screen_region_candidate(
     if merged_region:
         return result("multiple_molecules", 0.82, "multiple_or_merged_region")
     strong_single_structure = (
-        settings.reclassify_non_molecule and clusters == 1
+        settings.reclassify_non_molecule and clusters == 1 and structural_evidence
         and settings.promotion_min_ink_ratio <= ink_ratio <= settings.promotion_max_ink_ratio
         and settings.promotion_min_components <= len(significant) <= settings.promotion_max_components
         and settings.promotion_min_small_component_ratio <= small_ratio <= settings.promotion_max_small_component_ratio
@@ -515,7 +668,7 @@ def screen_region_candidate(
     if strong_single_structure:
         return result("molecule", 0.91, "possible_molecule")
     existing_single_structure = (
-        settings.name == "candidate" and initial == "molecule" and clusters == 1
+        settings.name == "candidate" and initial == "molecule" and clusters == 1 and structural_evidence
         and settings.existing_molecule_min_ink_ratio <= ink_ratio <= settings.promotion_max_ink_ratio
         and settings.existing_molecule_min_components <= len(significant) <= settings.promotion_max_components
         and settings.existing_molecule_min_aspect <= aspect <= settings.existing_molecule_max_aspect
@@ -562,17 +715,66 @@ def screen_region_candidate(
     molecule_score += 0.18 if skeletal else 0.0
     molecule_score += 0.10 if thresholds.score_aspect_min <= aspect <= thresholds.score_aspect_max else 0.0
     molecule_score += 0.06 if clusters == 1 else 0.0
-    molecule_score += float(initial_detector_confidence or 0.0) * 0.08
+    confidence_contribution = float(initial_detector_confidence or 0.0) * 0.08 if structural_evidence else 0.0
+    molecule_score += confidence_contribution
+    diagnostics["detector_confidence_contribution"] = round(confidence_contribution, 4)
     diagnostics["molecule_score"] = round(molecule_score, 4)
     if (
         settings.name == "candidate" and initial == "molecule"
         and ink_ratio >= settings.high_ink_uncertain_ratio and not skeletal
     ):
         return result("uncertain", molecule_score, "uncertain")
-    if molecule_score >= settings.molecule_score_threshold and initial == "molecule":
+    if molecule_score >= settings.molecule_score_threshold and initial == "molecule" and structural_evidence:
         return result("molecule", molecule_score, "possible_molecule")
+    if initial == "molecule" and not structural_evidence:
+        return result("uncertain", molecule_score, "missing_skeleton_evidence")
     if not settings.reclassify_non_molecule and initial != "molecule":
-        return result(initial, float(initial_detector_confidence or 0.5), "uncertain")
+        return result(initial, molecule_score, "uncertain")
     if initial != "molecule":
         return result(initial, molecule_score, "uncertain")
     return result("uncertain", molecule_score, "uncertain")
+
+
+def assess_output_complexity(diagnostics: dict[str, Any] | None, smiles: str | None) -> dict[str, Any]:
+    """Reject implausible visual/SMILES complexity mismatches without changing OCSR."""
+
+    payload: dict[str, Any] = {"passed": True, "reason_code": None}
+    if not diagnostics or not smiles:
+        payload["assessed"] = False
+        return payload
+    try:
+        from rdkit import Chem
+
+        molecule = Chem.MolFromSmiles(str(smiles))
+    except (ImportError, ModuleNotFoundError):
+        payload["assessed"] = False
+        payload["reason_code"] = "rdkit_unavailable"
+        return payload
+    if molecule is None:
+        return {"assessed": True, "passed": False, "reason_code": "invalid_output_smiles"}
+
+    atom_count = int(molecule.GetNumAtoms())
+    bond_count = int(molecule.GetNumBonds())
+    ring_count = int(molecule.GetRingInfo().NumRings())
+    fragment_count = len(Chem.GetMolFrags(molecule))
+    long_lines = int(diagnostics.get("long_line_count") or 0)
+    valid_components = int(diagnostics.get("valid_component_count") or diagnostics.get("significant_component_count") or 0)
+    input_rings = int(diagnostics.get("ring_count") or 0)
+    branch_junctions = int(diagnostics.get("branch_junction_count") or 0)
+    structural_evidence = bool(diagnostics.get("structural_evidence"))
+    input_complexity = long_lines + valid_components * 2 + input_rings * 5 + branch_junctions * 3
+    output_complexity = bond_count + ring_count * 3 + max(atom_count - 1, 0)
+    payload.update({
+        "assessed": True,
+        "input_complexity": input_complexity,
+        "output_complexity": output_complexity,
+        "output_atom_count": atom_count,
+        "output_bond_count": bond_count,
+        "output_ring_count": ring_count,
+        "output_fragment_count": fragment_count,
+    })
+    if structural_evidence and input_complexity >= 20 and atom_count <= 2:
+        payload.update({"passed": False, "reason_code": "output_too_simple_for_input"})
+    elif not structural_evidence and input_complexity <= 5 and atom_count >= 8:
+        payload.update({"passed": False, "reason_code": "output_too_complex_for_input"})
+    return payload

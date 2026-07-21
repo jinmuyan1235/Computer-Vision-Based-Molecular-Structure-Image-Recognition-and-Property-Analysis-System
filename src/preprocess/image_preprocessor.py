@@ -104,6 +104,11 @@ class ImagePreprocessor:
         """Run the complete CV pipeline and return every visualizable stage."""
         uploaded_original = self.load_image(image_path)
         original = apply_user_adjustments(uploaded_original, user_adjustments, self.default_size) if user_adjustments else uploaded_original
+        clarity_enhanced = apply_user_adjustments(
+            original,
+            {"clarity_enhancement": "standard"},
+            self.default_size,
+        )
         gray = self.to_grayscale(original)
         denoised = self.denoise(gray)
         binary = self.binarize(denoised)
@@ -112,6 +117,7 @@ class ImagePreprocessor:
         normalized = self.resize_normalize(deskewed, self.default_size)
         stages = {
             "original": original,
+            "clarity_enhanced": clarity_enhanced,
             "gray": gray,
             "denoised": denoised,
             "binary": binary,

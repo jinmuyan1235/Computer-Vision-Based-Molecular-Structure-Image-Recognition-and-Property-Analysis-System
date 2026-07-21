@@ -36,6 +36,7 @@ REGION_TYPE_LABELS = {
     "text": "文本",
     "table": "表格",
     "figure": "普通图像/插图",
+    "figure_label": "图表内文字标签",
     "ignore": "忽略",
     "unknown": "未知区域",
     "non_molecule": "非分子区域",

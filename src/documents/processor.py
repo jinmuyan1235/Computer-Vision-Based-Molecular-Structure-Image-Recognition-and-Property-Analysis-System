@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from copy import deepcopy
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
@@ -16,6 +17,7 @@ from PIL import Image, ImageDraw
 
 import config
 from src.analysis.batch_analyzer import flatten_report
+from src.analysis.correction import apply_smiles_correction, confirm_structure, revoke_structure_confirmation
 from src.analysis.molecule_report import MoleculeReportGenerator
 from src.documents.detectors import (
     BaseMoleculeRegionDetector,
@@ -25,7 +27,7 @@ from src.documents.detectors import (
     SplitDocumentRegionDetector,
 )
 from src.documents.candidate_screening import (
-    CandidateProposalConfig, CandidateScreeningConfig, CropScreeningConfig,
+    CandidateProposalConfig, CandidateScreeningConfig, CropScreeningConfig, assess_output_complexity,
     get_crop_screening_config, get_proposal_config, screen_region_candidate,
 )
 from src.documents.input_loader import DocumentInputLoader
@@ -179,8 +181,11 @@ class DocumentOCSRProcessor:
 
         detect_streams = getattr(self.detector, "detect_streams", None)
         if callable(detect_streams):
-            return detect_streams(page)
-        detected = self.detector.detect(page)
+            streams = detect_streams(page)
+            detected = streams.combined(page)
+        else:
+            detected = self.detector.detect(page)
+        detected = self._apply_page_context_screening(page, detected)
         molecules = [region for region in detected if region.region_type == "molecule"]
         layout = [region for region in detected if region.region_type != "molecule"]
         for region in molecules:
@@ -188,6 +193,133 @@ class DocumentOCSRProcessor:
         for region in layout:
             region.source = region.source or "document_layout"
         return DocumentRegionStreams(molecules, layout, original_order=detected)
+
+    def _apply_page_context_screening(
+        self,
+        page: DocumentPage,
+        regions: list[DocumentRegion],
+    ) -> list[DocumentRegion]:
+        """Apply visual and PDF-layer gates consistently to every molecule proposal."""
+
+        if not regions:
+            return regions
+        image = cv2.imdecode(np.fromfile(str(Path(page.image_path)), dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            return regions
+        page_area = max(page.width * page.height, 1)
+        figure_boxes = list(page.figure_boxes)
+        figure_boxes.extend(
+            {"bbox": list(region.bbox), "source": "layout_region"}
+            for region in regions
+            if region.region_type in {"figure", "table"}
+            and ((region.bbox[2] - region.bbox[0]) * (region.bbox[3] - region.bbox[1])) / page_area >= 0.025
+        )
+        for region in regions:
+            if region.region_type not in {"molecule", "unknown", "uncertain_visual"}:
+                continue
+            screening = screen_region_candidate(
+                image,
+                region.bbox,
+                region.region_type,
+                region.detection_confidence,
+                config=self.crop_screening_config,
+                text_boxes=page.text_boxes,
+                figure_boxes=figure_boxes,
+            )
+            recommended = screening.recommended_region_type
+            region.region_type = "reaction_like" if recommended == "reaction" else (
+                "unknown" if recommended == "uncertain" else recommended
+            )
+            region.screening = screening.to_dict()
+            region.detection_confidence = round(screening.screening_score, 3)
+            region.message = ", ".join(screening.reason_codes)
+        return regions
+
+    def rescreen_document_result(self, document_result: dict[str, Any]) -> dict[str, Any]:
+        """Reapply the latest non-OCSR gates to unconfirmed automatic regions."""
+
+        updated = deepcopy(document_result)
+        regions = updated.get("regions") or []
+        changed = 0
+        checked = 0
+        errors: list[dict[str, Any]] = []
+        for page in updated.get("pages") or []:
+            page_number = int(page.get("page_number") or 0)
+            page_regions = [
+                region
+                for region in regions
+                if int(region.get("page_number") or 0) == page_number and region.get("status") != "deleted"
+            ]
+            eligible = [
+                region
+                for region in page_regions
+                if str(region.get("source") or "detector") != "user"
+                and not bool(region.get("confirmed"))
+                and str(region.get("status") or "") != "recognized"
+            ]
+            if not eligible:
+                continue
+            image_path = Path(str(page.get("image_path") or ""))
+            image = cv2.imdecode(np.fromfile(str(image_path), dtype=np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                errors.append({"page_number": page_number, "message": "页面图片无法读取，未重新筛选。"})
+                continue
+            page_area = max(int(page.get("width") or 1) * int(page.get("height") or 1), 1)
+            figure_boxes = list(page.get("figure_boxes") or [])
+            figure_boxes.extend(
+                {"bbox": list(region.get("bbox") or []), "source": "layout_region"}
+                for region in page_regions
+                if region.get("region_type") in {"figure", "table"}
+                and len(region.get("bbox") or []) == 4
+                and (
+                    (int(region["bbox"][2]) - int(region["bbox"][0]))
+                    * (int(region["bbox"][3]) - int(region["bbox"][1]))
+                ) / page_area >= 0.025
+            )
+            for region in eligible:
+                try:
+                    result = screen_region_candidate(
+                        image,
+                        region.get("bbox") or [],
+                        str(region.get("region_type") or "unknown"),
+                        region.get("detection_confidence"),
+                        config=self.crop_screening_config,
+                        text_boxes=page.get("text_boxes") or [],
+                        figure_boxes=figure_boxes,
+                    )
+                except (TypeError, ValueError) as exc:
+                    errors.append({"page_number": page_number, "region_id": region.get("region_id"), "message": str(exc)})
+                    continue
+                checked += 1
+                before_type = str(region.get("region_type") or "unknown")
+                recommended = result.recommended_region_type
+                after_type = "reaction_like" if recommended == "reaction" else (
+                    "unknown" if recommended == "uncertain" else recommended
+                )
+                region["region_type"] = after_type
+                region["screening"] = result.to_dict()
+                region["detection_confidence"] = round(result.screening_score, 3)
+                region["message"] = ", ".join(result.reason_codes)
+                if before_type != after_type:
+                    changed += 1
+                    region.setdefault("audit", []).append({
+                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "operation": "automatic_rescreen",
+                        "before": {"region_type": before_type},
+                        "after": {"region_type": after_type},
+                        "note": "Applied latest PDF candidate-screening rules without OCSR.",
+                    })
+        updated["summary"] = self._summary(updated.get("pages", []), regions, updated.get("detection_errors", []))
+        updated.setdefault("processing", {})["screening_refresh"] = {
+            "config_version": f"crop-screening-{self.crop_screening_config.name}-v3",
+            "checked_region_count": checked,
+            "changed_region_count": changed,
+            "errors": errors,
+            "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        output_dir = Path(str(updated.get("output_dir") or self.output_dir))
+        updated["exports"] = self.export(updated, output_dir)
+        return updated
 
     def recognize_region(
         self,
@@ -251,6 +383,19 @@ class DocumentOCSRProcessor:
             report["input"]["region_id"] = region.region_id
             report["input"]["bbox"] = list(region.bbox)
             report["input"]["type"] = "document_region"
+            output_smiles = (
+                (report.get("final") or {}).get("canonical_smiles")
+                or (report.get("final") or {}).get("smiles")
+                or (report.get("ocsr") or {}).get("smiles")
+            )
+            screening_diagnostics = (region.screening or {}).get("diagnostics") or region.screening
+            complexity_gate = assess_output_complexity(screening_diagnostics, output_smiles)
+            report.setdefault("recognition_gate", {})["input_output_complexity"] = complexity_gate
+            if not complexity_gate.get("passed", True):
+                report["rejected_candidate"] = report.get("final") or {}
+                report["final"] = {}
+                report["status"] = "failed"
+                report["message"] = "模型输出复杂度与输入图形明显不一致，已拒绝作为有效识别结果。"
             region.report = report
             region.ocsr = report.get("ocsr") or {}
             region.final_result = report.get("final") or {}
@@ -330,7 +475,7 @@ class DocumentOCSRProcessor:
             return "该区域属于反应式、箭头或反应条件，已分流，不作为单分子识别；请人工框选单个底物/产物分子，或进入反应解析流程。"
         if region_type == "table":
             return "该区域是表格，已跳过单分子识别。"
-        if region_type == "text":
+        if region_type in {"text", "figure_label"}:
             return "该区域是文本，已跳过单分子识别。"
         if region_type == "figure":
             return "该区域像普通图像/插图，已跳过单分子识别，建议人工确认。"
@@ -465,6 +610,8 @@ class DocumentOCSRProcessor:
             region.region_type,
             region.detection_confidence,
             config=self.crop_screening_config,
+            text_boxes=(page.text_boxes if isinstance(page, DocumentPage) else page.get("text_boxes") or []),
+            figure_boxes=(page.figure_boxes if isinstance(page, DocumentPage) else page.get("figure_boxes") or []),
         )
         payload = result.to_dict()
         payload["passed"] = result.decision == "accept_molecule"
@@ -486,11 +633,65 @@ class DocumentOCSRProcessor:
             return fallback
         return None
 
-    def apply_edits(self, document_result: dict[str, Any], edits: list[dict[str, Any]], rerun_ocsr: bool = False) -> dict[str, Any]:
+    def apply_edits(
+        self,
+        document_result: dict[str, Any],
+        edits: list[dict[str, Any]],
+        rerun_ocsr: bool = False,
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+    ) -> dict[str, Any]:
         """Apply human bbox/type edits and optionally re-run OCSR on edited molecule regions."""
         before_ids = {str(region.get("region_id")) for region in document_result.get("regions", [])}
-        updated = apply_region_edits(document_result, edits)
+        report_actions = {"correct_smiles", "confirm_structure", "revoke_structure_confirmation"}
+        region_edits = [edit for edit in edits if str(edit.get("action") or "").lower() not in report_actions]
+        updated = apply_region_edits(document_result, region_edits) if region_edits else deepcopy(document_result)
         document_dir = Path(updated["output_dir"])
+        for edit in edits:
+            action = str(edit.get("action") or "").lower()
+            if action not in report_actions:
+                continue
+            region_id = str(edit.get("region_id") or "")
+            region = next(
+                (item for item in updated.get("regions", []) if str(item.get("region_id")) == region_id),
+                None,
+            )
+            if region is None:
+                raise ValueError(f"Unknown region_id for report review: {region_id}")
+            report = region.get("report") or {}
+            if not report:
+                raise ValueError("当前区域尚无候选结构，请先执行识别。")
+            previous_smiles = ((report.get("final") or {}).get("smiles") or (report.get("ocsr") or {}).get("smiles"))
+            if action == "correct_smiles":
+                report = apply_smiles_correction(report, str(edit.get("smiles") or ""), document_dir)
+                error = ((report.get("correction") or {}).get("last_error") or (report.get("validation") or {}).get("error"))
+                if error:
+                    raise ValueError(str(error))
+                region["confirmed"] = False
+                region["annotation_status"] = "pending"
+            elif action == "confirm_structure":
+                report = confirm_structure(report)
+                error = (report.get("human_review") or {}).get("last_error")
+                if error:
+                    raise ValueError(str(error))
+                region["confirmed"] = True
+                region["annotation_status"] = "confirmed"
+            else:
+                report = revoke_structure_confirmation(report)
+                region["confirmed"] = False
+                region["annotation_status"] = "pending"
+            region["report"] = report
+            region["ocsr"] = report.get("ocsr") or region.get("ocsr") or {}
+            region["final_result"] = report.get("final") or {}
+            region["status"] = "recognized" if report.get("status") == "success" else region.get("status")
+            region["message"] = report.get("message") or region.get("message")
+            region.setdefault("audit", []).append({
+                "operation": action,
+                "before": {"smiles": previous_smiles},
+                "after": {"smiles": ((report.get("final") or {}).get("smiles")), "confirmed": bool(region.get("confirmed"))},
+                "note": edit.get("note"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "source": "user",
+            })
         if rerun_ocsr:
             requested_ids = {
                 str(edit.get("region_id"))
@@ -507,7 +708,9 @@ class DocumentOCSRProcessor:
                 for region in updated.get("regions", [])
                 if str(region.get("region_id")) not in before_ids
             )
-            for region in updated.get("regions", []):
+            recognition_targets = [
+                region
+                for region in updated.get("regions", [])
                 if (
                     region.get("status") in {"confirmed", "edited", "detected", "failed"}
                     and region.get("region_type") == "molecule"
@@ -517,8 +720,16 @@ class DocumentOCSRProcessor:
                         or str(region.get("region_id")) in requested_ids
                         or int(region.get("page_number", 0)) in requested_pages
                     )
-                ):
-                    self.recognize_region(region, updated.get("pages", []), document_dir)
+                )
+            ]
+            total_targets = len(recognition_targets)
+            for index, region in enumerate(recognition_targets, start=1):
+                region_id = str(region.get("region_id") or "")
+                if progress_callback is not None:
+                    progress_callback("recognizing", index, total_targets, region_id)
+                self.recognize_region(region, updated.get("pages", []), document_dir)
+                if progress_callback is not None:
+                    progress_callback("recognized", index, total_targets, region_id)
         updated["summary"] = self._summary(updated.get("pages", []), updated.get("regions", []), updated.get("detection_errors", []))
         updated["exports"] = self.export(updated, document_dir)
         return updated
@@ -578,6 +789,7 @@ class DocumentOCSRProcessor:
             "crops_dir": str((output_root / "crops").resolve()),
             "redrawn_dir": str(redrawn_dir.resolve()),
             "structures_sdf": structure_exports["merged_sdf"],
+            "structures_smi": structure_exports["merged_smi"],
             "structures_zip": structure_exports["successful_zip"],
             "structure_failed_csv": structure_exports["failed_csv"],
             "structure_review_csv": structure_exports["review_csv"],
