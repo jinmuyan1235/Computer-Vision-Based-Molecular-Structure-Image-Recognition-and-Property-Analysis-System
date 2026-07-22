@@ -19,15 +19,15 @@
 ## 当前能力
 
 - 单图识别：上传分子结构图片，执行 OCSR、RDKit 校验、结构重绘、性质计算和人工纠错；
-- 手动 SMILES：识别失败时仍可手动输入并生成同一套结构分析报告；
-- 批量处理：对图片目录逐个处理，导出 CSV/JSON，并记录成功率、有效率和失败原因；
-- PDF/多分子文档：渲染 PDF 或页面图片，检测分子候选区域，支持 bbox 编辑、区域类型标注和单区域重处理；
+- 手动 SMILES：支持单条实时校验与错误定位、编辑前后结构对比、批量粘贴或上传 CSV/SMI/TXT、最近历史，以及 SMI/MOL/SDF/CSV/PDF 导出；
+- 图片批量处理：支持多图、浏览器文件夹、ZIP 或服务器目录输入；任务在后台运行，可暂停、继续、取消、断点续跑、跳过下一张、按 SHA-256 复用重复图片结果，并在导出正式结构前逐条确认或修正；
+- PDF/多分子文档：先渲染和检测整篇 PDF、页面图片或 ZIP，再在可视化审核台中增删、拖拽、缩放、复制、合并或拆分 bbox；只有人工确认的分子区域才会送入后台 OCSR；
 - 真实后端接入：支持 MolScribe、DECIMER 和多模型 ensemble；真实后端建议在独立子进程中执行，避免模型崩溃拖垮 UI；
 - 生产模式：`APP_MODE=production` 下禁止 demo 识别，启动时可执行后端自检和 warm-up；
 - 人工纠错回流：保存原图、预测、修正 SMILES、来源、隐私和 review 状态，可导出训练/评测 manifest；
 - 评测框架：支持 canonical SMILES、InChIKey、Tanimoto、拒识样本、分类/回归指标和真实验收集脚本；
 - 可选 ADMET baseline：用户提供带标签 CSV 后，可训练单终点 baseline，并记录验证指标和 applicability domain；
-- 报告导出：输出 JSON、CSV、PDF、结构图和文档区域包。
+- 报告导出：输出 JSON、CSV、PDF、SMI、MOL、SDF、结构图、失败/待确认清单和完整 ZIP 结果包。
 
 ## 当前边界
 
@@ -110,6 +110,36 @@ python -m streamlit run app.py
 
 浏览器中可上传 `data/samples/aspirin.png`，查看原图、所有预处理阶段、识别 SMILES、RDKit 重绘和性质结果。
 
+### WSL + NVIDIA GPU 启动（当前本机验证方式）
+
+当前 Windows 克隆目录可从 Ubuntu WSL 直接进入。以下命令与仓库内的 `start_gpu_app.sh`、默认虚拟环境路径和 MolScribe 权重路径一致：
+
+```powershell
+wsl -d Ubuntu
+```
+
+进入 WSL 后：
+
+```bash
+cd /mnt/c/Users/Administrator/Computer-Vision-Based-Molecular-Structure-Image-Recognition-and-Property-Analysis-System
+source /home/jinmu/.venvs/molecule-vision-gpu/bin/activate
+./start_gpu_app.sh
+```
+
+`start_gpu_app.sh` 本身还会再次激活 `${MOLECULE_VISION_GPU_VENV:-$HOME/.venvs/molecule-vision-gpu}`，因此预先执行 `source` 便于核对当前解释器，但不是必需步骤。脚本默认覆盖为 `APP_MODE=production`、`OCSR_BACKEND=molscribe`、`OCSR_DEVICE=cuda:0`、`DECIMER_DEVICE=gpu` 和 `OCSR_GPU_REQUIRED=true`，随后执行 GPU/依赖检查、生产后端自检和一次 warm-up，最后启动 Streamlit。
+
+首次配置新 WSL 环境时可运行：
+
+```bash
+./setup_gpu_environment.sh
+source "$HOME/.venvs/molecule-vision-gpu/bin/activate"
+python -m pip install -r requirements.txt -r requirements-documents.txt
+python scripts/download_ocsr_models.py --skip-decimer
+./start_gpu_app.sh
+```
+
+`FAST_START=true ./start_gpu_app.sh` 会跳过启动脚本中的 GPU/包检查和模型 warm-up，只适合已确认环境可用、希望尽快打开界面的情况；页面仍会显示后端健康状态。若虚拟环境不在默认位置，请设置 `MOLECULE_VISION_GPU_VENV=/绝对路径/到/venv`。
+
 ### PyCharm 运行注意事项
 
 项目解释器应明确指向：
@@ -148,6 +178,35 @@ python scripts/run_batch.py --input data/batch_input --output data/outputs
 ```bash
 python scripts/run_batch.py --input data/samples --output data/outputs --backend demo
 ```
+
+需要使用与 Web 后台任务相同的 checkpoint、缓存和运行时设备参数时，可调用工作进程入口：
+
+```bash
+python scripts/process_batch.py \
+  --input data/batch_input \
+  --output data/outputs/batch_runs/manual \
+  --backend molscribe \
+  --checkpoint data/outputs/batch_runs/manual/checkpoint.json \
+  --cache-dir data/outputs/batch_cache
+```
+
+### Web：SMILES 分析
+
+`工作台 / SMILES 分析` 不调用 OCSR 模型，包含三个页签：
+
+- **单条分析**：实时 RDKit 校验、尽可能定位语法错误位置并给出常见修复提示；可编辑 SMILES、并排比较编辑前后二维结构和指纹相似度；显示 Canonical/Standardized SMILES、InChIKey、分子式、描述符、Lipinski 明细和结构风险提示；
+- **批量分析**：支持每行一条的粘贴文本，以及 CSV、SMI、SMILES、TXT 文件；CSV 会优先识别 `smiles`、`canonical_smiles`、`structure`、`molecule`、`分子` 或 `结构` 列，并兼容 UTF-8/UTF-8 BOM/GB18030；一次最多 2,000 条，重复原始 SMILES 会复用本次 RDKit 计算；
+- **最近分析历史**：只保存用户主动选择保存的单条或批量成功记录，可重新载入单条编辑器。
+
+单条可下载 SMI、MOL、SDF、CSV 和 PDF；批量可下载 CSV、SMI、SDF 和失败清单。批量 SMILES 的“缓存复用”只表示相同输入复用了 RDKit 报告计算，不表示结构已经过人工或外部数据库验证。
+
+### Web：图片批量处理
+
+`工作台 / 批量处理` 支持多图上传、浏览器文件夹上传、ZIP 和服务器本地目录。任务启动前会校验扩展名、图片可解码性、像素数、文件数量、解压大小、ZIP 路径与异常压缩比，并显示清单、重复数和前 12 张缩略图。默认限制为 500 张、单文件 20 MB、总计 500 MB、至少保留 512 MB 磁盘空间，可通过 `BATCH_MAX_FILES`、`BATCH_MAX_FILE_SIZE_MB`、`BATCH_MAX_TOTAL_SIZE_MB`、`BATCH_MAX_IMAGE_PIXELS`、`BATCH_MIN_FREE_SPACE_MB` 和 `BATCH_ZIP_MAX_COMPRESSION_RATIO` 调整。
+
+批量任务在独立进程中执行并持久化状态；页面刷新后可恢复，运行中可暂停、继续、取消或请求跳过下一张尚未开始的图片，失败或取消后可从 checkpoint 继续。内容完全相同的图片会保留各自文件记录，并按由后端、运行时设备配置、MolScribe 权重文件状态和预处理版本组成的缓存命名空间，通过 SHA-256 结果缓存避免重复推理。
+
+结果区把 `accepted`、`accepted_with_warning`、`review_needed`、`rejected`、`failed` 和 `skipped` 作为互斥统计项。用户可以批量确认候选，也可以逐条校验并应用修正 SMILES、撤销确认，或只重试失败项/待确认项。SMI、SDF 和正式结构 ZIP 只包含已人工确认的结构；未确认候选仍保留在 CSV、JSON 和待确认清单中。
 
 ## OCSR 后端说明
 
@@ -241,7 +300,7 @@ python -m streamlit run app.py
 pytest -q
 ```
 
-测试覆盖合法/非法 SMILES、canonical SMILES、描述符字段、规则超限、图像预处理、OCSR 兼容层、单图/手动 SMILES 端到端流程、批处理导出、PDF 报告以及可选 ADMET baseline。
+测试覆盖合法/非法 SMILES 与错误定位、单条/批量 SMILES 解析和导出、canonical/standardized identity、描述符与规则、图像预处理、OCSR 适配与生产路由、单图审核、后台图片批处理与恢复、PDF/ZIP 文档区域检测和审核、结构导出、评测/数据集流程、数据库迁移以及可选 ADMET baseline。
 
 ## OCSR 真实测试集
 
@@ -311,10 +370,14 @@ molecule-vision-ocsr/
 │   ├── ocsr/              # 统一接口与 demo/MolScribe/DECIMER 适配器
 │   ├── chem/              # RDKit 校验、描述符、规则、绘图
 │   ├── analysis/          # 单分子报告与批处理编排
+│   ├── documents/         # PDF/页面加载、区域检测、筛选、编辑与文档处理
 │   ├── export/            # JSON、CSV、可选 PDF
 │   ├── ml/                # 可选 Morgan + Random Forest ADMET baseline
+│   ├── runtime/           # 后台任务、GPU 调度、健康检查、缓存与运行目录
+│   ├── storage/           # SQLite 分析索引
+│   ├── ui/                # Streamlit 页面、审核台与通用组件
 │   └── utils/             # 文件与日志工具
-├── scripts/               # 批处理、SMILES 分析、样例生成、ADMET 训练
+├── scripts/               # 应用工作进程、批处理、评测、数据集与模型工具
 ├── tests/                 # pytest 测试
 └── docs/                  # 说明书、API 与报告模板
 ```
@@ -343,7 +406,7 @@ molecule-vision-ocsr/
 
 ## 生产 MolScribe 后端配置
 
-本项目默认仍使用 `demo` 后端，demo 只用于教学演示：它会按内置样例文件名返回固定 SMILES，不是真实图片识别。真实 OCSR 需要单独安装 MolScribe、下载模型权重，并把 `OCSR_BACKEND` 切换为 `molscribe`。如果 MolScribe 未安装、模型文件缺失或加载失败，Streamlit、手动 SMILES、RDKit 性质分析、demo 后端和 DECIMER 后端仍会继续工作，并显示可读错误。
+未设置 `APP_MODE` 时项目进入 `demo` 模式并默认使用 `demo` 后端；设置 `APP_MODE=production` 但未设置 `OCSR_BACKEND` 时，代码默认选择 `decimer`。仓库的 GPU 启动脚本为了使用本机 MolScribe CUDA 环境，会显式覆盖为 `APP_MODE=production` 和 `OCSR_BACKEND=molscribe`。demo 只按内置样例文件名返回固定 SMILES，不是真实图片识别。真实 MolScribe OCSR 需要单独安装包、下载权重并配置正确路径；如果 MolScribe 未安装、模型文件缺失或加载失败，手动 SMILES 与不依赖该后端的功能仍可运行，图片/文档/批量识别会显示健康检查错误而不会伪装成功。
 
 本适配器按 MolScribe 官方仓库公开接口进行兼容：构造模型时优先使用 `MolScribe(model_path, device=...)`，推理时优先使用 `predict_image_file(path, return_confidence=True)`；不同发行版本若返回 `dict`、字符串、元组或列表，适配器会归一化为统一结果字段。已对公开仓库接口形状做验证，未声称支持未测试的私有改版 API。
 
@@ -411,7 +474,7 @@ python -m streamlit run app.py
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `MOLSCRIBE_MODEL_PATH` | `models/molscribe_model.pth` | MolScribe 权重文件路径，支持相对路径和绝对路径 |
+| `MOLSCRIBE_MODEL_PATH` | `models/molscribe/swin_base_char_aux_1m.pth` | MolScribe 权重文件路径，支持相对路径和绝对路径；与下载脚本和 GPU 启动脚本一致 |
 | `MOLSCRIBE_MODEL_NAME` | 权重文件名 | 侧边栏和结果中显示的模型名 |
 | `MOLSCRIBE_MODEL_VERSION` | 空 | 可选模型版本或标识 |
 | `OCSR_DEVICE` | `auto` | `auto`、`cpu`、`cuda` 或 `cuda:0`；`auto` 优先 GPU、不可用时回退 CPU；显式 `cuda*` 不可用会失败 |
@@ -561,7 +624,7 @@ python scripts/check_ocsr_backend.py --backend decimer
 
 ```powershell
 $env:OCSR_BACKEND="ensemble"
-$env:OCSR_ENSEMBLE_BACKENDS="molscribe,decimer"
+$env:OCSR_ENSEMBLE_BACKENDS="decimer,molscribe"
 $env:OCSR_ENSEMBLE_PARALLEL="false"
 $env:OCSR_DEVICE="cuda"
 $env:DECIMER_DEVICE="auto"
@@ -596,8 +659,8 @@ $env:OCSR_ENSEMBLE_TOTAL_TIMEOUT_SECONDS="240"
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `OCSR_ENSEMBLE_BACKENDS` | `molscribe,decimer` | 启用的子后端 |
-| `OCSR_ENSEMBLE_BACKEND_PRIORITY` | `molscribe,decimer` | 分歧时的暂选优先级 |
+| `OCSR_ENSEMBLE_BACKENDS` | `decimer,molscribe` | 启用的子后端 |
+| `OCSR_ENSEMBLE_BACKEND_PRIORITY` | `decimer,molscribe` | 分歧时的暂选优先级 |
 | `OCSR_ENSEMBLE_RELIABILITY_WEIGHTS` | `molscribe=1.0,decimer=1.0` | 实验性可靠性权重；当前不作为最终自动接受依据 |
 | `OCSR_ENSEMBLE_PARALLEL` | `false` | 是否并行执行子后端 |
 | `OCSR_ENSEMBLE_CONTINUE_ON_ERROR` | `true` | 单个后端失败时是否继续 |
@@ -711,29 +774,37 @@ python scripts/evaluate_ocsr.py \
 
 如果当前 RDKit 构建不支持 InChI，报告会把 `inchi` / `inchikey` 置空，并在 `standardization.warnings` 中记录原因；主流程、性质计算、JSON/CSV/PDF 导出不会因此中断。
 
-## PDF and Multi-Molecule Document Processing
+## PDF 与多分子文档处理
 
-The document workflow lets users upload a PDF, a full-page PNG/JPG image, or a ZIP archive of page images. It expands the input into page images, runs a lightweight OpenCV molecule-region detector, lets a reviewer confirm or edit regions, sends only confirmed molecule regions to the selected OCSR backend, and exports document-level results that keep page numbers and bbox coordinates.
+`工作台 / 文档识别` 接受 PDF、单张完整页面 PNG/JPG/JPEG 或包含页面图片的 ZIP。系统先渲染/展开整篇文档并逐页检测候选区域，初次处理只做检测，不自动运行真实 OCSR；用户在审核台确认分子区域后，再启动当前区域、当前页或全文的后台识别。未确认区域，以及 text、table、figure、reaction、ignore 等非单分子区域，不会进入单分子 OCSR。
 
-Example CLI:
+### 审核台能力
+
+- 页码缩略导航，以及按区域类型和状态筛选、上一个/下一个区域导航；
+- 在页面画布上新增、选择、拖拽和缩放 bbox，同时显示原图裁剪预览和质量警告；
+- 修改坐标与区域类型、确认/撤销区域、标记忽略、删除、复制到相邻页面、合并、水平/垂直拆分；
+- 撤销/重做编辑，检测并批量合并 IoU 高于 0.82 的重复框，批量清理规则明确标记的短文本误框；
+- 单区域、本页全部已确认分子、全文全部已确认分子的后台 OCSR；任务可取消、失败后重试，并可在页面重载后恢复运行状态；
+- 对候选 SMILES 做 RDKit 校验后应用人工修正，再确认或撤销结构确认；原模型输出和所有 bbox/类型编辑保留在审计记录中；
+- 对旧任务使用当前筛选规则重新分类时不会运行 OCSR，也不会把模型输出当作 ground truth。
+
+启发式检测器是可插拔的 OpenCV fallback，不是训练式版面模型。它可能漏掉低分辨率结构、拆散密集结构、合并邻近结构或把复杂反应式标为 `reaction_like`；完整反应解析尚未实现。正式使用结构结果前必须人工核对区域和候选结构。
+
+### 文档命令行
+
+检测并裁剪区域，不运行 OCSR：
 
 ```bash
 python scripts/process_document.py \
   --input data/documents/example.pdf \
-  --backend demo \
-  --output data/outputs/documents
-```
-
-Detect regions without running OCSR:
-
-```bash
-python scripts/process_document.py \
-  --input data/documents/page.png \
-  --backend demo \
+  --backend molscribe \
+  --output data/outputs/documents \
   --detect-only
 ```
 
-Export confirmed document-region annotations for future detector training:
+去掉 `--detect-only` 会直接识别处理器允许进入 OCSR 的区域，适合受控 CLI 流程；Web 默认采用“先检测、人工确认、再识别”的审核优先流程。已有 `document_result.json` 可通过 `scripts/process_document_edit.py` 应用 JSON edits，并用 `--rerun-ocsr` 重新识别被编辑的分子区域。
+
+导出已审核的检测标注：
 
 ```bash
 python scripts/export_document_detection_annotations.py \
@@ -741,70 +812,35 @@ python scripts/export_document_detection_annotations.py \
   --output data/outputs/documents/<run>/detection_annotations.json
 ```
 
-PDF rendering uses optional PyMuPDF when installed:
-
-```bash
-python -m pip install pymupdf
-```
-
-The locally verified document-rendering dependency set is:
+PDF 渲染依赖可选的 PyMuPDF；当前锁定的文档依赖为 `pymupdf==1.28.0`：
 
 ```bash
 python -m pip install -r requirements-documents.txt
 ```
 
-Verified locally on Windows / Python 3.10:
+PyMuPDF/MuPDF 由上游按 AGPL 或商业许可证分发，在专有或服务端部署前应单独核对其许可证。未安装时 PDF 输入会返回可读错误，PNG/JPG/ZIP 文档流程及其他功能仍可运行。
 
-```text
-pymupdf==1.28.0
-```
+### 限制与导出
 
-PyMuPDF/MuPDF is distributed by its upstream project under AGPL or commercial licensing. Review the official PyMuPDF license page before enabling it in proprietary or server deployments. If PyMuPDF is not installed, PDF inputs return a readable diagnostic; PNG/JPG/ZIP image workflows and the rest of the application keep working.
-
-Safety limits are configurable with environment variables:
-
-| Variable | Default | Meaning |
+| 变量 | 默认值 | 说明 |
 |---|---:|---|
-| `DOCUMENT_OUTPUT_DIR` | `data/outputs/documents` | Document run output directory |
-| `DOCUMENT_RENDER_DPI` | `200` | PDF page render resolution |
-| `DOCUMENT_MAX_FILE_SIZE_MB` | `100` | Maximum uploaded PDF/image/ZIP size |
-| `DOCUMENT_MAX_PAGES` | `100` | Maximum PDF pages or ZIP images in one full-document review task |
-| `DOCUMENT_MAX_PIXELS` | `25000000` | Maximum pixels per rendered page |
-| `DOCUMENT_MAX_REGIONS` | `500` | Maximum detected regions per document |
+| `DOCUMENT_OUTPUT_DIR` | `data/outputs/documents` | 文档运行输出根目录 |
+| `DOCUMENT_RENDER_DPI` | `200` | PDF 页面渲染分辨率 |
+| `DOCUMENT_MAX_FILE_SIZE_MB` | `100` | 单个 PDF/图片/ZIP 最大大小 |
+| `DOCUMENT_MAX_PAGES` | `100` | 单个任务最多 PDF 页数或 ZIP 图片数 |
+| `DOCUMENT_MAX_PIXELS` | `25000000` | 每个渲染页面的最大像素数 |
+| `DOCUMENT_MAX_REGIONS` | `500` | 单个文档最多区域数 |
+| `DOCUMENT_MIN_REGION_AREA` | `1200` | 候选区域最小面积 |
+| `DOCUMENT_MAX_REGION_AREA_RATIO` | `0.80` | 候选区域占整页面积的最大比例 |
 
-Each region is exported with:
+每个区域保留 `document_id`、页码、`region_id`、bbox、区域类型、检测置信度、确认状态、裁剪路径、筛选诊断、OCSR 候选、最终结果、处理耗时和 audit。每次保存会重建文档导出，其中结构 SMI/SDF/结构 ZIP 只包含已经人工确认的正式结构：
 
-```json
-{
-  "document_id": "...",
-  "page_number": 3,
-  "region_id": "p003_r005",
-  "bbox": [x1, y1, x2, y2],
-  "region_type": "molecule",
-  "confirmed": true,
-  "detection_confidence": 0.88,
-  "crop_path": "...",
-  "ocsr": {},
-  "final_result": {}
-}
-```
-
-The document detector is pluggable: `HybridMoleculeRegionDetector` can combine a future trainable layout model with the OpenCV fallback. The fallback distinguishes `molecule`, `reaction_arrow`, `reaction_condition`, `reaction_like`, `text`, `table`, `figure`, and `unknown`; the audit UI also provides coarse labels `molecule`, `text`, `table`, `reaction`, and `ignore`. Reaction regions, text, tables, figures, ignored regions, and unconfirmed molecule regions are not sent to single-molecule OCSR by default. Reaction parsing is not implemented in this task, so reaction graphics are recorded as unsupported rather than treated as ordinary molecules.
-
-Streamlit provides a `PDF/多分子文档` tab for page review, detected boxes, draggable/resizeable bbox adjustment, deletion of false positives, manual bbox addition, coordinate adjustment, region type changes, merge/split operations, page-level batch confirmation, single-region reprocessing, failed-region review-queue routing, detection-annotation export, and result downloads. User edits are recorded in each region's `audit` list with before/after bbox/type metadata and timestamp.
-
-Each document run writes an isolated output directory containing:
-
-- `document_result.json`
-- `regions.csv`
-- `failed_regions.csv`
-- `detection_annotations.json`
-- `crops/`
-- `redrawn/`
-- `annotated_pages/`
-- `document_results.zip`
-
-The heuristic detector is intentionally conservative and is not a trained layout model. It can miss low-resolution structures, split dense diagrams, merge nearby structures, or mark complex reaction schemes as `reaction_like`. Use the manual region editor for review before treating document-level outputs as curated data.
+- `document_result.json`：完整文档与区域审计数据；
+- `regions.csv`、`failed_regions.csv`：全部区域与失败区域表；
+- `detection_annotations.json`：检测训练标注；
+- `structure_exports/`：已确认结构的 SMI、SDF、单体结构文件、失败和待确认清单；
+- `pages/`、`crops/`、`redrawn/`、`annotated_pages/`：持久页面、裁剪、结构重绘和 bbox 标注页；
+- `document_results.zip`：上述结果的完整打包文件。
 
 ## Auditable OCSR Dataset Collection
 
